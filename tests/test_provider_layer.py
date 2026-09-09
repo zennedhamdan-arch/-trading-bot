@@ -607,8 +607,9 @@ n3 = news_agent.analyze_news("AAPL", headlines + ["Fresh headline changes everyt
 check("news: changed headlines -> new Gemini call",
       n3["cached"] is False and len(gemini_service._client.interactions.calls) == calls_after_first + 1)
 n4 = news_agent.analyze_news("MSFT", [])
-check("news: no headlines -> no LLM call, NEUTRAL",
-      n4["llm_status"] == "SKIPPED_NO_DATA" and n4["sentiment"] == "NEUTRAL"
+check("news: no headlines -> no LLM call, null stance + UNAVAILABLE evidence",
+      n4["llm_status"] == "SKIPPED_NO_DATA" and n4["sentiment"] is None
+      and n4["evidence_status"] == "UNAVAILABLE"
       and len(gemini_service._client.interactions.calls) == calls_after_first + 1)
 
 # fundamentals agent consumes the normalized provider payload

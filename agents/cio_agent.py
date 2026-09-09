@@ -43,19 +43,33 @@ You will receive reports from your team:
    has been reliable recently, below 1.0 = has been unreliable recently) -- use this
    to lean more heavily on agents that have been right and discount ones that haven't.
 7. A summary of recent closed-trade outcomes for this symbol, for continuity.
+8. An evidence-quality report: which evidence sources are AVAILABLE, and which are
+   UNAVAILABLE, ERROR or STALE.
+
+EVIDENCE SEMANTICS (critical):
+- Each analyst report carries an evidence_status. AVAILABLE means a real analysis
+  was produced; a NEUTRAL verdict from an AVAILABLE agent genuinely means "the
+  evidence is directionally neutral".
+- UNAVAILABLE / ERROR / STALE evidence is MISSING INFORMATION -- it is NOT neutral,
+  NOT bearish and NOT bullish. Never count it as support for a trade, and never
+  let it cancel opposing evidence.
+- When important evidence is missing (evidence quality DEGRADED), lower your
+  confidence and favor HOLD. The risk agent's dollar limit only says what the
+  portfolio COULD afford -- it is never, by itself, a reason to trade.
 
 The risk agent's approval is a hard constraint: if the risk agent did NOT approve
 the trade, you may NOT issue a BUY (you may still issue SELL if there is an existing
 position and technicals/news/debate are strongly bearish, or HOLD).
-Favor HOLD when signals conflict or confidence is low across agents, especially
-when the bull and bear cases are close in strength (a close debate = genuine uncertainty).
+Favor HOLD when signals conflict, when confidence is low across agents, or when
+important evidence is missing -- especially when the bull and bear cases are close
+in strength (a close debate = genuine uncertainty).
 
 Respond ONLY with a single valid JSON object, no markdown fences, no preamble, in this exact shape:
 {
   "decision": "BUY" | "SELL" | "HOLD",
   "confidence": <float 0.0 to 1.0>,
   "notional_usd": <float, dollar amount to trade if BUY, 0 otherwise>,
-  "reasoning": "<two to three sentence explanation synthesizing all inputs, including the debate>"
+  "reasoning": "<two to three sentence explanation synthesizing all inputs, including the debate and evidence quality>"
 }
 """
 
@@ -68,7 +82,8 @@ def _extract_json(text: str) -> dict:
 
 def make_decision(symbol: str, news_report: dict, tech_report: dict, risk_report: dict,
                    fundamentals_report: dict = None, debate_report: dict = None,
-                   agent_weights: dict = None, memory_summary: str = "") -> dict:
+                   agent_weights: dict = None, memory_summary: str = "",
+                   evidence: dict = None) -> dict:
     """
     Args:
         symbol: ticker symbol
@@ -79,6 +94,9 @@ def make_decision(symbol: str, news_report: dict, tech_report: dict, risk_report
         debate_report: output of debate_agent.run_debate(), optional
         agent_weights: dict of {agent_name: weight} from memory_service.get_agent_accuracy(), optional
         memory_summary: human-readable recent outcome summary string, optional
+        evidence: evidence-quality snapshot from services/evidence.py, optional --
+            tells the CIO exactly which evidence is AVAILABLE vs missing so a
+            generous risk limit alone can never justify a trade
 
     Returns:
         {
@@ -126,6 +144,12 @@ def make_decision(symbol: str, news_report: dict, tech_report: dict, risk_report
     context_parts.append(
         f"--- Risk Agent Report ---\n{json.dumps(risk_report, indent=2)}\n"
     )
+    if evidence:
+        from services import evidence as evidence_service
+        context_parts.append(
+            f"--- Evidence Quality (which evidence is actually available) ---\n"
+            f"{evidence_service.context_lines(evidence)}\n"
+        )
     if agent_weights:
         weight_lines = "\n".join(
             f"  {name}: weight={w.get('weight')} (hit rate {w.get('hit_rate')}, n={w.get('sample_size')})"

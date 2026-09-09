@@ -79,25 +79,53 @@
   }
 
   /* ==========================================================================
-     Verdicts — map any agent log to a directional verdict
+     Verdicts — map any agent log to a directional verdict.
+
+     EVIDENCE SEMANTICS: a report's evidence_status says whether the agent
+     actually analyzed evidence. NEUTRAL is a VERDICT (successfully analyzed,
+     directionally neutral evidence) — never a stand-in for a failed agent.
+     UNAVAILABLE / ERROR / STALE / OFF agents render as exactly that, with
+     null stance and null confidence (no fake "NEUTRAL · CONF 0%").
      ========================================================================== */
+
+  function evidenceStateOf(log) {
+    if (!log) return "OFF";
+    var d = log.data || {};
+    var es = d.evidence_status;
+    if (es === "AVAILABLE" || es === "UNAVAILABLE" || es === "ERROR" || es === "STALE" || es === "OFF") return es;
+    // Legacy reports (no evidence_status): derive from error + llm_status.
+    if (d.error) {
+      var ls = String(d.llm_status || "");
+      if (["SKIPPED_NO_DATA", "NOT_CONFIGURED", "PROVIDER_QUOTA_EXCEEDED", "MODEL_NOT_FOUND", "AUTH_ERROR", "NETWORK_ERROR"].indexOf(ls) >= 0) return "UNAVAILABLE";
+      if (ls === "SKIPPED_DISABLED") return "OFF";
+      return "ERROR";
+    }
+    return "AVAILABLE";
+  }
 
   function verdictOf(log) {
     if (!log) return null;
     var d = log.data || {};
     var a = log.agent;
     function v(label, dir, conf) { return { label: label, dir: dir, conf: conf, badge: badgeForVerdict(label) }; }
+    function evidenceVerdict(state) { return v(state, "none", null); }
     if (a === "technical" || a === "fundamentals") {
+      var state = evidenceStateOf(log);
+      if (state !== "AVAILABLE") return evidenceVerdict(state);
       var s = (d.signal || "").toUpperCase();
       if (s === "BULLISH") return v("BULLISH", "bull", d.confidence);
       if (s === "BEARISH") return v("BEARISH", "bear", d.confidence);
-      return v("NEUTRAL", "neutral", d.confidence);
+      if (s === "NEUTRAL") return v("NEUTRAL", "neutral", d.confidence);
+      return v("—", "neutral", d.confidence != null ? d.confidence : null);
     }
     if (a === "news") {
+      var nstate = evidenceStateOf(log);
+      if (nstate !== "AVAILABLE") return evidenceVerdict(nstate);
       var s2 = (d.sentiment || d.signal || "").toUpperCase();
       if (s2 === "BULLISH" || s2 === "POSITIVE") return v("BULLISH", "bull", d.confidence);
       if (s2 === "BEARISH" || s2 === "NEGATIVE") return v("BEARISH", "bear", d.confidence);
-      return v("NEUTRAL", "neutral", d.confidence);
+      if (s2 === "NEUTRAL") return v("NEUTRAL", "neutral", d.confidence);
+      return v("—", "neutral", d.confidence != null ? d.confidence : null);
     }
     if (a === "cio") {
       var k = (d.decision || "").toUpperCase();
@@ -108,6 +136,7 @@
       return d.approced ? v("APPROVED", "bull", null) : d.approved === false ? v("REJECTED", "bear", null) : v(d.risk_level || "—", "neutral", null);
     }
     if (a === "debate") {
+      if (evidenceStateOf(log) === "ERROR") return v("ERROR", "none", null);
       var e = Number(d.edge);
       if (isNaN(e)) return v("—", "neutral", null);
       if (e > 0.15) return v("BULLISH", "bull", Math.max(d.bull_strength || 0, 0.5));
@@ -124,7 +153,10 @@
     var k = String(label || "").toUpperCase();
     if (["BUY", "BULLISH", "APPROVED", "SUBMITTED", "FILLED"].indexOf(k) >= 0) return "badge badge-buy";
     if (["SELL", "BEARISH", "REJECTED", "FAILED"].indexOf(k) >= 0) return "badge badge-sell";
-    if (["HOLD", "NEUTRAL", "REVIEW"].indexOf(k) >= 0) return "badge badge-hold";
+    if (k === "ERROR") return "badge badge-error";
+    if (k === "STALE") return "badge badge-warning";
+    if (k === "UNAVAILABLE") return "badge badge-neutral";
+    if (["HOLD", "NEUTRAL", "REVIEW", "OFF"].indexOf(k) >= 0) return "badge badge-hold";
     return "badge";
   }
 
@@ -170,6 +202,20 @@
     DIRECTIONAL.forEach(function (a) {
       var l = win[a];
       if (!l) return;
+      // Only AVAILABLE evidence counts as a directional vote: an
+      // UNAVAILABLE/ERROR/STALE agent produced NO evidence, so it is
+      // displayed but never counted as agreeing (or disagreeing).
+      var state = evidenceStateOf(l);
+      if (state !== "AVAILABLE") {
+        var sv = verdictOf(l);
+        rows +=
+          '<div class="cons-row">' +
+            '<span class="cons-agent">' + U.agentLabel(a).replace(" Agent", "") + "</span>" +
+            '<div class="divmeter"><span class="mid"></span></div>' +
+            '<span class="cons-verdict t-faint">' + U.esc(sv ? sv.label : state) + "</span>" +
+          "</div>";
+        return;
+      }
       var v = verdictOf(l);
       if (!v) return;
       total++;
@@ -227,7 +273,14 @@
     var disabledAgents = disabledAgentSet();
 
     if (log) {
-      if (log.level === "ERROR") { nodeCls += " err"; statusTxt = '<span class="badge badge-error">ERROR</span>'; }
+      if (log.level === "ERROR") {
+        nodeCls += " err";
+        // The evidence-state badge (UNAVAILABLE / ERROR / STALE) already
+        // communicates the failure for analyst agents — avoid a duplicate
+        // generic ERROR chip next to it.
+        var alreadyBadged = v && ["ERROR", "UNAVAILABLE", "STALE"].indexOf(v.label) >= 0;
+        if (!alreadyBadged) statusTxt = '<span class="badge badge-error">ERROR</span>';
+      }
       else nodeCls += " done";
       if (stage.agent === "execution" && (!v || v.label !== "SUBMITTED")) nodeCls = "pipe-node skipped";
     } else {

@@ -45,19 +45,25 @@ def analyze_technicals(symbol: str, indicators: dict) -> dict:
         {
           "agent": "technical",
           "symbol": symbol,
-          "signal": "BULLISH"/"BEARISH"/"NEUTRAL",
-          "confidence": float,
+          "evidence_status": "AVAILABLE"|"UNAVAILABLE"|"ERROR",
+          "signal": "BULLISH"/"BEARISH"/"NEUTRAL" | None (None unless AVAILABLE),
+          "confidence": float | None,
           "summary": str,
           "error": str | None,
           "provider": str, "model": str, "llm_status": str, "latency_ms": float
         }
+
+    NEUTRAL is only ever a VERDICT on successfully analyzed evidence; a
+    failed agent yields evidence_status UNAVAILABLE/ERROR with a null
+    signal and null confidence — never a fake NEUTRAL.
     """
     route = llm_service.route_info("technical")
     base_result = {
         "agent": "technical",
         "symbol": symbol,
-        "signal": "NEUTRAL",
-        "confidence": 0.0,
+        "evidence_status": None,
+        "signal": None,
+        "confidence": None,
         "summary": "",
         "error": None,
         "provider": route["provider"],
@@ -68,8 +74,9 @@ def analyze_technicals(symbol: str, indicators: dict) -> dict:
 
     if indicators.get("error"):
         base_result["llm_status"] = "SKIPPED_NO_DATA"
+        base_result["evidence_status"] = "UNAVAILABLE"
         base_result["error"] = indicators["error"]
-        base_result["summary"] = "No usable indicator data available."
+        base_result["summary"] = "No usable indicator data available — no technical verdict."
         return base_result
 
     # Deterministic evidence (computed in Python, NOT by the LLM): the model
@@ -110,11 +117,14 @@ def analyze_technicals(symbol: str, indicators: dict) -> dict:
 
     if not result.ok:
         logger.error(f"Technical agent failed for {symbol}: {result.error}")
+        from services.evidence import state_for_llm_status
+        base_result["evidence_status"] = state_for_llm_status(result.status)
         base_result["error"] = result.error
-        base_result["summary"] = "Technical agent encountered an error; defaulting to NEUTRAL."
+        base_result["summary"] = "Technical agent encountered an error — no technical verdict."
         return base_result
 
     parsed = result.parsed
+    base_result["evidence_status"] = "AVAILABLE"
     base_result["signal"] = str(parsed.get("signal", "NEUTRAL")).upper()
     base_result["confidence"] = float(parsed.get("confidence", 0.0))
     base_result["summary"] = str(parsed.get("summary", ""))
