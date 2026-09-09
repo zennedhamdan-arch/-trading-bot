@@ -211,15 +211,18 @@
       var v = U.ago(el.getAttribute("data-ago"));
       if (v) el.textContent = v;
     });
-    var nf = qs("#freshness");
-    if (nf && !store.demo) {
+    var label;
+    if (store.demo) {
+      label = "Sample data · demo";
+    } else {
       var t = Math.max.apply(null, [0].concat(["portfolio", "logs"].map(function (k) { return store.ts[k] || 0; })));
-      if (t) {
-        var s = Math.floor((Date.now() - t) / 1000);
-        nf.textContent = "Updated " + (s < 60 ? s + "s ago" : Math.floor(s / 60) + "m ago");
-        nf.classList.toggle("stale", s > 45);
-      }
+      if (!t) return;
+      var s = Math.floor((Date.now() - t) / 1000);
+      label = "Updated " + (s < 60 ? s + "s ago" : Math.floor(s / 60) + "m ago");
+      var nf = qs("#freshness");
+      if (nf) nf.classList.toggle("stale", s > 45);
     }
+    qsa("#freshness, #freshness-m").forEach(function (el) { el.textContent = label; });
     renderClocks();
   }
 
@@ -232,7 +235,7 @@
 
   function updateNextCycle() {
     var nc = qs("#nextcycle");
-    if (!nc || store.demo) return;
+    if (!nc) return;
     var st = store.data.portfolio && store.data.portfolio.bot_state;
     var cfg = store.data.config || {};
     var iv = (cfg.cycle_interval_minutes || 15) * 60000;
@@ -250,7 +253,7 @@
 
   function renderFreshness() {
     var dot = qs("#freshness-dot");
-    if (dot) dot.classList.toggle("dot-on", !store.errors.portfolio && !store.errors.logs);
+    if (dot) dot.className = "dot " + (store.errors.portfolio || store.errors.logs ? "dot-err" : "dot-on");
     tickAgo();
   }
 

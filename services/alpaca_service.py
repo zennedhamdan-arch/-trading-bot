@@ -273,6 +273,8 @@ def execute_order(symbol: str, side: str, notional_usd: Optional[float] = None,
             "order_id": str(order.id),
             "symbol": order.symbol,
             "side": side,
+            "qty": float(order.qty) if order.qty else None,
+            "notional_usd": round(notional_usd, 2) if notional_usd else None,
             "status": order.status.value if hasattr(order.status, "value") else str(order.status),
             "error": None,
         }

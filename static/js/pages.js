@@ -109,21 +109,27 @@
 
     var banners = accountErrorBanner(acct) + botOfflineBanner();
 
-    // KPI strip
-    var dayPos = acct.day_pl >= 0;
+    // KPI strip — when the broker API is down, show honest "unavailable"
+    // tiles instead of $0.00 values that look like real zeros.
+    var down = !!acct.error;
+    var dayPos = !down && acct.day_pl > 0;
+    var val = function (v) { return down ? "—" : v; };
     var kpis =
       kpiTile("Portfolio Value",
-        U.fmtMoney(acct.portfolio_value || acct.equity),
-        '<span class="num ' + (dayPos ? "pos" : "neg") + '">' + U.fmtSigned(acct.day_pl) + " (" + U.fmtPct(acct.day_pl_pct) + ")</span> today", "kpi-hero") +
-      kpiTile("Equity", acct.equity != null ? U.fmtMoney(acct.equity) : "—",
-        acct.equity ? "<span>Long + cash</span>" : "") +
-      kpiTile("Cash", acct.cash != null ? U.fmtMoney(acct.cash) : "—",
-        '<span>' + U.fmtPct(acct.equity ? (acct.cash / acct.equity) * 100 : null, 1) + " of equity</span>") +
-      kpiTile("Buying Power", acct.buying_power != null ? U.fmtMoney(acct.buying_power) : "—",
+        val(U.fmtMoney(acct.portfolio_value || acct.equity)),
+        down ? '<span class="t-faint">Broker API unreachable</span>'
+             : '<span class="num ' + (dayPos ? "pos" : acct.day_pl < 0 ? "neg" : "neu") + '">' + U.fmtSigned(acct.day_pl) + " (" + U.fmtPct(acct.day_pl_pct) + ")</span> today", "kpi-hero") +
+      kpiTile("Equity", val(acct.equity != null ? U.fmtMoney(acct.equity) : "—"),
+        down ? '<span class="t-faint">Unavailable</span>' : '<span>Long + cash</span>') +
+      kpiTile("Cash", val(acct.cash != null ? U.fmtMoney(acct.cash) : "—"),
+        down ? '<span class="t-faint">Unavailable</span>'
+             : '<span>' + U.fmtPct(acct.equity ? (acct.cash / acct.equity) * 100 : null, 1) + " of equity</span>") +
+      kpiTile("Buying Power", val(acct.buying_power != null ? U.fmtMoney(acct.buying_power) : "—"),
         '<span class="t-faint">Paper account</span>') +
       kpiTile("Today's P&L",
-        '<span class="' + (dayPos ? "pos" : "neg") + '">' + U.fmtSigned(acct.day_pl) + "</span>",
-        '<span class="num ' + (dayPos ? "pos" : "neg") + '">' + U.fmtPct(acct.day_pl_pct) + "</span> vs last close") +
+        down ? "—" : '<span class="' + (dayPos ? "pos" : acct.day_pl < 0 ? "neg" : "neu") + '">' + U.fmtSigned(acct.day_pl) + "</span>",
+        down ? '<span class="t-faint">Requires broker data</span>'
+             : '<span class="num ' + (dayPos ? "pos" : acct.day_pl < 0 ? "neg" : "neu") + '">' + U.fmtPct(acct.day_pl_pct) + "</span> vs last close") +
       kpiTile("Open Positions", String((pf.positions || []).length),
         (pf.positions || []).length ? '<span class="linklike" data-action="goto" data-page="positions">View positions →</span>' : '<span class="t-faint">Flat</span>');
 
@@ -320,6 +326,11 @@
     var invested = positions.reduce(function (a, p) { return a + (p.market_value || 0); }, 0);
     var unreal = positions.reduce(function (a, p) { return a + (p.unrealized_pl || 0); }, 0);
     var equity = acct.equity || invested + (acct.cash || 0);
+    var down = !!acct.error;
+    var val = function (v) { return down ? "—" : v; };
+    function bar(pct, cls) {
+      return '<div class="meter ' + (cls || "") + '"><i style="width:' + U.clamp(pct || 0, 0, 100) + '%"></i></div>';
+    }
 
     var alloc =
       '<div class="dsec-hd">' + ICON("scale") + "<span>Allocation</span></div>" +
@@ -327,7 +338,7 @@
         ? positions.slice().sort(function (a, b) { return (b.market_value || 0) - (a.market_value || 0); }).map(function (p) {
             var w = equity ? ((p.market_value || 0) / equity) * 100 : 0;
             return '<div class="bar-row"><span class="b-name">' + U.esc(p.symbol) + "</span>" +
-              '<div class="meter' + (p.unrealized_pl >= 0 ? " meter-green" : " meter-red") + '">' + C.meterHTML(w, p.unrealized_pl >= 0 ? "meter-green" : "meter-red").replace(/^<div[^>]*>|<\/div>$/g, "") + "</div>" +
+              bar(w, p.unrealized_pl >= 0 ? "meter-green" : "meter-red") +
               '<span class="b-val">' + w.toFixed(1) + "%</span></div>";
           }).join("") +
           '<div class="bar-row"><span class="b-name" style="color:var(--ink-lo)">Cash</span>' +
@@ -336,11 +347,11 @@
         : C.stateHTML({ icon: "layers", title: "No positions", msg: "Nothing held — the portfolio is fully in cash.", compact: true }));
 
     var perfStats = C.kvHTML([
-      ["Equity", U.fmtMoney(acct.equity)],
+      ["Equity", val(U.fmtMoney(acct.equity))],
       ["Invested", U.fmtMoney(invested)],
-      ["Cash", U.fmtMoney(acct.cash)],
+      ["Cash", val(U.fmtMoney(acct.cash))],
       ["Unrealized P&L", '<span class="' + U.classFor(unreal) + '">' + U.fmtSigned(unreal) + "</span>"],
-      ["Today's P&L", '<span class="' + U.classFor(acct.day_pl) + '">' + U.fmtSigned(acct.day_pl) + " (" + U.fmtPct(acct.day_pl_pct) + ")</span>"],
+      ["Today's P&L", down ? "—" : '<span class="' + U.classFor(acct.day_pl) + '">' + U.fmtSigned(acct.day_pl) + " (" + U.fmtPct(acct.day_pl_pct) + ")</span>"],
       ["Account status", U.esc(acct.status || "—")],
     ]);
 
@@ -348,12 +359,12 @@
       (store.demo ? window.DemoBanner : "") +
       accountErrorBanner(acct) + botOfflineBanner() +
       '<div class="kpi-strip mb-12">' +
-        kpiTile("Equity", U.fmtMoney(acct.equity)) +
-        kpiTile("Invested", U.fmtMoney(invested), '<span>' + (positions.length ? positions.length + " positions" : "flat") + "</span>") +
-        kpiTile("Cash", U.fmtMoney(acct.cash)) +
+        kpiTile("Equity", val(U.fmtMoney(acct.equity)), down ? '<span class="t-faint">Broker API unreachable</span>' : "") +
+        kpiTile("Invested", val(U.fmtMoney(invested)), '<span>' + (positions.length ? positions.length + " positions" : "flat") + "</span>") +
+        kpiTile("Cash", val(U.fmtMoney(acct.cash)), down ? '<span class="t-faint">Unavailable</span>' : "") +
         kpiTile("Unrealized P&L", '<span class="' + U.classFor(unreal) + '">' + U.fmtSigned(unreal) + "</span>", '<span class="num ' + U.classFor(unreal) + '">open positions</span>') +
-        kpiTile("Today", '<span class="' + U.classFor(acct.day_pl) + '">' + U.fmtSigned(acct.day_pl) + "</span>", '<span class="num ' + U.classFor(acct.day_pl) + '">' + U.fmtPct(acct.day_pl_pct) + "</span>") +
-        kpiTile("Buying Power", U.fmtMoney(acct.buying_power)) +
+        kpiTile("Today", down ? "—" : '<span class="' + U.classFor(acct.day_pl) + '">' + U.fmtSigned(acct.day_pl) + "</span>", down ? '<span class="t-faint">Requires broker data</span>' : '<span class="num ' + U.classFor(acct.day_pl) + '">' + U.fmtPct(acct.day_pl_pct) + "</span>") +
+        kpiTile("Buying Power", val(U.fmtMoney(acct.buying_power)), down ? '<span class="t-faint">Unavailable</span>' : "") +
       "</div>" +
       '<div class="grid g-main mb-12">' +
         '<div class="span-main">' + P._chartCard() + "</div>" +
@@ -415,8 +426,8 @@
     );
   };
 
-  P.positions._bind = function (root, rerender) {
-    var state = { sort: "market_value", dir: -1, filter: "all", q: "" };
+  P.positions._bind = function (root, rerender, stateIn) {
+    var state = Object.assign({ sort: "market_value", dir: -1, filter: "all", q: "" }, stateIn || {});
     var q = qs("#pos-q", root);
     if (q) q.addEventListener("input", U.debounce(function () { state.q = q.value; rerender(state); }, 200));
     qsa("[data-posfilter]", root).forEach(function (b) {
@@ -484,8 +495,8 @@
     );
   };
 
-  P.orders._bind = function (root, rerender) {
-    var state = { side: "all", status: "all", q: "" };
+  P.orders._bind = function (root, rerender, stateIn) {
+    var state = Object.assign({ side: "all", status: "all", q: "" }, stateIn || {});
     var q = qs("#ord-q", root);
     if (q) q.addEventListener("input", U.debounce(function () { state.q = q.value; rerender(state); }, 200));
     var side = qs("#ord-side", root), status = qs("#ord-status", root);
@@ -663,8 +674,9 @@
       var a = acc.agents[m.key];
       var has = a && a.sample_size > 0 && a.hit_rate != null;
       var pct = has ? a.hit_rate * 100 : 0;
+      var cls = !has ? "" : pct >= 55 ? "meter-green" : "meter-amber";
       return '<div class="bar-row"><span class="b-name">' + m.label + "</span>" +
-        '<div class="meter' + (pct >= 55 ? " meter-green" : pct ? " meter-amber" : "") + '">' + (has ? C.meterHTML(pct, pct >= 55 ? "meter-green" : "meter-amber").replace(/^<div[^>]*>|<\/div>$/g, "") : "") + "</div>" +
+        '<div class="meter ' + cls + '">' + (has ? '<i style="width:' + pct.toFixed(1) + '%"></i>' : "") + "</div>" +
         '<span class="b-val">' + (has ? pct.toFixed(1) + "%" : "no data") + "</span></div>";
     }).join("");
 
@@ -705,6 +717,8 @@
     var maxPos = positions.length ? positions.reduce(function (a, b) { return (a.market_value || 0) >= (b.market_value || 0) ? a : b; }) : null;
     var maxConc = maxPos && equity ? ((maxPos.market_value || 0) / equity) * 100 : null;
     var limit = (cfg.max_position_pct || 0.10) * 100;
+    var down = !!acct.error;
+    var val = function (v) { return down ? "—" : v; };
 
     // live risk events from the log
     var riskLogs = logs().filter(function (l) { return l.agent === "risk" || (l.level === "WARNING" && /concentration|exposure|limit/i.test(l.message)); });
@@ -1021,9 +1035,9 @@
     }
   };
 
-  P.activity._bind = function (root, rerender) {
+  P.activity._bind = function (root, rerender, stateIn) {
     var params = App.store.ui.params;
-    var state = { cat: "all", agent: "all", level: "all", q: "", sym: (params && params.sym) || "" };
+    var state = Object.assign({ cat: "all", agent: "all", level: "all", q: "", sym: (params && params.sym) || "" }, stateIn || {});
     var q = qs("#act-q", root);
     if (q) q.addEventListener("input", U.debounce(function () { state.q = q.value; rerender(state); }, 200));
     var ag = qs("#act-agent", root), lv = qs("#act-level", root);

@@ -444,6 +444,9 @@ async def api_config():
         "enable_fundamentals_agent": settings.ENABLE_FUNDAMENTALS_AGENT,
         "enable_debate": settings.ENABLE_DEBATE,
         "enable_memory": settings.ENABLE_MEMORY,
+        "trading_mode": "PAPER",  # this application is hardcoded to paper trading
+        "memory_db_path": settings.MEMORY_DB_PATH,
+        "agent_accuracy_lookback": settings.AGENT_ACCURACY_LOOKBACK,
         "warnings": warnings,
     })
 
