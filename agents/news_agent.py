@@ -1,16 +1,16 @@
 """
 agents/news_agent.py
 
-Sentiment/News Agent powered by Google Gemini (gemini-2.5-flash).
+Sentiment/News Agent powered by Google Gemini (GEMINI_MODEL, default
+gemini-3.6-flash, via the Interactions API).
 Analyzes market news headlines for a given ticker and returns a
 structured sentiment assessment used by the CIO agent.
 """
 
-import json
 import logging
-import re
 
 from config import settings
+from services import gemini_service
 
 logger = logging.getLogger("news_agent")
 
@@ -29,15 +29,9 @@ Respond ONLY with a single valid JSON object, no markdown fences, no preamble, i
 
 
 def _extract_json(text: str) -> dict:
-    """Best-effort extraction of a JSON object from a model response,
-    tolerating stray markdown fences or extra text around the JSON."""
-    text = text.strip()
-    text = re.sub(r"^```(json)?", "", text).strip()
-    text = re.sub(r"```$", "", text).strip()
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if not match:
-        raise ValueError("No JSON object found in model response.")
-    return json.loads(match.group(0))
+    """Tolerant JSON extraction — kept for local use/testing; the live path
+    parses through services.gemini_service (same logic)."""
+    return gemini_service._extract_json(text)
 
 
 def analyze_news(symbol: str, headlines: list) -> dict:
@@ -77,20 +71,13 @@ def analyze_news(symbol: str, headlines: list) -> dict:
         return base_result
 
     try:
-        from google import genai
-
-        client = genai.Client(api_key=settings.GEMINI_API_KEY)
-
         headlines_block = "\n".join(f"- {h}" for h in headlines[:15])
-        prompt = f"{SYSTEM_INSTRUCTIONS}\n\nTicker: {symbol}\nHeadlines:\n{headlines_block}"
+        prompt = f"Ticker: {symbol}\nHeadlines:\n{headlines_block}"
 
-        response = client.models.generate_content(
-            model=settings.GEMINI_MODEL,
-            contents=prompt,
+        parsed = gemini_service.generate_json(
+            system_instructions=SYSTEM_INSTRUCTIONS,
+            input_text=prompt,
         )
-
-        raw_text = response.text or ""
-        parsed = _extract_json(raw_text)
 
         base_result["sentiment"] = str(parsed.get("sentiment", "NEUTRAL")).upper()
         base_result["confidence"] = float(parsed.get("confidence", 0.0))
