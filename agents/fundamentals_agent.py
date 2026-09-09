@@ -3,9 +3,11 @@ agents/fundamentals_agent.py
 
 Fundamentals Analyst -- adapted from TradingAgents' fundamentals analyst
 role. Pulls basic company financials via yfinance (free, no API key)
-and has an LLM (Gemini, GEMINI_MODEL, via the Interactions API -- same
-free tier already used by news_agent) interpret them into a directional
-signal for the CIO.
+and has an LLM (default Gemini — see GEMINI_MODEL in config.py) interpret
+them into a directional signal for the CIO.
+
+Provider/model: configured centrally via services/llm_service.py; no model
+id lives in this file.
 
 Data-layer behavior (Yahoo Finance is aggressively rate-limited, especially
 from cloud IPs):
@@ -19,13 +21,20 @@ from cloud IPs):
   - Any failure returns a clean {"error": "DATA_UNAVAILABLE: ..."} result —
     never a fabricated value, and never an exception that could take down
     the trading cycle.
+
+LLM-call reduction: the LLM analysis is cached per (symbol, exact metrics
+dict) for FUNDAMENTALS_ANALYSIS_CACHE_TTL_MINUTES. Fundamentals change at
+most daily, so unchanged metrics are never re-sent to the provider —
+cache hits are labeled ("cached": true), never hidden.
 """
 
+import hashlib
+import json
 import logging
 import time
 
 from config import settings
-from services import gemini_service
+from services import llm_service
 
 logger = logging.getLogger("fundamentals_agent")
 
@@ -49,8 +58,8 @@ Respond ONLY with a single valid JSON object, no markdown fences, no preamble:
 
 def _extract_json(text: str) -> dict:
     """Tolerant JSON extraction — kept for local use/testing; the live path
-    parses through services.gemini_service (same logic)."""
-    return gemini_service._extract_json(text)
+    parses through services.llm_service (same logic)."""
+    return llm_service.extract_json(text)
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +72,9 @@ _fundamentals_cache: dict = {}
 # monotonic timestamps for pacing and 429 backoff
 _last_yf_call: float = 0.0
 _yf_backoff_until: float = 0.0
+
+# (symbol, metrics_hash) -> (expires_at_monotonic, report_fields, stored_at)
+_analysis_cache: dict = {}
 
 
 def _is_rate_limit_error(exc: Exception) -> bool:
@@ -93,9 +105,11 @@ def _is_rate_limit_error(exc: Exception) -> bool:
 
 
 def reset_fundamentals_cache() -> None:
-    """Test/introspection hook: clears the cache and backoff state."""
+    """Test/introspection hook: clears the data cache, backoff state and the
+    LLM analysis cache."""
     global _yf_backoff_until, _last_yf_call
     _fundamentals_cache.clear()
+    _analysis_cache.clear()
     _yf_backoff_until = 0.0
     _last_yf_call = 0.0
 
@@ -184,9 +198,12 @@ def analyze_fundamentals(symbol: str, fundamentals: dict) -> dict:
           "signal": "BULLISH"/"BEARISH"/"NEUTRAL",
           "confidence": float,
           "summary": str,
-          "error": str | None
+          "error": str | None,
+          "provider": str, "model": str, "llm_status": str,
+          "latency_ms": float | null, "cached": bool
         }
     """
+    route = llm_service.route_info("fundamentals")
     base_result = {
         "agent": "fundamentals",
         "symbol": symbol,
@@ -194,13 +211,20 @@ def analyze_fundamentals(symbol: str, fundamentals: dict) -> dict:
         "confidence": 0.0,
         "summary": "",
         "error": None,
+        "provider": route["provider"],
+        "model": route["model"],
+        "llm_status": "NOT_CONFIGURED",
+        "latency_ms": None,
+        "cached": False,
     }
 
     if not settings.ENABLE_FUNDAMENTALS_AGENT:
+        base_result["llm_status"] = "SKIPPED_DISABLED"
         base_result["summary"] = "Fundamentals agent disabled via config."
         return base_result
 
     if fundamentals.get("error"):
+        base_result["llm_status"] = "SKIPPED_NO_DATA"
         base_result["error"] = fundamentals["error"]
         base_result["summary"] = "No usable fundamentals data available."
         return base_result
@@ -210,29 +234,53 @@ def analyze_fundamentals(symbol: str, fundamentals: dict) -> dict:
         base_result["summary"] = "Fundamentals agent disabled: missing API key."
         return base_result
 
-    try:
-        metrics_text = (
-            f"Symbol: {symbol}\n"
-            f"P/E ratio: {fundamentals.get('pe_ratio')}\n"
-            f"Forward P/E: {fundamentals.get('forward_pe')}\n"
-            f"Revenue growth (YoY): {fundamentals.get('revenue_growth')}\n"
-            f"Profit margin: {fundamentals.get('profit_margin')}\n"
-            f"Debt-to-equity: {fundamentals.get('debt_to_equity')}\n"
-            f"Return on equity: {fundamentals.get('return_on_equity')}\n"
-        )
+    # 1. Reuse the previous LLM analysis while the exact metrics are
+    # unchanged — fundamentals change at most daily, so this keeps the
+    # provider's daily request budget for symbols whose data actually moved.
+    metrics_payload = json.dumps(fundamentals, sort_keys=True, default=str)
+    key = (symbol, hashlib.sha1(metrics_payload.encode("utf-8")).hexdigest())
+    ttl = max(0.0, float(settings.FUNDAMENTALS_ANALYSIS_CACHE_TTL_MINUTES) * 60.0)
+    cached = _analysis_cache.get(key)
+    if cached and cached[0] > time.monotonic():
+        report = dict(cached[1])
+        report["cached"] = True
+        return report
 
-        parsed = gemini_service.generate_json(
-            system_instructions=SYSTEM_INSTRUCTIONS,
-            input_text=metrics_text,
-        )
+    metrics_text = (
+        f"Symbol: {symbol}\n"
+        f"P/E ratio: {fundamentals.get('pe_ratio')}\n"
+        f"Forward P/E: {fundamentals.get('forward_pe')}\n"
+        f"Revenue growth (YoY): {fundamentals.get('revenue_growth')}\n"
+        f"Profit margin: {fundamentals.get('profit_margin')}\n"
+        f"Debt-to-equity: {fundamentals.get('debt_to_equity')}\n"
+        f"Return on equity: {fundamentals.get('return_on_equity')}\n"
+    )
 
-        base_result["signal"] = str(parsed.get("signal", "NEUTRAL")).upper()
-        base_result["confidence"] = float(parsed.get("confidence", 0.0))
-        base_result["summary"] = str(parsed.get("summary", ""))
-        return base_result
+    result = llm_service.call_json(
+        "fundamentals",
+        system=SYSTEM_INSTRUCTIONS,
+        user=metrics_text,
+        temperature=0.2,
+        max_tokens=400,
+        symbol=symbol,
+    )
 
-    except Exception as e:
-        logger.error(f"Fundamentals agent failed for {symbol}: {e}")
-        base_result["error"] = str(e)
+    base_result["llm_status"] = result.status
+    base_result["model"] = result.model
+    base_result["latency_ms"] = result.latency_ms
+
+    if not result.ok:
+        logger.error(f"Fundamentals agent failed for {symbol}: {result.error}")
+        base_result["error"] = result.error
         base_result["summary"] = "Fundamentals agent encountered an error; defaulting to NEUTRAL."
         return base_result
+
+    parsed = result.parsed
+    base_result["signal"] = str(parsed.get("signal", "NEUTRAL")).upper()
+    base_result["confidence"] = float(parsed.get("confidence", 0.0))
+    base_result["summary"] = str(parsed.get("summary", ""))
+
+    if ttl > 0:
+        stored = dict(base_result)
+        _analysis_cache[key] = (time.monotonic() + ttl, stored, time.monotonic())
+    return base_result

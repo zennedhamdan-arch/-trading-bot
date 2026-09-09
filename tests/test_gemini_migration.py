@@ -259,7 +259,7 @@ if hits:
         print("      stale:", h)
 
 res2 = subprocess.run(
-    ["grep", "-rn", "generate_content", "--include=*.py", "."],
+    ["grep", "-rn", "generate_content(", "--include=*.py", "."],
     capture_output=True, text=True,
 )
 hits2 = [l for l in res2.stdout.splitlines() if ".venv/" not in l and "__pycache__" not in l and "test_gemini_migration" not in l]

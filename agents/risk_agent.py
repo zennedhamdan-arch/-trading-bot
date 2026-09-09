@@ -1,17 +1,27 @@
 """
 agents/risk_agent.py
 
-Risk Agent powered by OpenRouter (deepseek/deepseek-r1:free).
-Enforces portfolio position sizing and risk limits before any trade
-is allowed to proceed. Uses the OpenAI-compatible client pointed at
-OpenRouter's base URL, as recommended by OpenRouter's docs.
+Risk Agent. Enforces portfolio position sizing and risk limits before any
+trade is allowed to proceed.
+
+Provider/model: configured centrally via services/llm_service.py via
+OPENROUTER_RISK_MODEL (default: a model verified free on OpenRouter's
+live catalog at the time of writing — see config.py; no model id lives
+in this file). If the configured model is unavailable, the provider
+layer returns a clear MODEL_NOT_FOUND / PROVIDER_QUOTA_EXCEEDED status
+and this agent BLOCKS the trade — it never silently produces a fake
+risk verdict.
+
+The hard numeric safety clamp (never exceed max position pct of equity,
+never exceed available cash) is deterministic code, independent of what
+any LLM says.
 """
 
 import json
 import logging
-import re
 
 from config import settings
+from services import llm_service
 
 logger = logging.getLogger("risk_agent")
 
@@ -37,13 +47,9 @@ Respond ONLY with a single valid JSON object, no markdown fences, no preamble, i
 
 
 def _extract_json(text: str) -> dict:
-    text = text.strip()
-    text = re.sub(r"^```(json)?", "", text).strip()
-    text = re.sub(r"```$", "", text).strip()
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if not match:
-        raise ValueError("No JSON object found in model response.")
-    return json.loads(match.group(0))
+    """Tolerant JSON extraction — kept for local use/testing; the live path
+    parses through services.llm_service (same logic)."""
+    return llm_service.extract_json(text)
 
 
 def assess_risk(symbol: str, proposed_side: str, account_summary: dict,
@@ -63,9 +69,11 @@ def assess_risk(symbol: str, proposed_side: str, account_summary: dict,
           "max_notional_usd": float,
           "risk_level": "LOW"/"MEDIUM"/"HIGH",
           "reasoning": str,
-          "error": str | None
+          "error": str | None,
+          "provider": str, "model": str, "llm_status": str, "latency_ms": float | null
         }
     """
+    route = llm_service.route_info("risk")
     base_result = {
         "agent": "risk",
         "symbol": symbol,
@@ -74,6 +82,10 @@ def assess_risk(symbol: str, proposed_side: str, account_summary: dict,
         "risk_level": "HIGH",
         "reasoning": "",
         "error": None,
+        "provider": route["provider"],
+        "model": route["model"],
+        "llm_status": "NOT_CONFIGURED",
+        "latency_ms": None,
     }
 
     if not settings.OPENROUTER_API_KEY:
@@ -85,52 +97,48 @@ def assess_risk(symbol: str, proposed_side: str, account_summary: dict,
     cash = account_summary.get("cash", 0.0)
 
     if equity <= 0:
+        base_result["llm_status"] = "SKIPPED_NO_DATA"
         base_result["reasoning"] = "Portfolio equity is zero or unavailable; blocking trade."
         return base_result
 
-    try:
-        from openai import OpenAI
+    context_text = (
+        f"Symbol: {symbol}\n"
+        f"Proposed side: {proposed_side}\n"
+        f"Portfolio equity: ${equity:.2f}\n"
+        f"Available cash: ${cash:.2f}\n"
+        f"Max position percent allowed: {settings.MAX_POSITION_PCT * 100:.1f}%\n"
+        f"Existing position in {symbol}: {json.dumps(existing_position) if existing_position else 'None'}\n"
+    )
 
-        client = OpenAI(
-            api_key=settings.OPENROUTER_API_KEY,
-            base_url=settings.OPENROUTER_BASE_URL,
-        )
+    result = llm_service.call_json(
+        "risk",
+        system=SYSTEM_INSTRUCTIONS,
+        user=context_text,
+        temperature=0.1,
+        max_tokens=500,
+        symbol=symbol,
+    )
 
-        context_text = (
-            f"Symbol: {symbol}\n"
-            f"Proposed side: {proposed_side}\n"
-            f"Portfolio equity: ${equity:.2f}\n"
-            f"Available cash: ${cash:.2f}\n"
-            f"Max position percent allowed: {settings.MAX_POSITION_PCT * 100:.1f}%\n"
-            f"Existing position in {symbol}: {json.dumps(existing_position) if existing_position else 'None'}\n"
-        )
+    base_result["llm_status"] = result.status
+    base_result["model"] = result.model
+    base_result["latency_ms"] = result.latency_ms
 
-        completion = client.chat.completions.create(
-            model=settings.OPENROUTER_RISK_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_INSTRUCTIONS},
-                {"role": "user", "content": context_text},
-            ],
-            temperature=0.1,
-            max_tokens=500,
-        )
-
-        raw_text = completion.choices[0].message.content or ""
-        parsed = _extract_json(raw_text)
-
-        # Hard safety clamp: never trust the LLM's number beyond our own ceiling.
-        hard_cap = equity * settings.MAX_POSITION_PCT
-        requested = float(parsed.get("max_notional_usd", 0.0))
-        clamped_notional = max(0.0, min(requested, hard_cap, cash))
-
-        base_result["approved"] = bool(parsed.get("approved", False)) and clamped_notional > 0
-        base_result["max_notional_usd"] = round(clamped_notional, 2)
-        base_result["risk_level"] = str(parsed.get("risk_level", "HIGH")).upper()
-        base_result["reasoning"] = str(parsed.get("reasoning", ""))
+    if not result.ok:
+        # Provider/model failure -> explicit, visible error; trade blocked.
+        logger.error(f"Risk agent failed for {symbol}: {result.error}")
+        base_result["error"] = result.error
+        base_result["reasoning"] = f"Risk agent provider error ({result.status}); blocking trade by default (fail-safe)."
         return base_result
 
-    except Exception as e:
-        logger.error(f"Risk agent failed for {symbol}: {e}")
-        base_result["error"] = str(e)
-        base_result["reasoning"] = "Risk agent encountered an error; blocking trade by default (fail-safe)."
-        return base_result
+    parsed = result.parsed
+
+    # Hard safety clamp: never trust the LLM's number beyond our own ceiling.
+    hard_cap = equity * settings.MAX_POSITION_PCT
+    requested = float(parsed.get("max_notional_usd", 0.0))
+    clamped_notional = max(0.0, min(requested, hard_cap, cash))
+
+    base_result["approved"] = bool(parsed.get("approved", False)) and clamped_notional > 0
+    base_result["max_notional_usd"] = round(clamped_notional, 2)
+    base_result["risk_level"] = str(parsed.get("risk_level", "HIGH")).upper()
+    base_result["reasoning"] = str(parsed.get("reasoning", ""))
+    return base_result

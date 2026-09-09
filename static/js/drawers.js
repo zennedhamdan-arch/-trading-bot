@@ -294,6 +294,38 @@
       );
     }
 
+    function llmUsageSection(c) {
+      var u = c.llm_usage;
+      if (!u || !Object.keys(u).length) return "";
+      var provNames = { groq: "Groq", openrouter: "OpenRouter", gemini: "Gemini" };
+      var agentNames = { technical: "Technical", debate: "Debate", cio: "CIO", risk: "Risk", news: "News", fundamentals: "Fundamentals" };
+      var rows = Object.keys(u).map(function (p) {
+        var d = u[p];
+        var agents = Object.keys(d.by_agent || {}).map(function (a) {
+          var ad = d.by_agent[a];
+          return U.esc(agentNames[a] || a) + " " + ad.ok + "/" + ad.requests;
+        }).join(", ");
+        var errs = Object.keys(d.errors || {}).map(function (s) { return U.esc(s); }).join(", ");
+        return (
+          "<tr><td><span class='sym'>" + U.esc(provNames[p] || p) + "</span></td>" +
+          '<td class="r">' + d.requests + "</td>" +
+          '<td class="r" style="color:var(--green)">' + d.ok + "</td>" +
+          (errs
+            ? '<td class="r" style="color:var(--red)">' + (d.requests - d.ok) + "</td>"
+            : '<td class="r" style="color:var(--green)">0</td>') +
+          "<td>" + (agents || "\u2014") + "</td>" +
+          "<td>" + (errs ? '<span style="color:var(--red)">' + errs + "</span>" : '<span class="pos">clean</span>') + "</td>" +
+          "</tr>"
+        );
+      }).join("");
+      return (
+        '<div class="dsec">' + C.sectionTitle("cpu", "LLM Calls (per provider)") +
+          '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Provider</th><th class="r">Requests</th><th class="r">OK</th><th class="r">Failed</th><th>Agents (ok/req)</th><th>Errors</th></tr></thead><tbody>' + rows + "</tbody></table></div>" +
+          '<div class="note" style="margin-top:8px">' + ICON("info") + "<span>Live LLM requests this cycle. Re-used analyses (unchanged headlines/fundamentals) and quota-blocked requests are not sent, so they do not appear here \u2014 check the provider's daily budget on the Health page.</span>" +
+        "</div></div>"
+      );
+    }
+
     var stages = [
       { name: "Market Data", icon: "globe", ok: c.status !== "ERROR" && logs.length > 0 },
       { name: "Technical Agent", icon: "chart-candle", ok: has("technical") },
@@ -371,6 +403,7 @@
         }).join("") +
       "</div>" +
       agentStatusMatrix(c) +
+      llmUsageSection(c) +
       (decisionRows
         ? '<div class="dsec">' + C.sectionTitle("gavel", "Decisions") +
             '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Symbol</th><th>Decision</th><th class="r">Confidence</th><th class="r">Notional</th></tr></thead><tbody>' + decisionRows + "</tbody></table></div>" +
@@ -407,12 +440,12 @@
      ========================================================================== */
 
   var AGENT_ROLES = {
-    technical: "Interprets RSI, 50/200-day moving averages and MACD into a BULLISH / BEARISH / NEUTRAL signal (Groq · llama-3.1).",
-    news: "Scans recent headlines via the Alpaca News API and scores sentiment (Gemini).",
-    fundamentals: "Reads valuation, growth, margins and balance-sheet health from yfinance data (Gemini).",
-    debate: "Two opposing researchers argue the strongest bull and bear cases from the same data (Groq).",
-    risk: "Hard constraint layer: approves/blocks trades and caps notional by exposure and concentration rules (OpenRouter).",
-    cio: "Chief Investment Officer: weighs every agent report, the debate edge, agent accuracy weights and memory, then issues the final BUY / SELL / HOLD (Groq · llama-3.3-70b).",
+    technical: "Interprets RSI, 50/200-day moving averages and MACD into a BULLISH / BEARISH / NEUTRAL signal (Groq; model set via GROQ_TECH_MODEL).",
+    news: "Scans recent headlines via the Alpaca News API and scores sentiment (Gemini; model set via GEMINI_MODEL).",
+    fundamentals: "Reads valuation, growth, margins and balance-sheet health from yfinance data (Gemini; model set via GEMINI_MODEL).",
+    debate: "Two opposing researchers argue the strongest bull and bear cases from the same data in one structured call (Groq; model set via GROQ_DEBATE_MODEL).",
+    risk: "Hard constraint layer: approves/blocks trades and caps notional by exposure and concentration rules (OpenRouter; model set via OPENROUTER_RISK_MODEL).",
+    cio: "Chief Investment Officer: weighs every agent report, the debate edge, agent accuracy weights and memory, then issues the final BUY / SELL / HOLD (Groq; model set via GROQ_CIO_MODEL).",
     execution: "Submits paper market orders to Alpaca when the CIO issues an actionable decision.",
     memory: "SQLite-backed decision log; computes realized P&L on closed trades and feeds agent accuracy weights back into the CIO.",
     system: "Bot process, scheduler and configuration events.",

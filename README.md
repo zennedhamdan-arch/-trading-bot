@@ -26,7 +26,13 @@ every control (start/stop bot, run cycle, filters, drawers) still works.
    - **Groq** — technical/debate/CIO agents (free tier)
    - **Gemini** — news/fundamentals agents (free)
    - **OpenRouter** — risk agent (free models)
-3. Restart: `./run.sh`
+3. Optionally set the model ids (defaults verified Sept 2026; validated
+   against each provider's live catalog at startup — see "Model & quota
+   configuration" below):
+   - `GROQ_TECH_MODEL` / `GROQ_DEBATE_MODEL` / `GROQ_CIO_MODEL`
+   - `OPENROUTER_RISK_MODEL`
+   - `GEMINI_MODEL`
+4. Restart: `./run.sh`
 4. In the dashboard header, press **Start** — the scheduler runs a full agent
    cycle every `CYCLE_INTERVAL_MINUTES` (default 15). Press **Run Cycle** any
    time to force one immediately.
@@ -40,6 +46,44 @@ per-cycle execution records (Cycles), risk verdicts (Risk), agent accuracy
 `http://localhost:8000/?demo=1` renders the complete UI with clearly-labeled
 sample data (hatched amber banner on every screen) — useful for evaluating the
 design without a running bot. It never mixes with live data.
+
+## Model & quota configuration
+
+All agent→model routing lives in `services/llm_service.py` and is driven by
+environment variables — no model ids are hardcoded in agent files.
+
+| Agent | Provider | Env var | Default (verified Sept 2026) |
+|---|---|---|---|
+| Technical | Groq | `GROQ_TECH_MODEL` | `openai/gpt-oss-20b` |
+| Debate | Groq | `GROQ_DEBATE_MODEL` | `openai/gpt-oss-20b` |
+| CIO | Groq | `GROQ_CIO_MODEL` | `openai/gpt-oss-120b` |
+| Risk | OpenRouter | `OPENROUTER_RISK_MODEL` | `openai/gpt-oss-20b:free` |
+| News | Gemini | `GEMINI_MODEL` | `gemini-3.6-flash` |
+| Fundamentals | Gemini | `GEMINI_MODEL` | `gemini-3.6-flash` |
+
+- **Validation**: at startup every configured model id is checked against the
+  provider's live `/models` catalog. A missing model is reported on the
+  dashboard (Health page) and every request for it fails with a clear
+  `MODEL_NOT_FOUND` status — never a fabricated result.
+- **Quota handling**: each provider has a local rolling-24h request budget
+  (`*_DAILY_REQUEST_LIMIT`; Gemini defaults to 20/day, its free-tier limit).
+  When the budget is hit — or the provider returns a quota-exhausted 429 —
+  further requests short-circuit with `PROVIDER_QUOTA_EXCEEDED` and the
+  affected agents are marked UNAVAILABLE for that cycle. Quota exhaustion is
+  never retried and never falls back to another model; transient rate limits
+  (429 with a short retry delay) get at most one bounded retry.
+- **Call reduction**: the Gemini-backed news/fundamentals agents reuse their
+  previous LLM analysis while the underlying headlines/metrics are unchanged
+  (`NEWS_ANALYSIS_CACHE_TTL_MINUTES`, `FUNDAMENTALS_ANALYSIS_CACHE_TTL_MINUTES`),
+  and the bull/bear debate is one structured call per symbol (not two). A
+  full 5-symbol cycle sends 15 Groq, 5 OpenRouter and at most 10 Gemini
+  requests — and typically 0 Gemini requests once analyses are cached.
+- **Fallbacks**: disabled by default. A fallback model is used only when
+  explicitly configured (`*_FALLBACK_MODEL`) AND verified in the provider's
+  live catalog at startup — never for quota errors, never silently.
+- **Per-cycle accounting**: every cycle record (`/api/cycles`, Cycles page →
+  cycle detail) carries `llm_usage`: exact request counts per provider, per
+  agent and per symbol, with statuses. Nothing is hidden.
 
 ## Operational notes
 

@@ -1,10 +1,12 @@
 """
 agents/cio_agent.py
 
-Executive (CIO) Agent powered by Groq (llama-3.3-70b-versatile).
-Weighs the outputs of the News, Technical, Fundamentals, Risk, and
-Bull/Bear Debate agents and issues the final BUY / SELL / HOLD decision
-for a symbol.
+Executive (CIO) Agent. Weighs the outputs of the News, Technical,
+Fundamentals, Risk, and Bull/Bear Debate agents and issues the final
+BUY / SELL / HOLD decision for a symbol.
+
+Provider/model: configured centrally via services/llm_service.py
+(GROQ_CIO_MODEL; no model id lives in this file).
 
 Also incorporates:
   - Adaptive agent weighting: each agent's historical hit rate (from
@@ -13,13 +15,18 @@ Also incorporates:
   - Recent outcome memory: a summary of the last several closed trades
     for this symbol, so the CIO has continuity across cycles instead
     of deciding from scratch every time.
+
+Safety (unchanged): the risk agent's approval is a hard constraint, and
+the notional is clamped deterministically regardless of what the model
+says. If the CIO cannot obtain a valid LLM response, it HOLDs (fail-safe)
+with an explicit error — never a fabricated decision.
 """
 
 import json
 import logging
-import re
 
 from config import settings
+from services import llm_service
 
 logger = logging.getLogger("cio_agent")
 
@@ -54,13 +61,9 @@ Respond ONLY with a single valid JSON object, no markdown fences, no preamble, i
 
 
 def _extract_json(text: str) -> dict:
-    text = text.strip()
-    text = re.sub(r"^```(json)?", "", text).strip()
-    text = re.sub(r"```$", "", text).strip()
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if not match:
-        raise ValueError("No JSON object found in model response.")
-    return json.loads(match.group(0))
+    """Tolerant JSON extraction — kept for local use/testing; the live path
+    parses through services.llm_service (same logic)."""
+    return llm_service.extract_json(text)
 
 
 def make_decision(symbol: str, news_report: dict, tech_report: dict, risk_report: dict,
@@ -85,9 +88,11 @@ def make_decision(symbol: str, news_report: dict, tech_report: dict, risk_report
           "confidence": float,
           "notional_usd": float,
           "reasoning": str,
-          "error": str | None
+          "error": str | None,
+          "provider": str, "model": str, "llm_status": str, "latency_ms": float | null
         }
     """
+    route = llm_service.route_info("cio")
     base_result = {
         "agent": "cio",
         "symbol": symbol,
@@ -96,6 +101,10 @@ def make_decision(symbol: str, news_report: dict, tech_report: dict, risk_report
         "notional_usd": 0.0,
         "reasoning": "",
         "error": None,
+        "provider": route["provider"],
+        "model": route["model"],
+        "llm_status": "NOT_CONFIGURED",
+        "latency_ms": None,
     }
 
     if not settings.GROQ_API_KEY:
@@ -103,77 +112,73 @@ def make_decision(symbol: str, news_report: dict, tech_report: dict, risk_report
         base_result["reasoning"] = "CIO agent disabled: missing API key. Defaulting to HOLD."
         return base_result
 
-    try:
-        from groq import Groq
-
-        client = Groq(api_key=settings.GROQ_API_KEY)
-
-        context_parts = [
-            f"Symbol: {symbol}\n",
-            f"--- News/Sentiment Agent Report ---\n{json.dumps(news_report, indent=2)}\n",
-            f"--- Technical Agent Report ---\n{json.dumps(tech_report, indent=2)}\n",
-        ]
-        if fundamentals_report:
-            context_parts.append(
-                f"--- Fundamentals Agent Report ---\n{json.dumps(fundamentals_report, indent=2)}\n"
-            )
-        if debate_report:
-            context_parts.append(
-                f"--- Bull vs Bear Debate ---\n"
-                f"Bull case (strength {debate_report.get('bull_strength')}): {debate_report.get('bull_summary')}\n"
-                f"Bear case (strength {debate_report.get('bear_strength')}): {debate_report.get('bear_summary')}\n"
-                f"Net edge (bull - bear): {debate_report.get('edge')}\n"
-            )
+    context_parts = [
+        f"Symbol: {symbol}\n",
+        f"--- News/Sentiment Agent Report ---\n{json.dumps(news_report, indent=2)}\n",
+        f"--- Technical Agent Report ---\n{json.dumps(tech_report, indent=2)}\n",
+    ]
+    if fundamentals_report:
         context_parts.append(
-            f"--- Risk Agent Report ---\n{json.dumps(risk_report, indent=2)}\n"
+            f"--- Fundamentals Agent Report ---\n{json.dumps(fundamentals_report, indent=2)}\n"
         )
-        if agent_weights:
-            weight_lines = "\n".join(
-                f"  {name}: weight={w.get('weight')} (hit rate {w.get('hit_rate')}, n={w.get('sample_size')})"
-                for name, w in agent_weights.items()
-            )
-            context_parts.append(f"--- Agent Historical Accuracy Weights ---\n{weight_lines}\n")
-        if memory_summary:
-            context_parts.append(f"--- Recent Outcome History ---\n{memory_summary}\n")
-
-        context_text = "\n".join(context_parts)
-
-        completion = client.chat.completions.create(
-            model=settings.GROQ_CIO_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_INSTRUCTIONS},
-                {"role": "user", "content": context_text},
-            ],
-            temperature=0.2,
-            max_tokens=700,
+    if debate_report:
+        context_parts.append(
+            f"--- Bull vs Bear Debate ---\n"
+            f"Bull case (strength {debate_report.get('bull_strength')}): {debate_report.get('bull_summary')}\n"
+            f"Bear case (strength {debate_report.get('bear_strength')}): {debate_report.get('bear_summary')}\n"
+            f"Net edge (bull - bear): {debate_report.get('edge')}\n"
         )
+    context_parts.append(
+        f"--- Risk Agent Report ---\n{json.dumps(risk_report, indent=2)}\n"
+    )
+    if agent_weights:
+        weight_lines = "\n".join(
+            f"  {name}: weight={w.get('weight')} (hit rate {w.get('hit_rate')}, n={w.get('sample_size')})"
+            for name, w in agent_weights.items()
+        )
+        context_parts.append(f"--- Agent Historical Accuracy Weights ---\n{weight_lines}\n")
+    if memory_summary:
+        context_parts.append(f"--- Recent Outcome History ---\n{memory_summary}\n")
 
-        raw_text = completion.choices[0].message.content or ""
-        parsed = _extract_json(raw_text)
+    context_text = "\n".join(context_parts)
 
-        decision = str(parsed.get("decision", "HOLD")).upper()
-        notional = float(parsed.get("notional_usd", 0.0))
+    result = llm_service.call_json(
+        "cio",
+        system=SYSTEM_INSTRUCTIONS,
+        user=context_text,
+        temperature=0.2,
+        max_tokens=700,
+        symbol=symbol,
+    )
 
-        # Hard safety enforcement: never allow a BUY if risk agent didn't approve,
-        # and never exceed the risk agent's approved notional, regardless of
-        # what the CIO model says.
-        if decision == "BUY":
-            if not risk_report.get("approved", False):
-                decision = "HOLD"
-                notional = 0.0
-            else:
-                notional = min(notional, risk_report.get("max_notional_usd", 0.0))
-        else:
-            notional = 0.0
+    base_result["llm_status"] = result.status
+    base_result["model"] = result.model
+    base_result["latency_ms"] = result.latency_ms
 
-        base_result["decision"] = decision
-        base_result["confidence"] = float(parsed.get("confidence", 0.0))
-        base_result["notional_usd"] = round(max(0.0, notional), 2)
-        base_result["reasoning"] = str(parsed.get("reasoning", ""))
-        return base_result
-
-    except Exception as e:
-        logger.error(f"CIO agent failed for {symbol}: {e}")
-        base_result["error"] = str(e)
+    if not result.ok:
+        logger.error(f"CIO agent failed for {symbol}: {result.error}")
+        base_result["error"] = result.error
         base_result["reasoning"] = "CIO agent encountered an error; defaulting to HOLD (fail-safe)."
         return base_result
+
+    parsed = result.parsed
+    decision = str(parsed.get("decision", "HOLD")).upper()
+    notional = float(parsed.get("notional_usd", 0.0))
+
+    # Hard safety enforcement: never allow a BUY if risk agent didn't approve,
+    # and never exceed the risk agent's approved notional, regardless of
+    # what the CIO model says.
+    if decision == "BUY":
+        if not risk_report.get("approved", False):
+            decision = "HOLD"
+            notional = 0.0
+        else:
+            notional = min(notional, risk_report.get("max_notional_usd", 0.0))
+    else:
+        notional = 0.0
+
+    base_result["decision"] = decision
+    base_result["confidence"] = float(parsed.get("confidence", 0.0))
+    base_result["notional_usd"] = round(max(0.0, notional), 2)
+    base_result["reasoning"] = str(parsed.get("reasoning", ""))
+    return base_result

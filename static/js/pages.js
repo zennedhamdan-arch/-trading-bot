@@ -889,11 +889,50 @@
     var agentErrs = {};
     logs().forEach(function (l) { if (l.level === "ERROR" && l.agent) agentErrs[l.agent] = (agentErrs[l.agent] || 0) + 1; });
 
+    var providerCards = (function () {
+      var routes = cfg.llm_routes || {};
+      var validation = cfg.llm_model_validation || { providers: {} };
+      var quota = cfg.llm_quota || {};
+      var provNames = { groq: "Groq", gemini: "Gemini", openrouter: "OpenRouter" };
+      function modelsFor(provider) {
+        var models = [];
+        Object.keys(routes).forEach(function (a) {
+          if (routes[a].provider === provider && routes[a].model && models.indexOf(routes[a].model) < 0) models.push(routes[a].model);
+        });
+        return models;
+      }
+      return ["groq", "gemini", "openrouter"].map(function (p) {
+        var entry = (validation.providers || {})[p] || {};
+        var q = quota[p] || {};
+        var missing = (entry.missing || []).length;
+        var models = modelsFor(p);
+        var tone = missing || (entry.error && ("" + entry.error).indexOf("not configured") < 0 && !entry.ok) ? "err" : (entry.error ? "warn" : "ok");
+        var sub;
+        if (entry.error && ("" + entry.error).indexOf("not configured") >= 0) {
+          sub = "API key not configured \u2014 agents on this provider are disabled";
+          tone = "warn";
+        } else if (missing) {
+          sub = U.esc((entry.missing || [])[0]) + (missing > 1 ? " +" + (missing - 1) + " more" : "") + " not in live catalog";
+        } else {
+          sub = models.map(function (m) { return U.esc(m); }).join(" \u00b7 ") || "no models routed";
+        }
+        var qTxt = "";
+        if (q.daily_request_limit > 0) {
+          qTxt = " \u00b7 " + (q.requests_last_24h || 0) + "/" + q.daily_request_limit + " req (24h)";
+          if (q.backoff_active) { qTxt += " \u00b7 QUOTA PAUSED " + Math.ceil((q.backoff_seconds_remaining || 0) / 60) + "m"; tone = "err"; }
+          else if ((q.requests_last_24h || 0) >= q.daily_request_limit) { tone = "err"; }
+        }
+        return healthCard((provNames[p] || p) + " Models", tone === "ok" ? "VERIFIED" : tone === "err" ? "PROBLEM" : "CHECK CFG", tone, "brain",
+          sub + qTxt);
+      }).join("");
+    })();
+
     var cards =
       healthCard("Bot Process", st.running ? "ONLINE" : "OFFLINE", st.running ? "ok" : "err", "power",
         st.running ? "Running since " + U.fmtDateTime(st.started_at) : "The trading engine is stopped") +
       healthCard("Alpaca API", acct.error ? "UNREACHABLE" : "CONNECTED", acct.error ? "err" : "ok", "link",
         acct.error ? U.esc(acct.error) : "Paper trading endpoint") +
+      providerCards +
       healthCard("AI Providers", cfg.warnings && cfg.warnings.length ? "DEGRADED" : "CONNECTED", cfg.warnings && cfg.warnings.length ? "warn" : "ok", "brain",
         cfg.warnings ? U.esc(cfg.warnings.length + " configuration warning" + (cfg.warnings.length > 1 ? "s" : "")) : "Groq · Gemini · OpenRouter") +
       healthCard("Database", cfg.enable_memory ? "CONNECTED" : "DISABLED", cfg.enable_memory ? "ok" : "warn", "db",

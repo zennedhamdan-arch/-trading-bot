@@ -3,61 +3,50 @@ agents/debate_agent.py
 
 Bull vs Bear debate -- adapted from TradingAgents' bull/bear researcher
 debate step. Instead of feeding the CIO a single pass per agent, two
-opposing personas independently argue the strongest possible case for
-buying vs. avoiding/selling the symbol, using the SAME underlying data
-(technical + news + fundamentals) that the other agents already saw.
+opposing personas argue the strongest possible case for buying vs.
+avoiding/selling the symbol, using the SAME underlying data (technical +
+news + fundamentals) that the other agents already saw.
 
 This surfaces one-sided reasoning: if the bear case is much stronger
 than the bull case despite a nominally "BULLISH" technical read, the
 CIO sees that tension directly instead of it being averaged away.
 
-Uses Groq's free tier (same provider as tech_agent/cio_agent), just two
-extra short completions per symbol per cycle.
+Provider/model: configured centrally via services/llm_service.py
+(GROQ_DEBATE_MODEL; no model id lives in this file).
+
+LLM-call efficiency: bull and bear cases are produced by ONE structured
+request per symbol (the model returns both sides in a single JSON
+object) rather than two separate completions with identical context —
+same reasoning quality, half the calls.
 """
 
-import json
 import logging
-import re
 
 from config import settings
+from services import llm_service
 
 logger = logging.getLogger("debate_agent")
 
-BULL_INSTRUCTIONS = """You are the Bull Researcher on a trading desk. Your job is to
-build the STRONGEST possible case for why this stock should be bought or held,
-using the data provided. Be persuasive but honest -- do not invent facts not
-supported by the data. If the data genuinely does not support a bull case,
-say so plainly rather than forcing one.
+DEBATE_INSTRUCTIONS = """You are running a bull vs. bear debate on a trading desk for one stock.
+Using ONLY the data provided, write the STRONGEST possible case FOR buying or holding
+the stock (the bull case), and the STRONGEST possible case AGAINST it (the bear case).
+Be persuasive but honest -- do not invent facts not supported by the data. If the data
+genuinely does not support a case, say so plainly rather than forcing one.
 
-Respond ONLY with a single valid JSON object, no markdown fences, no preamble:
+Respond ONLY with a single valid JSON object, no markdown fences, no preamble, in this exact shape:
 {
-  "strength": <float 0.0 to 1.0, how strong the bull case actually is>,
-  "summary": "<two to three sentence bull argument>"
-}
-"""
-
-BEAR_INSTRUCTIONS = """You are the Bear Researcher on a trading desk. Your job is to
-build the STRONGEST possible case for why this stock should be avoided or sold,
-using the data provided. Be persuasive but honest -- do not invent facts not
-supported by the data. If the data genuinely does not support a bear case,
-say so plainly rather than forcing one.
-
-Respond ONLY with a single valid JSON object, no markdown fences, no preamble:
-{
-  "strength": <float 0.0 to 1.0, how strong the bear case actually is>,
-  "summary": "<two to three sentence bear argument>"
+  "bull_strength": <float 0.0 to 1.0, how strong the bull case actually is>,
+  "bull_summary": "<two to three sentence bull argument>",
+  "bear_strength": <float 0.0 to 1.0, how strong the bear case actually is>,
+  "bear_summary": "<two to three sentence bear argument>"
 }
 """
 
 
 def _extract_json(text: str) -> dict:
-    text = text.strip()
-    text = re.sub(r"^```(json)?", "", text).strip()
-    text = re.sub(r"```$", "", text).strip()
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if not match:
-        raise ValueError("No JSON object found in model response.")
-    return json.loads(match.group(0))
+    """Tolerant JSON extraction — kept for local use/testing; the live path
+    parses through services.llm_service (same logic)."""
+    return llm_service.extract_json(text)
 
 
 def _build_context(symbol: str, tech_report: dict, news_report: dict,
@@ -74,41 +63,12 @@ def _build_context(symbol: str, tech_report: dict, news_report: dict,
     return "\n".join(parts)
 
 
-def _run_side(system_instructions: str, context_text: str) -> dict:
-    if not settings.GROQ_API_KEY:
-        return {"strength": 0.0, "summary": "Debate disabled: missing GROQ_API_KEY.", "error": "GROQ_API_KEY not configured."}
-
-    try:
-        from groq import Groq
-
-        client = Groq(api_key=settings.GROQ_API_KEY)
-        completion = client.chat.completions.create(
-            model=settings.GROQ_TECH_MODEL,  # reuse the cheap/fast free-tier model
-            messages=[
-                {"role": "system", "content": system_instructions},
-                {"role": "user", "content": context_text},
-            ],
-            temperature=0.4,
-            max_tokens=300,
-        )
-        raw_text = completion.choices[0].message.content or ""
-        parsed = _extract_json(raw_text)
-        return {
-            "strength": float(parsed.get("strength", 0.0)),
-            "summary": str(parsed.get("summary", "")),
-            "error": None,
-        }
-    except Exception as e:
-        logger.error(f"Debate side failed: {e}")
-        return {"strength": 0.0, "summary": "Debate agent encountered an error.", "error": str(e)}
-
-
 def run_debate(symbol: str, tech_report: dict, news_report: dict,
                fundamentals_report: dict = None) -> dict:
     """
-    Runs the bull and bear cases independently and returns both plus a
-    simple "edge" score (bull_strength - bear_strength) the CIO can use
-    as an extra signal alongside the individual agent reports.
+    Runs the bull and bear cases in one structured request and returns both
+    plus a simple "edge" score (bull_strength - bear_strength) the CIO can
+    use as an extra signal alongside the individual agent reports.
 
     Returns:
         {
@@ -119,26 +79,64 @@ def run_debate(symbol: str, tech_report: dict, news_report: dict,
           "bear_strength": float,
           "bear_summary": str,
           "edge": float,  # positive = bull case wins, negative = bear case wins
+          "error": str | null,
+          "provider": str, "model": str, "llm_status": str, "latency_ms": float | null
         }
     """
-    if not settings.ENABLE_DEBATE:
-        return {
-            "agent": "debate", "symbol": symbol,
-            "bull_strength": 0.0, "bull_summary": "Debate disabled via config.",
-            "bear_strength": 0.0, "bear_summary": "Debate disabled via config.",
-            "edge": 0.0,
-        }
-
-    context_text = _build_context(symbol, tech_report, news_report, fundamentals_report)
-    bull = _run_side(BULL_INSTRUCTIONS, context_text)
-    bear = _run_side(BEAR_INSTRUCTIONS, context_text)
-
-    return {
+    route = llm_service.route_info("debate")
+    base_result = {
         "agent": "debate",
         "symbol": symbol,
-        "bull_strength": bull["strength"],
-        "bull_summary": bull["summary"],
-        "bear_strength": bear["strength"],
-        "bear_summary": bear["summary"],
-        "edge": round(bull["strength"] - bear["strength"], 3),
+        "bull_strength": 0.0,
+        "bull_summary": "",
+        "bear_strength": 0.0,
+        "bear_summary": "",
+        "edge": 0.0,
+        "error": None,
+        "provider": route["provider"],
+        "model": route["model"],
+        "llm_status": "NOT_CONFIGURED",
+        "latency_ms": None,
     }
+
+    if not settings.ENABLE_DEBATE:
+        base_result["llm_status"] = "SKIPPED_DISABLED"
+        base_result["bull_summary"] = "Debate disabled via config."
+        base_result["bear_summary"] = "Debate disabled via config."
+        return base_result
+
+    if not settings.GROQ_API_KEY:
+        base_result["error"] = "GROQ_API_KEY not configured."
+        base_result["bull_summary"] = "Debate disabled: missing GROQ_API_KEY."
+        base_result["bear_summary"] = "Debate disabled: missing GROQ_API_KEY."
+        return base_result
+
+    context_text = _build_context(symbol, tech_report, news_report, fundamentals_report)
+
+    result = llm_service.call_json(
+        "debate",
+        system=DEBATE_INSTRUCTIONS,
+        user=context_text,
+        temperature=0.4,
+        max_tokens=600,
+        symbol=symbol,
+    )
+
+    base_result["llm_status"] = result.status
+    base_result["model"] = result.model
+    base_result["latency_ms"] = result.latency_ms
+
+    if not result.ok:
+        logger.error(f"Debate failed for {symbol}: {result.error}")
+        base_result["error"] = result.error
+        base_result["bull_summary"] = "Debate agent encountered an error."
+        base_result["bear_summary"] = "Debate agent encountered an error."
+        return base_result
+
+    parsed = result.parsed
+    base_result["bull_strength"] = float(parsed.get("bull_strength", 0.0))
+    base_result["bull_summary"] = str(parsed.get("bull_summary", ""))
+    base_result["bear_strength"] = float(parsed.get("bear_strength", 0.0))
+    base_result["bear_summary"] = str(parsed.get("bear_summary", ""))
+    base_result["edge"] = round(base_result["bull_strength"] - base_result["bear_strength"], 3)
+    return base_result
