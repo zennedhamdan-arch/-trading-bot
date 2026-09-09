@@ -57,6 +57,13 @@ logger = logging.getLogger("main")
 MAX_LOG_ENTRIES = 200
 agent_logs = deque(maxlen=MAX_LOG_ENTRIES)
 
+# Real cycle history (in-memory, most recent first) so the dashboard can show
+# what every autonomous cycle actually did. Cleared on restart, same as logs.
+MAX_CYCLE_ENTRIES = 100
+cycle_history = deque(maxlen=MAX_CYCLE_ENTRIES)
+_cycle_counter = {"n": 0}
+_active_cycle = None  # set while a cycle is running; used to tally warnings
+
 bot_state = {
     "running": False,
     "started_at": None,
@@ -74,6 +81,8 @@ _previous_positions: dict = {}
 
 def _log_event(entry: dict):
     entry["timestamp"] = datetime.now(timezone.utc).isoformat()
+    if _active_cycle is not None and entry.get("level") == "WARNING":
+        _active_cycle["warnings"] += 1
     agent_logs.appendleft(entry)
 
 

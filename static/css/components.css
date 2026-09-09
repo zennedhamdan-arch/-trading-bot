@@ -353,12 +353,13 @@ select.sel:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0
 
 /* Demo banner (design preview) */
 .demo-banner {
-  position: sticky; top: 0; z-index: 60;
   background: repeating-linear-gradient(-45deg, #2c2410, #2c2410 12px, #332b14 12px, #332b14 24px);
-  border-bottom: 1px solid var(--amber-line);
+  border: 1px solid var(--amber-line);
+  border-radius: var(--r-md);
   color: var(--amber);
-  display: flex; align-items: center; gap: 10px;
-  padding: 6px 14px; font-size: 11.5px; font-weight: 600; letter-spacing: 0.04em;
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 7px 12px; font-size: 11.5px; font-weight: 600; letter-spacing: 0.04em;
+  margin-bottom: 12px;
 }
 .demo-banner .grow { flex: 1; }
 .demo-banner .demo-note { font-weight: 500; color: #d8b36a; }
@@ -376,6 +377,7 @@ select.sel:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0
 }
 .feed-item:last-child { border-bottom: 0; }
 .feed-item:hover { background: rgba(255, 255, 255, 0.022); }
+.feed-item.new { box-shadow: inset 2px 0 0 var(--accent); background: rgba(77, 141, 240, 0.045); }
 .feed-item.rowlink { cursor: pointer; }
 .feed-ico {
   width: 26px; height: 26px; border-radius: var(--r-md);

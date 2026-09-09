@@ -135,15 +135,15 @@
   padding: 4px 6px calc(4px + env(safe-area-inset-bottom, 0px));
   justify-content: stretch;
 }
-.mbot a {
+.mbot a, .mbot button {
   flex: 1;
   display: flex; flex-direction: column; align-items: center; gap: 3px;
   padding: 6px 2px 5px; border-radius: var(--r-md);
   font-size: 9.5px; font-weight: 600; letter-spacing: 0.03em; color: var(--ink-faint);
 }
-.mbot a .icon { width: 18px; height: 18px; }
+.mbot a .icon, .mbot button .icon { width: 18px; height: 18px; }
 .mbot a.on { color: var(--accent-hi); }
-.mbot a:active { background: var(--bg-2); }
+.mbot a:active, .mbot button:active { background: var(--bg-2); }
 
 /* More sheet */
 .more-veil { position: fixed; inset: 0; z-index: 80; background: rgba(5,8,12,0.6); opacity: 0; transition: opacity 0.16s var(--ease); }

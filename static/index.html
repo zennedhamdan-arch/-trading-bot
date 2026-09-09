@@ -2,816 +2,260 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>AI-TRADER // Autonomous Quant Engine</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/tailwindcss/3.4.1/tailwind.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="description" content="AI Trader — autonomous multi-agent trading operations command center. Paper trading only.">
+<title>AI Trader — Command Center</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
-<script>
-  tailwind.config = {
-    theme: {
-      extend: {
-        colors: {
-          slate: { 950: '#0b0f1a', 900: '#0f172a', 850: '#131b2e', 800: '#1e293b', 700: '#2a3548' },
-          emerald: { DEFAULT: '#10b981' },
-          rose: { DEFAULT: '#f43f5e' },
-          amber: { DEFAULT: '#f59e0b' },
-        },
-        fontFamily: { sans: ['Inter','sans-serif'], mono: ["'JetBrains Mono'",'monospace'] },
-      }
-    }
-  }
-</script>
-<style>
-  body{ background:#0f172a; background-image: radial-gradient(circle at 15% 0%, rgba(16,185,129,0.05), transparent 35%), radial-gradient(circle at 85% 15%, rgba(99,102,241,0.06), transparent 40%); }
-  ::-webkit-scrollbar{ width:8px; height:8px; }
-  ::-webkit-scrollbar-track{ background:#0f172a; }
-  ::-webkit-scrollbar-thumb{ background:#2a3548; border-radius:4px; }
-  ::-webkit-scrollbar-thumb:hover{ background:#3b4a63; }
-
-  .glass{ background:rgba(19,27,46,0.6); backdrop-filter: blur(12px); border:1px solid #1e293b; }
-  .card-hover{ transition: border-color .25s ease, transform .25s ease, box-shadow .25s ease; }
-  .card-hover:hover{ transform: translateY(-3px); border-color:#334155; box-shadow: 0 12px 32px -12px rgba(0,0,0,0.5); }
-
-  .pulse-badge{ position:relative; }
-  .pulse-badge::before{
-    content:''; position:absolute; inset:0; border-radius:9999px;
-    background:currentColor; opacity:.55; animation: pulseRing 1.8s cubic-bezier(0.4,0,0.6,1) infinite;
-  }
-  @keyframes pulseRing{ 0%{transform:scale(1); opacity:.55;} 100%{transform:scale(2.6); opacity:0;} }
-
-  .skel{ background: linear-gradient(90deg, #1e293b 25%, #263449 37%, #1e293b 63%); background-size: 400% 100%; animation: skel-shine 1.4s ease infinite; border-radius: 6px; }
-  @keyframes skel-shine{ 0%{background-position:100% 50%;} 100%{background-position:0 50%;} }
-
-  .fade-in{ animation: fadeIn .4s ease both; }
-  @keyframes fadeIn{ from{opacity:0; transform:translateY(6px);} to{opacity:1; transform:translateY(0);} }
-
-  .glow-btn{ box-shadow: 0 0 0 1px rgba(255,255,255,0.04) inset; transition: all .2s ease; }
-  .glow-emerald:hover{ box-shadow: 0 0 24px -4px rgba(16,185,129,0.55); }
-  .glow-rose:hover{ box-shadow: 0 0 24px -4px rgba(244,63,94,0.55); }
-  .glow-indigo:hover{ box-shadow: 0 0 24px -4px rgba(99,102,241,0.55); }
-
-  .progress-track{ background:#1e293b; }
-  .progress-fill{ background: linear-gradient(90deg,#10b981,#34d399); transition: width .2s linear; }
-
-  .conf-track{ background:#1e293b; }
-
-  .tab-btn.active{ color:#e2e8f0; border-bottom-color:#10b981; }
-
-  .decision-glow-buy{ box-shadow: inset 0 0 60px -20px rgba(16,185,129,0.35); }
-  .decision-glow-sell{ box-shadow: inset 0 0 60px -20px rgba(244,63,94,0.35); }
-  .decision-glow-hold{ box-shadow: inset 0 0 60px -20px rgba(245,158,11,0.28); }
-
-  @media (prefers-reduced-motion: reduce){
-    .pulse-badge::before{ animation:none; }
-    .skel{ animation:none; }
-  }
-</style>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;550;600;650;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/css/tokens.css">
+<link rel="stylesheet" href="/static/css/components.css">
+<link rel="stylesheet" href="/static/css/app.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230a0d12'/%3E%3Cpath d='M8 20 13 13l4 4 7-9' stroke='%233fce8f' stroke-width='2.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='24' cy='8' r='2.2' fill='%233fce8f'/%3E%3C/svg%3E">
 </head>
-<body class="min-h-screen text-slate-200 font-sans">
+<body>
+<a class="skip-link" href="#page">Skip to content</a>
 
-<!-- ============================================================ HEADER ============================================================ -->
-<header class="sticky top-0 z-40 glass border-b border-slate-800">
-  <div class="max-w-[1600px] mx-auto px-5 py-3 flex items-center justify-between flex-wrap gap-3">
-    <div class="flex items-center gap-3">
-      <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-emerald-500/20 to-indigo-500/20 border border-slate-700 flex items-center justify-center">
-        <i class="fa-solid fa-chart-simple text-emerald-400 text-lg"></i>
-      </div>
+<div id="app">
+
+  <!-- ======================= Sidebar (desktop) ======================= -->
+  <aside class="sidebar" aria-label="Primary">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true"></div>
       <div>
-        <h1 class="text-[15px] font-extrabold tracking-tight text-white leading-none">AI-TRADER <span class="text-slate-500 font-medium">// Autonomous Quant Engine</span></h1>
-        <div class="flex items-center gap-2 mt-1.5">
-          <span id="liveBadge" class="inline-flex items-center gap-1.5 text-[10px] font-bold tracking-widest px-2 py-0.5 rounded-full bg-slate-800 text-slate-400 border border-slate-700">
-            <span id="liveDot" class="relative w-1.5 h-1.5 rounded-full bg-slate-500 text-slate-500"><span id="liveDotPulse" class="pulse-badge absolute inset-0 rounded-full hidden"></span></span>
-            SYSTEM OFFLINE
-          </span>
-          <span id="lastCycleText" class="text-[10px] font-mono text-slate-600">last cycle: —</span>
+        <div class="brand-name">AI&nbsp;TRADER</div>
+        <div class="brand-sub">Operations Center</div>
+      </div>
+    </div>
+    <nav class="snav" id="snav">
+      <div class="grp">Monitoring</div>
+      <a href="#/overview" data-nav="overview"><i data-icon="grid"></i>Overview</a>
+      <a href="#/portfolio" data-nav="portfolio"><i data-icon="chart-candle"></i>Portfolio</a>
+      <a href="#/positions" data-nav="positions"><i data-icon="layers"></i>Positions</a>
+      <a href="#/orders" data-nav="orders"><i data-icon="list-ordered"></i>Orders</a>
+      <div class="grp">Intelligence</div>
+      <a href="#/ai" data-nav="ai"><i data-icon="brain"></i>AI Intelligence</a>
+      <a href="#/agents" data-nav="agents"><i data-icon="gauge"></i>Agent Performance</a>
+      <a href="#/risk" data-nav="risk"><i data-icon="shield"></i>Risk</a>
+      <div class="grp">Operations</div>
+      <a href="#/cycles" data-nav="cycles"><i data-icon="repeat"></i>Cycles</a>
+      <a href="#/health" data-nav="health"><i data-icon="pulse"></i>System Health</a>
+      <a href="#/activity" data-nav="activity"><i data-icon="scroll"></i>Activity / Logs</a>
+      <a href="#/config" data-nav="config"><i data-icon="settings"></i>Configuration</a>
+    </nav>
+    <div class="sidebar-ft">
+      <div class="paper-pill"><i data-icon="flask"></i>PAPER TRADING</div>
+      <div class="botpill" id="botpill" role="status">
+        <span class="dot" id="botpill-dot"></span>
+        <div>
+          <div class="b-state" id="botpill-state">OFFLINE</div>
+          <div class="t-faint" style="font-size:10px" id="botpill-sub">Bot status</div>
         </div>
       </div>
     </div>
+  </aside>
 
-    <div class="flex items-center gap-2.5">
-      <!-- Live refresh progress ring -->
-      <div class="hidden sm:flex items-center gap-2 mr-1 px-2.5 py-1.5 rounded-lg bg-slate-900/60 border border-slate-800">
-        <i class="fa-solid fa-arrows-rotate text-[10px] text-slate-500" id="refreshIcon"></i>
-        <div class="w-16 h-1 rounded-full progress-track overflow-hidden">
-          <div id="refreshBar" class="h-full progress-fill rounded-full" style="width:0%"></div>
-        </div>
+  <!-- ======================= Main column ======================= -->
+  <div class="main">
+
+    <!-- Desktop header -->
+    <header class="hdr">
+      <div class="hdr-titles">
+        <h1 class="page-title" id="page-title">Overview</h1>
+        <div class="page-sub" id="page-desc"></div>
       </div>
-
-      <button id="btnRunNow" class="glow-btn glow-indigo flex items-center gap-2 px-3.5 py-2 rounded-lg bg-indigo-500/10 border border-indigo-500/40 text-indigo-300 text-xs font-semibold hover:bg-indigo-500/20 transition">
-        <i class="fa-solid fa-bolt"></i> <span class="hidden sm:inline">Run Analysis Now</span>
-      </button>
-      <button id="btnToggleBot" class="glow-btn glow-emerald flex items-center gap-2 px-3.5 py-2 rounded-lg bg-emerald-500/10 border border-emerald-500/40 text-emerald-300 text-xs font-semibold hover:bg-emerald-500/20 transition">
-        <i class="fa-solid fa-play" id="toggleBotIcon"></i> <span class="hidden sm:inline" id="toggleBotText">Start Bot</span>
-      </button>
-      <button id="btnSettings" class="glow-btn flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-800/60 border border-slate-700 text-slate-300 text-xs font-semibold hover:bg-slate-800 transition">
-        <i class="fa-solid fa-gear"></i> <span class="hidden sm:inline">Settings</span>
-      </button>
-    </div>
-  </div>
-</header>
-
-<main class="max-w-[1600px] mx-auto px-5 py-5">
-
-  <!-- ============================================================ METRIC CARDS ============================================================ -->
-  <section class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4 mb-5">
-    <div class="glass card-hover rounded-2xl p-4">
-      <div class="flex items-center justify-between mb-3">
-        <span class="text-[11px] font-semibold tracking-widest text-slate-500">TOTAL PORTFOLIO VALUE</span>
-        <div class="w-8 h-8 rounded-lg bg-indigo-500/10 border border-indigo-500/30 flex items-center justify-center">
-          <i class="fa-solid fa-vault text-indigo-400 text-xs"></i>
+      <div class="hdr-actions">
+        <div class="hdr-status">
+          <span class="statuspill" id="hdr-status"><span class="dot" id="hdr-status-dot"></span><span id="hdr-status-text">CONNECTING</span></span>
+          <span class="lastcycle" title="Last completed cycle">Last cycle <span class="num" id="lastcycle-val">—</span></span>
         </div>
+        <button class="btn btn-sm btn-ghost btn-icon" data-action="pal-open" aria-label="Search (Ctrl+K)" title="Search · Ctrl+K"></button>
+        <button class="btn btn-sm" data-action="refresh" aria-label="Refresh data"><i data-icon="refresh"></i>Refresh</button>
+        <button class="btn btn-sm" data-action="run-cycle"><i data-icon="play"></i>Run Cycle</button>
+        <button class="btn btn-sm btn-success" id="btn-power" data-action="start-bot"><i data-icon="power"></i>Start</button>
       </div>
-      <p id="mEquity" class="font-mono text-2xl font-bold text-white skel h-8 w-32"></p>
-      <p id="mEquitySub" class="text-[11px] text-slate-500 mt-1 font-mono">&nbsp;</p>
-    </div>
+    </header>
 
-    <div class="glass card-hover rounded-2xl p-4">
-      <div class="flex items-center justify-between mb-3">
-        <span class="text-[11px] font-semibold tracking-widest text-slate-500">AVAILABLE CASH</span>
-        <div class="w-8 h-8 rounded-lg bg-cyan-500/10 border border-cyan-500/30 flex items-center justify-center">
-          <i class="fa-solid fa-sack-dollar text-cyan-400 text-xs"></i>
-        </div>
-      </div>
-      <p id="mCash" class="font-mono text-2xl font-bold text-white skel h-8 w-32"></p>
-      <p id="mCashSub" class="text-[11px] text-slate-500 mt-1 font-mono">Buying power available</p>
-    </div>
-
-    <div class="glass card-hover rounded-2xl p-4">
-      <div class="flex items-center justify-between mb-3">
-        <span class="text-[11px] font-semibold tracking-widest text-slate-500">TODAY'S P&amp;L</span>
-        <div id="mPLIconWrap" class="w-8 h-8 rounded-lg bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center">
-          <i id="mPLIcon" class="fa-solid fa-arrow-trend-up text-emerald-400 text-xs"></i>
-        </div>
-      </div>
-      <p id="mPL" class="font-mono text-2xl font-bold text-white skel h-8 w-32"></p>
-      <p id="mPLPct" class="text-[11px] mt-1 font-mono text-slate-500">&nbsp;</p>
-    </div>
-
-    <div class="glass card-hover rounded-2xl p-4">
-      <div class="flex items-center justify-between mb-3">
-        <span class="text-[11px] font-semibold tracking-widest text-slate-500">ACTIVE POSITIONS</span>
-        <div class="w-8 h-8 rounded-lg bg-amber-500/10 border border-amber-500/30 flex items-center justify-center">
-          <i class="fa-solid fa-layer-group text-amber-400 text-xs"></i>
-        </div>
-      </div>
-      <p id="mPositions" class="font-mono text-2xl font-bold text-white skel h-8 w-16"></p>
-      <p id="mPositionsSub" class="text-[11px] text-slate-500 mt-1 font-mono">&nbsp;</p>
-    </div>
-  </section>
-
-  <!-- ============================================================ AGENT COMMITTEE BOARD ============================================================ -->
-  <section class="mb-5">
-    <div class="flex items-center gap-2 mb-3">
-      <i class="fa-solid fa-brain text-slate-500 text-xs"></i>
-      <h2 class="text-xs font-bold tracking-widest text-slate-400">AGENT COMMITTEE DECISION BOARD</h2>
-      <div class="h-px flex-1 bg-slate-800"></div>
-      <span id="committeeSymbol" class="text-[10px] font-mono text-slate-600">awaiting cycle</span>
-    </div>
-
-    <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
-
-      <!-- NEWS AGENT -->
-      <div class="glass card-hover rounded-2xl p-4 flex flex-col">
-        <div class="flex items-center justify-between mb-3">
-          <div class="flex items-center gap-2">
-            <div class="w-7 h-7 rounded-lg bg-blue-500/10 border border-blue-500/30 flex items-center justify-center">
-              <i class="fa-solid fa-newspaper text-blue-400 text-[11px]"></i>
-            </div>
-            <div>
-              <p class="text-[11px] font-bold text-slate-300 leading-none">News &amp; Sentiment</p>
-              <p class="text-[9px] text-slate-600 font-mono mt-0.5">Gemini 2.5 Flash</p>
-            </div>
-          </div>
-          <span id="newsBadge" class="text-[9px] font-bold px-2 py-1 rounded-full bg-slate-800 text-slate-500 border border-slate-700">—</span>
-        </div>
-        <p id="newsSummary" class="text-xs text-slate-400 leading-relaxed flex-1 min-h-[52px]">Waiting for first analysis cycle…</p>
-        <div class="mt-3 pt-3 border-t border-slate-800">
-          <p class="text-[9px] font-bold tracking-widest text-slate-600 mb-1">KEY HEADLINE</p>
-          <p id="newsHeadline" class="text-[11px] text-slate-500 italic leading-snug">—</p>
-        </div>
-      </div>
-
-      <!-- TECHNICAL AGENT -->
-      <div class="glass card-hover rounded-2xl p-4 flex flex-col">
-        <div class="flex items-center justify-between mb-3">
-          <div class="flex items-center gap-2">
-            <div class="w-7 h-7 rounded-lg bg-violet-500/10 border border-violet-500/30 flex items-center justify-center">
-              <i class="fa-solid fa-chart-line text-violet-400 text-[11px]"></i>
-            </div>
-            <div>
-              <p class="text-[11px] font-bold text-slate-300 leading-none">Technical</p>
-              <p class="text-[9px] text-slate-600 font-mono mt-0.5">Groq · Llama 3.1</p>
-            </div>
-          </div>
-          <span id="techBadge" class="text-[9px] font-bold px-2 py-1 rounded-full bg-slate-800 text-slate-500 border border-slate-700">—</span>
-        </div>
-        <p id="techSummary" class="text-xs text-slate-400 leading-relaxed flex-1 min-h-[52px]">Waiting for first analysis cycle…</p>
-        <div class="mt-3 pt-3 border-t border-slate-800">
-          <p class="text-[9px] font-bold tracking-widest text-slate-600 mb-1">CONFIDENCE</p>
-          <div class="w-full h-1.5 rounded-full conf-track overflow-hidden">
-            <div id="techConfBar" class="h-full rounded-full bg-violet-500" style="width:0%"></div>
+    <!-- Mobile top header -->
+    <div class="mtop">
+      <div class="mtop-row1">
+        <div class="brand">
+          <div class="brand-mark"></div>
+          <div>
+            <div class="brand-name">AI&nbsp;TRADER</div>
           </div>
         </div>
-      </div>
-
-      <!-- RISK AGENT -->
-      <div class="glass card-hover rounded-2xl p-4 flex flex-col">
-        <div class="flex items-center justify-between mb-3">
-          <div class="flex items-center gap-2">
-            <div class="w-7 h-7 rounded-lg bg-amber-500/10 border border-amber-500/30 flex items-center justify-center">
-              <i class="fa-solid fa-shield-halved text-amber-400 text-[11px]"></i>
-            </div>
-            <div>
-              <p class="text-[11px] font-bold text-slate-300 leading-none">Risk Manager</p>
-              <p class="text-[9px] text-slate-600 font-mono mt-0.5">OpenRouter · DeepSeek R1</p>
-            </div>
-          </div>
-          <span id="riskBadge" class="text-[9px] font-bold px-2 py-1 rounded-full bg-slate-800 text-slate-500 border border-slate-700">—</span>
-        </div>
-        <p id="riskSummary" class="text-xs text-slate-400 leading-relaxed flex-1 min-h-[52px]">Waiting for first analysis cycle…</p>
-        <div class="mt-3 pt-3 border-t border-slate-800 flex items-center justify-between">
-          <span class="text-[9px] font-bold tracking-widest text-slate-600">MAX CLEARANCE</span>
-          <span id="riskNotional" class="text-[11px] font-mono font-semibold text-slate-300">$0.00</span>
+        <div class="mtop-actions">
+          <span class="statuspill" id="mtop-status"><span class="dot" id="mtop-status-dot"></span><span id="mtop-status-text">—</span></span>
+          <button class="btn btn-sm" data-action="run-cycle" aria-label="Run cycle now" title="Run cycle now"><i data-icon="play"></i>Run</button>
+          <button class="btn btn-sm btn-ghost btn-icon" data-action="more-open" aria-label="More pages"><i data-icon="more"></i></button>
         </div>
       </div>
-
-      <!-- CIO AGENT -->
-      <div id="cioCard" class="glass card-hover rounded-2xl p-4 flex flex-col relative overflow-hidden">
-        <div class="flex items-center justify-between mb-3 relative z-10">
-          <div class="flex items-center gap-2">
-            <div class="w-7 h-7 rounded-lg bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center">
-              <i class="fa-solid fa-crown text-emerald-400 text-[11px]"></i>
-            </div>
-            <div>
-              <p class="text-[11px] font-bold text-slate-300 leading-none">Executive CIO</p>
-              <p class="text-[9px] text-slate-600 font-mono mt-0.5">Groq · Llama 3.3 70B</p>
-            </div>
-          </div>
-        </div>
-        <div class="relative z-10 flex-1 flex flex-col justify-center items-center py-2">
-          <span id="cioDecision" class="font-mono text-3xl font-black tracking-wider text-slate-600">HOLD</span>
-          <span id="cioSymbolTag" class="text-[10px] font-mono text-slate-600 mt-1">—</span>
-        </div>
-        <div class="relative z-10 mt-2">
-          <div class="flex items-center justify-between mb-1">
-            <span class="text-[9px] font-bold tracking-widest text-slate-600">CONFIDENCE</span>
-            <span id="cioConfPct" class="text-[10px] font-mono text-slate-500">0%</span>
-          </div>
-          <div class="w-full h-1.5 rounded-full conf-track overflow-hidden">
-            <div id="cioConfBar" class="h-full rounded-full bg-slate-600" style="width:0%"></div>
-          </div>
-          <p id="cioReasoning" class="text-[11px] text-slate-500 leading-snug mt-2.5 line-clamp-3">Awaiting executive decision…</p>
-        </div>
-      </div>
-
-    </div>
-  </section>
-
-  <!-- ============================================================ MAIN SPLIT: CHART + TABLES ============================================================ -->
-  <section class="grid grid-cols-1 xl:grid-cols-5 gap-4">
-
-    <!-- LEFT 60% : Chart -->
-    <div class="xl:col-span-3 glass rounded-2xl p-4">
-      <div class="flex items-center justify-between mb-4">
-        <div class="flex items-center gap-2">
-          <i class="fa-solid fa-wave-square text-slate-500 text-xs"></i>
-          <h2 class="text-xs font-bold tracking-widest text-slate-400">PORTFOLIO PERFORMANCE</h2>
-        </div>
-        <span id="chartRange" class="text-[10px] font-mono text-slate-600">1M</span>
-      </div>
-      <div class="relative h-[320px]">
-        <canvas id="equityChart"></canvas>
-        <div id="chartEmpty" class="absolute inset-0 flex items-center justify-center text-xs text-slate-600 font-mono">
-          <i class="fa-solid fa-chart-area mr-2"></i> No history data yet
-        </div>
+      <div class="row" style="justify-content:space-between;padding:6px 0 8px">
+        <h1 class="page-title" id="mtop-title" style="font-size:13px">Overview</h1>
+        <span class="freshness" id="mtop-fresh"><span class="dot"></span><span id="freshness-m">—</span></span>
       </div>
     </div>
 
-    <!-- RIGHT 40% : Tables -->
-    <div class="xl:col-span-2 glass rounded-2xl p-4 flex flex-col">
-      <div class="flex items-center gap-1 mb-3 border-b border-slate-800">
-        <button id="tabPositions" class="tab-btn active px-3 py-2 text-xs font-semibold text-slate-500 border-b-2 border-transparent transition">
-          <i class="fa-solid fa-list-check mr-1.5"></i>Open Positions
-        </button>
-        <button id="tabOrders" class="tab-btn px-3 py-2 text-xs font-semibold text-slate-500 border-b-2 border-transparent transition">
-          <i class="fa-solid fa-receipt mr-1.5"></i>Active Orders
-        </button>
-      </div>
-
-      <div id="panelPositions" class="overflow-y-auto max-h-[320px]">
-        <table class="w-full text-xs">
-          <thead class="sticky top-0 bg-slate-900/95">
-            <tr class="text-left text-slate-600 border-b border-slate-800">
-              <th class="py-2 pr-2 font-semibold text-[10px] tracking-wider">TICKER</th>
-              <th class="py-2 pr-2 font-semibold text-[10px] tracking-wider text-right">QTY</th>
-              <th class="py-2 pr-2 font-semibold text-[10px] tracking-wider text-right">ENTRY</th>
-              <th class="py-2 pr-2 font-semibold text-[10px] tracking-wider text-right">MKT VAL</th>
-              <th class="py-2 pl-2 font-semibold text-[10px] tracking-wider text-right">P&amp;L</th>
-            </tr>
-          </thead>
-          <tbody id="positionsBody" class="font-mono"></tbody>
-        </table>
-        <div id="positionsEmpty" class="py-10 text-center text-slate-600 text-xs font-mono">
-          <i class="fa-solid fa-inbox mr-1.5"></i>No open positions
-        </div>
-      </div>
-
-      <div id="panelOrders" class="hidden overflow-y-auto max-h-[320px]">
-        <table class="w-full text-xs">
-          <thead class="sticky top-0 bg-slate-900/95">
-            <tr class="text-left text-slate-600 border-b border-slate-800">
-              <th class="py-2 pr-2 font-semibold text-[10px] tracking-wider">TICKER</th>
-              <th class="py-2 pr-2 font-semibold text-[10px] tracking-wider">SIDE</th>
-              <th class="py-2 pr-2 font-semibold text-[10px] tracking-wider text-right">QTY</th>
-              <th class="py-2 pl-2 font-semibold text-[10px] tracking-wider">STATUS</th>
-            </tr>
-          </thead>
-          <tbody id="ordersBody" class="font-mono"></tbody>
-        </table>
-        <div id="ordersEmpty" class="py-10 text-center text-slate-600 text-xs font-mono hidden">
-          <i class="fa-solid fa-inbox mr-1.5"></i>No recent orders
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- ============================================================ AGENT ACTIVITY LOG (raw feed, collapsible) ============================================================ -->
-  <section class="mt-5 glass rounded-2xl p-4">
-    <div class="flex items-center justify-between mb-3">
-      <div class="flex items-center gap-2">
-        <i class="fa-solid fa-terminal text-slate-500 text-xs"></i>
-        <h2 class="text-xs font-bold tracking-widest text-slate-400">RAW AGENT ACTIVITY LOG</h2>
-      </div>
-      <button id="btnToggleLog" class="text-[10px] font-mono text-slate-600 hover:text-slate-400 transition">
-        <i class="fa-solid fa-chevron-down mr-1"></i>expand
-      </button>
-    </div>
-    <div id="logFeed" class="hidden space-y-1.5 max-h-[280px] overflow-y-auto pr-1"></div>
-  </section>
-
-  <footer class="text-center text-[10px] font-mono text-slate-700 tracking-wide py-8">
-    ALPACA PAPER TRADING · NOT FINANCIAL ADVICE · FOR RESEARCH &amp; EDUCATIONAL USE ONLY
-  </footer>
-</main>
-
-<!-- ============================================================ SETTINGS MODAL ============================================================ -->
-<div id="settingsModal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
-  <div class="glass rounded-2xl p-5 w-full max-w-md fade-in">
-    <div class="flex items-center justify-between mb-4">
-      <h3 class="text-sm font-bold text-white"><i class="fa-solid fa-gear mr-2 text-slate-500"></i>Bot Configuration</h3>
-      <button id="btnCloseSettings" class="text-slate-500 hover:text-slate-300 transition"><i class="fa-solid fa-xmark"></i></button>
-    </div>
-    <div id="settingsBody" class="space-y-3 text-xs font-mono text-slate-400">
-      <div class="skel h-4 w-full"></div>
-      <div class="skel h-4 w-3/4"></div>
-      <div class="skel h-4 w-1/2"></div>
-    </div>
+    <main class="content" id="page" tabindex="-1"></main>
   </div>
 </div>
 
+<!-- ======================= Mobile bottom nav ======================= -->
+<nav class="mbot" aria-label="Primary mobile">
+  <a href="#/overview" data-nav="overview"><i data-icon="grid"></i>Overview</a>
+  <a href="#/portfolio" data-nav="portfolio"><i data-icon="chart-candle"></i>Portfolio</a>
+  <a href="#/ai" data-nav="ai"><i data-icon="brain"></i>AI</a>
+  <a href="#/activity" data-nav="activity"><i data-icon="scroll"></i>Activity</a>
+  <a href="#more" data-action="more-open" role="button" tabindex="0"><i data-icon="more"></i>More</a>
+</nav>
+
+<!-- ======================= Mobile "More" sheet ======================= -->
+<div class="more-veil" id="more-root" data-action="more-close"></div>
 <script>
-// ============================================================ STATE ============================================================
-const REFRESH_MS = 5000;
-let equityChart = null;
-let botRunning = false;
-let refreshTimer = null;
-let progressTimer = null;
-let progressPct = 0;
+  // fill the more-sheet once at boot
+  (function () {
+    var root = document.getElementById("more-root");
+    root.innerHTML =
+      '<div class="moresheet" role="dialog" aria-label="All pages">' +
+        '<div class="moresheet-grab"></div>' +
+        '<div class="moresheet-hd"><span class="page-title" style="font-size:13px">All Pages</span><span class="spacer"></span>' +
+          '<button class="drawer-close" data-action="more-close" aria-label="Close"><i data-icon="x"></i></button></div>' +
+        '<div class="moresheet-list">' +
+          '<a href="#/overview" data-nav="overview"><i data-icon="grid"></i>Overview</a>' +
+          '<a href="#/portfolio" data-nav="portfolio"><i data-icon="chart-candle"></i>Portfolio</a>' +
+          '<a href="#/positions" data-nav="positions"><i data-icon="layers"></i>Positions</a>' +
+          '<a href="#/orders" data-nav="orders"><i data-icon="list-ordered"></i>Orders</a>' +
+          '<a href="#/ai" data-nav="ai"><i data-icon="brain"></i>AI Intelligence</a>' +
+          '<a href="#/agents" data-nav="agents"><i data-icon="gauge"></i>Agent Performance</a>' +
+          '<a href="#/risk" data-nav="risk"><i data-icon="shield"></i>Risk</a>' +
+          '<a href="#/cycles" data-nav="cycles"><i data-icon="repeat"></i>Cycles</a>' +
+          '<a href="#/health" data-nav="health"><i data-icon="pulse"></i>System Health</a>' +
+          '<a href="#/activity" data-nav="activity"><i data-icon="scroll"></i>Activity</a>' +
+          '<a href="#/config" data-nav="config"><i data-icon="settings"></i>Configuration</a>' +
+        "</div>" +
+        '<div class="moresheet-ft">' +
+          '<span class="paper-pill" style="margin:0;flex:1;justify-content:center"><i data-icon="flask"></i>PAPER TRADING</span>' +
+          '<button class="btn btn-sm" data-action="refresh"><i data-icon="refresh"></i>Refresh</button>' +
+          '<button class="btn btn-sm btn-success" data-action="start-bot"><i data-icon="power"></i>Start</button>' +
+        "</div>" +
+      "</div>";
+  })();
+</script>
 
-// ============================================================ HELPERS ============================================================
-function fmtMoney(n){
-  const v = Number(n) || 0;
-  const sign = v < 0 ? '-' : '';
-  return sign + '$' + Math.abs(v).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
-}
-function fmtPct(n){
-  const v = Number(n) || 0;
-  return (v >= 0 ? '+' : '') + v.toFixed(2) + '%';
-}
-function relTime(iso){
-  if(!iso) return 'never';
-  const diff = (Date.now() - new Date(iso).getTime()) / 1000;
-  if(diff < 5) return 'just now';
-  if(diff < 60) return Math.floor(diff) + 's ago';
-  if(diff < 3600) return Math.floor(diff/60) + 'm ago';
-  return Math.floor(diff/3600) + 'h ago';
-}
-function clearSkel(el){ el.classList.remove('skel','h-8','w-32','h-16'); }
+<!-- Overlays -->
+<div id="drawer-root"></div>
+<div id="modal-root"></div>
+<div id="palette-root"></div>
+<div class="toasts" id="toasts" aria-live="polite"></div>
 
-async function apiGet(path){
-  const res = await fetch(path);
-  if(!res.ok) throw new Error(path + ' -> ' + res.status);
-  return res.json();
-}
-async function apiPost(path){
-  const res = await fetch(path, {method:'POST'});
-  if(!res.ok) throw new Error(path + ' -> ' + res.status);
-  return res.json();
-}
+<script src="/static/js/icons.js"></script>
+<script src="/static/js/api.js"></script>
+<script src="/static/js/app.js"></script>
+<script src="/static/js/components.js"></script>
+<script src="/static/js/drawers.js"></script>
+<script src="/static/js/pages.js"></script>
+<script>
+/* ============================================================================
+   BOOT
+   ========================================================================== */
+(function () {
+  "use strict";
+  var App = window.App, U = window.U;
+  var qs = App.qs, qsa = App.qsa;
 
-// ============================================================ HEADER / STATUS ============================================================
-function renderStatus(botState){
-  botRunning = !!botState.running;
-  const badge = document.getElementById('liveBadge');
-  const dot = document.getElementById('liveDot');
-  const pulse = document.getElementById('liveDotPulse');
-
-  if(botRunning){
-    badge.className = 'inline-flex items-center gap-1.5 text-[10px] font-bold tracking-widest px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/30';
-    badge.innerHTML = '<span id="liveDot" class="relative w-1.5 h-1.5 rounded-full bg-emerald-400 text-emerald-400"><span class="pulse-badge absolute inset-0 rounded-full"></span></span> SYSTEM LIVE';
-    document.getElementById('toggleBotIcon').className = 'fa-solid fa-pause';
-    document.getElementById('toggleBotText').textContent = 'Pause Bot';
-    document.getElementById('btnToggleBot').className = 'glow-btn glow-rose flex items-center gap-2 px-3.5 py-2 rounded-lg bg-rose-500/10 border border-rose-500/40 text-rose-300 text-xs font-semibold hover:bg-rose-500/20 transition';
-  } else {
-    badge.className = 'inline-flex items-center gap-1.5 text-[10px] font-bold tracking-widest px-2 py-0.5 rounded-full bg-slate-800 text-slate-400 border border-slate-700';
-    badge.innerHTML = '<span class="relative w-1.5 h-1.5 rounded-full bg-slate-500"></span> SYSTEM OFFLINE';
-    document.getElementById('toggleBotIcon').className = 'fa-solid fa-play';
-    document.getElementById('toggleBotText').textContent = 'Start Bot';
-    document.getElementById('btnToggleBot').className = 'glow-btn glow-emerald flex items-center gap-2 px-3.5 py-2 rounded-lg bg-emerald-500/10 border border-emerald-500/40 text-emerald-300 text-xs font-semibold hover:bg-emerald-500/20 transition';
-  }
-
-  document.getElementById('lastCycleText').textContent =
-    'last cycle: ' + relTime(botState.last_cycle_at) + (botState.last_cycle_status ? ' · ' + botState.last_cycle_status : '');
-}
-
-// ============================================================ METRIC CARDS ============================================================
-function renderMetrics(account, positions){
-  const eqEl = document.getElementById('mEquity'); clearSkel(eqEl);
-  eqEl.textContent = fmtMoney(account.equity);
-  document.getElementById('mEquitySub').textContent = 'Buying power ' + fmtMoney(account.buying_power);
-
-  const cashEl = document.getElementById('mCash'); clearSkel(cashEl);
-  cashEl.textContent = fmtMoney(account.cash);
-
-  const plEl = document.getElementById('mPL'); clearSkel(plEl);
-  const pl = Number(account.day_pl) || 0;
-  plEl.textContent = fmtMoney(pl);
-  plEl.className = 'font-mono text-2xl font-bold ' + (pl >= 0 ? 'text-emerald-400' : 'text-rose-400');
-
-  const plPctEl = document.getElementById('mPLPct');
-  plPctEl.textContent = fmtPct(account.day_pl_pct);
-  plPctEl.className = 'text-[11px] mt-1 font-mono ' + (pl >= 0 ? 'text-emerald-500/80' : 'text-rose-500/80');
-
-  const iconWrap = document.getElementById('mPLIconWrap');
-  const icon = document.getElementById('mPLIcon');
-  if(pl >= 0){
-    iconWrap.className = 'w-8 h-8 rounded-lg bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center';
-    icon.className = 'fa-solid fa-arrow-trend-up text-emerald-400 text-xs';
-  } else {
-    iconWrap.className = 'w-8 h-8 rounded-lg bg-rose-500/10 border border-rose-500/30 flex items-center justify-center';
-    icon.className = 'fa-solid fa-arrow-trend-down text-rose-400 text-xs';
-  }
-
-  const posEl = document.getElementById('mPositions'); clearSkel(posEl);
-  posEl.textContent = String(positions.length);
-  document.getElementById('mPositionsSub').textContent = positions.length === 1 ? '1 ticker held' : positions.length + ' tickers held';
-}
-
-// ============================================================ AGENT COMMITTEE BOARD ============================================================
-function badgeClasses(kind){
-  // kind: bullish/bearish/neutral/buy/sell/hold/approved/blocked
-  const map = {
-    BULLISH: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30',
-    BUY:     'bg-emerald-500/10 text-emerald-400 border-emerald-500/30',
-    BEARISH: 'bg-rose-500/10 text-rose-400 border-rose-500/30',
-    SELL:    'bg-rose-500/10 text-rose-400 border-rose-500/30',
-    NEUTRAL: 'bg-amber-500/10 text-amber-400 border-amber-500/30',
-    HOLD:    'bg-amber-500/10 text-amber-400 border-amber-500/30',
-    APPROVED:'bg-emerald-500/10 text-emerald-400 border-emerald-500/30',
-    BLOCKED: 'bg-rose-500/10 text-rose-400 border-rose-500/30',
-  };
-  return map[kind] || 'bg-slate-800 text-slate-500 border-slate-700';
-}
-
-function findLatest(logs, agentName){
-  return logs.find(l => l.agent === agentName && l.data) || null;
-}
-
-function renderCommittee(logs){
-  const latestAny = logs.find(l => ['news','technical','risk','cio'].includes(l.agent));
-  document.getElementById('committeeSymbol').textContent = latestAny ? ('last symbol: ' + latestAny.symbol) : 'awaiting cycle';
-
-  // --- NEWS ---
-  const newsEntry = findLatest(logs, 'news');
-  const newsBadge = document.getElementById('newsBadge');
-  if(newsEntry){
-    const d = newsEntry.data;
-    newsBadge.textContent = d.sentiment || 'NEUTRAL';
-    newsBadge.className = 'text-[9px] font-bold px-2 py-1 rounded-full border ' + badgeClasses(d.sentiment);
-    document.getElementById('newsSummary').textContent = d.summary || 'No summary available.';
-    document.getElementById('newsHeadline').textContent = d.key_headline || 'No headline captured this cycle.';
-  }
-
-  // --- TECHNICAL ---
-  const techEntry = findLatest(logs, 'technical');
-  const techBadge = document.getElementById('techBadge');
-  if(techEntry){
-    const d = techEntry.data;
-    techBadge.textContent = d.signal || 'NEUTRAL';
-    techBadge.className = 'text-[9px] font-bold px-2 py-1 rounded-full border ' + badgeClasses(d.signal);
-    document.getElementById('techSummary').textContent = d.summary || 'No summary available.';
-    const confPct = Math.round((Number(d.confidence) || 0) * 100);
-    document.getElementById('techConfBar').style.width = confPct + '%';
-  }
-
-  // --- RISK ---
-  const riskEntry = findLatest(logs, 'risk');
-  const riskBadge = document.getElementById('riskBadge');
-  if(riskEntry){
-    const d = riskEntry.data;
-    const kind = d.approved ? 'APPROVED' : 'BLOCKED';
-    riskBadge.textContent = kind;
-    riskBadge.className = 'text-[9px] font-bold px-2 py-1 rounded-full border ' + badgeClasses(kind);
-    document.getElementById('riskSummary').textContent = d.reasoning || 'No reasoning available.';
-    document.getElementById('riskNotional').textContent = fmtMoney(d.max_notional_usd);
-  }
-
-  // --- CIO ---
-  const cioEntry = findLatest(logs, 'cio');
-  const cioCard = document.getElementById('cioCard');
-  const cioDecisionEl = document.getElementById('cioDecision');
-  if(cioEntry){
-    const d = cioEntry.data;
-    cioDecisionEl.textContent = d.decision || 'HOLD';
-    document.getElementById('cioSymbolTag').textContent = cioEntry.symbol || '—';
-    const confPct = Math.round((Number(d.confidence) || 0) * 100);
-    document.getElementById('cioConfPct').textContent = confPct + '%';
-    document.getElementById('cioConfBar').style.width = confPct + '%';
-    document.getElementById('cioReasoning').textContent = d.reasoning || 'No reasoning available.';
-
-    cioCard.classList.remove('decision-glow-buy','decision-glow-sell','decision-glow-hold');
-    if(d.decision === 'BUY'){
-      cioDecisionEl.className = 'font-mono text-3xl font-black tracking-wider text-emerald-400';
-      document.getElementById('cioConfBar').className = 'h-full rounded-full bg-emerald-500';
-      cioCard.classList.add('decision-glow-buy');
-    } else if(d.decision === 'SELL'){
-      cioDecisionEl.className = 'font-mono text-3xl font-black tracking-wider text-rose-400';
-      document.getElementById('cioConfBar').className = 'h-full rounded-full bg-rose-500';
-      cioCard.classList.add('decision-glow-sell');
-    } else {
-      cioDecisionEl.className = 'font-mono text-3xl font-black tracking-wider text-amber-400';
-      document.getElementById('cioConfBar').className = 'h-full rounded-full bg-amber-500';
-      cioCard.classList.add('decision-glow-hold');
-    }
-  }
-}
-
-// ============================================================ TABLES ============================================================
-function renderPositions(positions){
-  const body = document.getElementById('positionsBody');
-  const empty = document.getElementById('positionsEmpty');
-  if(!positions || positions.length === 0){
-    body.innerHTML = '';
-    empty.classList.remove('hidden');
-    return;
-  }
-  empty.classList.add('hidden');
-  body.innerHTML = positions.map(p => {
-    const pl = Number(p.unrealized_pl) || 0;
-    const plColor = pl >= 0 ? 'text-emerald-400' : 'text-rose-400';
-    return `<tr class="border-b border-slate-800/60 hover:bg-slate-800/30 transition">
-      <td class="py-2 pr-2 font-semibold text-slate-200">${p.symbol}</td>
-      <td class="py-2 pr-2 text-right text-slate-400">${Number(p.qty).toLocaleString()}</td>
-      <td class="py-2 pr-2 text-right text-slate-400">${fmtMoney(p.avg_entry_price)}</td>
-      <td class="py-2 pr-2 text-right text-slate-400">${p.market_value != null ? fmtMoney(p.market_value) : '—'}</td>
-      <td class="py-2 pl-2 text-right ${plColor} font-semibold">${fmtPct(p.unrealized_plpc)}</td>
-    </tr>`;
-  }).join('');
-}
-
-function renderOrders(orders){
-  const body = document.getElementById('ordersBody');
-  const empty = document.getElementById('ordersEmpty');
-  if(!orders || orders.length === 0){
-    body.innerHTML = '';
-    empty.classList.remove('hidden');
-    return;
-  }
-  empty.classList.add('hidden');
-  body.innerHTML = orders.map(o => {
-    const sideColor = o.side === 'buy' ? 'text-emerald-400' : 'text-rose-400';
-    const statusColor = o.status === 'filled' ? 'text-emerald-400' : (o.status === 'canceled' || o.status === 'rejected' ? 'text-rose-400' : 'text-amber-400');
-    return `<tr class="border-b border-slate-800/60 hover:bg-slate-800/30 transition">
-      <td class="py-2 pr-2 font-semibold text-slate-200">${o.symbol}</td>
-      <td class="py-2 pr-2 uppercase font-semibold ${sideColor}">${o.side || '—'}</td>
-      <td class="py-2 pr-2 text-right text-slate-400">${o.qty != null ? Number(o.qty).toLocaleString() : '—'}</td>
-      <td class="py-2 pl-2 uppercase text-[10px] font-semibold ${statusColor}">${o.status || '—'}</td>
-    </tr>`;
-  }).join('');
-}
-
-// ============================================================ CHART ============================================================
-function renderChart(points){
-  const emptyEl = document.getElementById('chartEmpty');
-  if(!points || points.length === 0){
-    emptyEl.classList.remove('hidden');
-    return;
-  }
-  emptyEl.classList.add('hidden');
-
-  const labels = points.map(p => {
-    const t = p.timestamp;
-    const ms = t < 2e10 ? t * 1000 : t;
-    return new Date(ms).toLocaleDateString(undefined, {month:'short', day:'numeric'});
+  // hydrate every <i data-icon> placeholder in the shell
+  qsa("[data-icon]").forEach(function (el) {
+    el.outerHTML = window.ICON(el.getAttribute("data-icon"));
   });
-  const values = points.map(p => p.equity);
+  qsa(".brand-mark").forEach(function (el) {
+    el.innerHTML = window.ICON("trend-up");
+  });
 
-  if(equityChart){
-    equityChart.data.labels = labels;
-    equityChart.data.datasets[0].data = values;
-    equityChart.update('none');
-    return;
-  }
+  // demo banner (shown only in ?demo=1 design preview)
+  window.DemoBanner =
+    '<div class="demo-banner" role="status">' +
+      window.ICON("flask") +
+      "<span>DESIGN PREVIEW — SAMPLE DATA</span>" +
+      '<span class="demo-note">This is a static preview of the dashboard with illustrative data. Remove <span class="num">?demo=1</span> from the URL to view live data from the trading bot.</span>' +
+      '<span class="grow"></span>' +
+      '<a class="btn btn-sm" href="/" style="height:22px;font-size:10.5px">Exit to live</a>' +
+    "</div>";
 
-  const ctx = document.getElementById('equityChart').getContext('2d');
-  const gradient = ctx.createLinearGradient(0, 0, 0, 320);
-  gradient.addColorStop(0, 'rgba(16,185,129,0.35)');
-  gradient.addColorStop(1, 'rgba(16,185,129,0)');
+  // header status renderer (subscribed to data ticks)
+  function renderStatus() {
+    var st = (App.store.data.portfolio && App.store.data.portfolio.bot_state) || {};
+    var offline = App.store.errors.portfolio || App.store.errors.logs;
+    var running = !!st.running;
 
-  equityChart = new Chart(ctx, {
-    type: 'line',
-    data: {
-      labels,
-      datasets: [{
-        data: values,
-        borderColor: '#10b981',
-        backgroundColor: gradient,
-        borderWidth: 2.5,
-        pointRadius: 0,
-        pointHoverRadius: 5,
-        pointHoverBackgroundColor: '#10b981',
-        pointHoverBorderColor: '#fff',
-        tension: 0.35,
-        fill: true,
-      }]
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      interaction: { intersect: false, mode: 'index' },
-      plugins: {
-        legend: { display: false },
-        tooltip: {
-          backgroundColor: '#131b2e',
-          borderColor: '#2a3548',
-          borderWidth: 1,
-          titleColor: '#94a3b8',
-          bodyColor: '#e2e8f0',
-          padding: 10,
-          displayColors: false,
-          callbacks: { label: (ctx) => fmtMoney(ctx.parsed.y) }
-        }
-      },
-      scales: {
-        x: { ticks: { color: '#475569', font: {size: 10} }, grid: { color: '#1e293b', drawTicks: false } },
-        y: { ticks: { color: '#475569', font: {size: 10}, callback: (v) => '$' + (v/1000).toFixed(0) + 'k' }, grid: { color: '#1e293b', drawTicks: false } },
+    var dotCls = offline ? "dot-err" : running ? "dot-on dot-live" : "dot-off";
+    var text = offline ? "OFFLINE" : running ? "ONLINE" : "STOPPED";
+
+    var d1 = qs("#hdr-status-dot"), t1 = qs("#hdr-status-text");
+    var d2 = qs("#mtop-status-dot"), t2 = qs("#mtop-status-text");
+    if (d1) d1.className = "dot " + dotCls;
+    if (t1) t1.textContent = text;
+    if (d2) d2.className = "dot " + dotCls;
+    if (t2) t2.textContent = offline ? "OFFLINE" : running ? "ONLINE" : "STOPPED";
+
+    var pill = qs("#botpill"), pd = qs("#botpill-dot"), ps = qs("#botpill-state"), psub = qs("#botpill-sub");
+    if (pill) {
+      pill.className = "botpill " + (running ? "on" : "off");
+      if (pd) pd.className = "dot " + (offline ? "dot-err" : running ? "dot-on dot-live" : "dot-off");
+      if (ps) ps.textContent = offline ? "OFFLINE" : running ? "ONLINE" : "OFFLINE";
+      if (psub) psub.textContent = running ? "Autonomous cycles active" : "Trading engine stopped";
+    }
+
+    // power button reflects inverse state
+    var power = qs("#btn-power");
+    if (power) {
+      if (running) {
+        power.className = "btn btn-sm btn-danger";
+        power.setAttribute("data-action", "stop-bot");
+        power.innerHTML = window.ICON("square") + "Stop";
+      } else {
+        power.className = "btn btn-sm btn-success";
+        power.setAttribute("data-action", "start-bot");
+        power.innerHTML = window.ICON("power") + "Start";
       }
     }
+
+    // header titles
+    var page = App.store.ui.page || "overview";
+    var t = qs("#page-title"), d = qs("#page-desc"), mt = qs("#mtop-title");
+    if (t) t.textContent = App.PAGE_TITLES[page] || "Overview";
+    if (d) d.textContent = App.PAGE_DESCS[page] || "";
+    if (mt) mt.textContent = App.PAGE_TITLES[page] || "Overview";
+  }
+  App.on("data", renderStatus);
+
+  // history preload for non-default ranges is lazy; preload 1M via portfolio payload
+
+  if (App.store.demo) {
+    App.loadDemo();
+  }
+  App.startPolling();
+  renderStatus();
+  App.renderPage = App.renderPage.bind(App); // no-op safety
+
+  // initial route render (App.renderPage is defined in pages.js)
+  (function firstRender() {
+    var m = location.hash.match(/^#\/([a-z-]+)/);
+    var page = m && m[1] in (App.PAGE_TITLES || {}) ? m[1] : "overview";
+    if (!location.hash) location.replace("#/overview");
+    App.store.ui.page = page;
+    App.renderPage(page, {});
+  })();
+
+  // route changes
+  window.addEventListener("hashchange", function () {
+    if (qs("#more-root").classList.contains("on")) {
+      qs("#more-root").classList.remove("on");
+      document.body.style.overflow = "";
+    }
   });
-}
-
-// ============================================================ LOG FEED ============================================================
-const AGENT_META = {
-  news:      { label: 'NEWS', color: '#60a5fa', icon: 'fa-newspaper' },
-  technical: { label: 'TECHNICAL', color: '#a78bfa', icon: 'fa-chart-line' },
-  risk:      { label: 'RISK', color: '#f59e0b', icon: 'fa-shield-halved' },
-  cio:       { label: 'CIO', color: '#34d399', icon: 'fa-crown' },
-  execution: { label: 'EXECUTION', color: '#f43f5e', icon: 'fa-bolt' },
-  system:    { label: 'SYSTEM', color: '#64748b', icon: 'fa-circle-info' },
-};
-function renderLogFeed(logs){
-  const feed = document.getElementById('logFeed');
-  if(!logs || logs.length === 0){
-    feed.innerHTML = '<p class="text-xs text-slate-600 font-mono py-6 text-center">No agent activity yet.</p>';
-    return;
-  }
-  feed.innerHTML = logs.slice(0, 60).map(entry => {
-    const meta = AGENT_META[entry.agent] || AGENT_META.system;
-    const isError = entry.level === 'ERROR';
-    return `<div class="fade-in flex items-start gap-2.5 text-[11px] py-1.5 px-2 rounded-lg hover:bg-slate-800/40 transition">
-      <i class="fa-solid ${meta.icon} mt-0.5" style="color:${isError ? '#f43f5e' : meta.color}"></i>
-      <span class="font-mono font-bold shrink-0" style="color:${isError ? '#f43f5e' : meta.color}">${meta.label}</span>
-      ${entry.symbol ? `<span class="font-mono text-slate-600 shrink-0">${entry.symbol}</span>` : ''}
-      <span class="text-slate-500 leading-snug flex-1">${entry.message || ''}</span>
-      <span class="font-mono text-slate-700 shrink-0">${relTime(entry.timestamp)}</span>
-    </div>`;
-  }).join('');
-}
-
-// ============================================================ SETTINGS MODAL ============================================================
-async function openSettings(){
-  document.getElementById('settingsModal').classList.remove('hidden');
-  try{
-    const cfg = await apiGet('/api/config');
-    const body = document.getElementById('settingsBody');
-    body.innerHTML = `
-      <div class="flex justify-between"><span class="text-slate-500">Trade Universe</span><span class="text-slate-300">${(cfg.trade_universe||[]).join(', ')}</span></div>
-      <div class="flex justify-between"><span class="text-slate-500">Cycle Interval</span><span class="text-slate-300">${cfg.cycle_interval_minutes} min</span></div>
-      <div class="flex justify-between"><span class="text-slate-500">Max Position Size</span><span class="text-slate-300">${(cfg.max_position_pct*100).toFixed(1)}%</span></div>
-      ${(cfg.warnings && cfg.warnings.length) ? `<div class="pt-2 border-t border-slate-800 space-y-1">${cfg.warnings.map(w => `<p class="text-amber-400 text-[11px]"><i class="fa-solid fa-triangle-exclamation mr-1"></i>${w}</p>`).join('')}</div>` : ''}
-    `;
-  } catch(e){
-    document.getElementById('settingsBody').innerHTML = '<p class="text-rose-400">Failed to load config.</p>';
-  }
-}
-document.getElementById('btnSettings').addEventListener('click', openSettings);
-document.getElementById('btnCloseSettings').addEventListener('click', () => document.getElementById('settingsModal').classList.add('hidden'));
-document.getElementById('settingsModal').addEventListener('click', (e) => { if(e.target.id === 'settingsModal') e.currentTarget.classList.add('hidden'); });
-
-// ============================================================ TABS ============================================================
-document.getElementById('tabPositions').addEventListener('click', () => {
-  document.getElementById('tabPositions').classList.add('active');
-  document.getElementById('tabOrders').classList.remove('active');
-  document.getElementById('panelPositions').classList.remove('hidden');
-  document.getElementById('panelOrders').classList.add('hidden');
-});
-document.getElementById('tabOrders').addEventListener('click', () => {
-  document.getElementById('tabOrders').classList.add('active');
-  document.getElementById('tabPositions').classList.remove('active');
-  document.getElementById('panelOrders').classList.remove('hidden');
-  document.getElementById('panelPositions').classList.add('hidden');
-});
-
-// ============================================================ LOG COLLAPSE ============================================================
-document.getElementById('btnToggleLog').addEventListener('click', () => {
-  const feed = document.getElementById('logFeed');
-  const btn = document.getElementById('btnToggleLog');
-  const isHidden = feed.classList.contains('hidden');
-  feed.classList.toggle('hidden');
-  btn.innerHTML = isHidden ? '<i class="fa-solid fa-chevron-up mr-1"></i>collapse' : '<i class="fa-solid fa-chevron-down mr-1"></i>expand';
-});
-
-// ============================================================ CONTROLS ============================================================
-document.getElementById('btnToggleBot').addEventListener('click', async () => {
-  const btn = document.getElementById('btnToggleBot');
-  btn.disabled = true; btn.classList.add('opacity-50');
-  try{
-    if(botRunning) await apiPost('/api/bot/stop');
-    else await apiPost('/api/bot/start');
-    await refreshAll();
-  } finally {
-    btn.disabled = false; btn.classList.remove('opacity-50');
-  }
-});
-
-document.getElementById('btnRunNow').addEventListener('click', async () => {
-  const btn = document.getElementById('btnRunNow');
-  const icon = document.getElementById('refreshIcon');
-  btn.disabled = true; btn.classList.add('opacity-50');
-  icon.classList.add('fa-spin');
-  try{
-    await apiPost('/api/bot/run-now');
-  } finally {
-    icon.classList.remove('fa-spin');
-    btn.disabled = false; btn.classList.remove('opacity-50');
-    resetProgress();
-    await refreshAll();
-  }
-});
-
-// ============================================================ REFRESH LOOP + PROGRESS BAR ============================================================
-async function refreshAll(){
-  try{
-    const [portfolio, logsRes] = await Promise.all([
-      apiGet('/api/portfolio'),
-      apiGet('/api/logs'),
-    ]);
-    renderStatus(portfolio.bot_state || {});
-    renderMetrics(portfolio.account || {}, portfolio.positions || []);
-    renderPositions(portfolio.positions || []);
-    renderOrders(portfolio.orders || []);
-    renderChart(portfolio.history || []);
-    const logs = logsRes.logs || [];
-    renderCommittee(logs);
-    renderLogFeed(logs);
-  } catch(e){
-    console.error('Refresh failed:', e);
-  }
-}
-
-function resetProgress(){
-  progressPct = 0;
-  document.getElementById('refreshBar').style.width = '0%';
-}
-
-function startPolling(){
-  refreshAll();
-  resetProgress();
-  progressTimer = setInterval(() => {
-    progressPct += (100 / (REFRESH_MS / 100));
-    if(progressPct >= 100) progressPct = 100;
-    document.getElementById('refreshBar').style.width = progressPct + '%';
-  }, 100);
-  refreshTimer = setInterval(async () => {
-    resetProgress();
-    await refreshAll();
-  }, REFRESH_MS);
-}
-
-startPolling();
+})();
 </script>
 </body>
 </html>
