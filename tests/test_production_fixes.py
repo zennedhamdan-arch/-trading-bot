@@ -252,10 +252,13 @@ check("unknown provider -> DATA_UNAVAILABLE with reason",
 from agents import fundamentals_agent as fa
 fa.reset_fundamentals_cache()
 config.settings.FUNDAMENTALS_PROVIDER = "none"
+config.settings.FUNDAMENTALS_FALLBACK_PROVIDER = ""
+fs.reset_cache()  # drop 4e's cached UNKNOWN_PROVIDER result
 af = fa.analyze_fundamentals("SPY", fs.get_fundamentals("SPY"))
-check("analyze_fundamentals degrades gracefully (no crash, NEUTRAL, DATA_UNAVAILABLE)",
-      af["signal"] == "NEUTRAL" and af["error"] is not None
-      and af["error"].startswith("DATA_UNAVAILABLE"))
+check("analyze_fundamentals degrades gracefully (no crash, null signal, DATA_UNAVAILABLE)",
+      af["signal"] is None and af["confidence"] is None and af["error"] is not None
+      and af["error"].startswith("DATA_UNAVAILABLE")
+      and af["evidence_status"] == "OFF")  # provider=none is off-by-config, not a failure
 
 # 4g. provider health check
 health = fs.health_check()
@@ -301,8 +304,8 @@ main.tech_agent.analyze_technicals = lambda s, i: _ok_report("technical", s)
 main.news_agent.analyze_news = lambda s, h: _ok_report("news", s)
 main.fundamentals_agent.get_fundamentals = lambda s: {"symbol": s, "pe_ratio": 10.0, "error": None}
 main.fundamentals_agent.analyze_fundamentals = lambda s, f: _ok_report("fundamentals", s)
-main.debate_agent.run_debate = lambda s, t, n, f=None: {"agent": "debate", "symbol": s, "bull_strength": 0.7, "bull_summary": "b", "bear_strength": 0.3, "bear_summary": "r", "edge": 0.4, "error": None}
-main.risk_agent.assess_risk = lambda s, side, acct, pos, indicators=None: {"agent": "risk", "symbol": s, "approved": True, "max_notional_usd": 500.0, "risk_level": "LOW", "reasoning": "ok", "error": None, "llm_status": "OK"}
+main.debate_agent.run_debate = lambda s, t, n, f=None, evidence=None: {"agent": "debate", "symbol": s, "bull_strength": 0.7, "bull_summary": "b", "bear_strength": 0.3, "bear_summary": "r", "edge": 0.4, "error": None}
+main.risk_agent.assess_risk = lambda s, side, acct, pos, indicators=None, evidence=None: {"agent": "risk", "symbol": s, "approved": True, "max_notional_usd": 500.0, "risk_level": "LOW", "reasoning": "ok", "error": None, "llm_status": "OK"}
 main.cio_agent.make_decision = lambda *a, **k: {"agent": "cio", "symbol": "X", "decision": "HOLD", "confidence": 0.5, "notional_usd": 0.0, "reasoning": "hold", "error": None}
 config.settings.ENABLE_MEMORY = False
 

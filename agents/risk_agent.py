@@ -35,6 +35,12 @@ and anything the numbers suggest. You may approve an amount UP TO the computed
 maximum, or veto the trade entirely (approved=false). Be conservative when
 data is incomplete or signals conflict.
 
+PORTFOLIO RISK vs DECISION QUALITY: the computed maximum notional only states
+what the portfolio could afford — it is never an endorsement of the trade. If
+the decision-quality report shows the evidence behind the trade is unavailable,
+stale or failed, veto (approved=false) or sharply reduce the amount, even when
+the portfolio-level math alone would permit it.
+
 Respond ONLY with a single valid JSON object, no markdown fences, no preamble, in this exact shape:
 {
   "approved": true | false,
@@ -52,7 +58,8 @@ def _extract_json(text: str) -> dict:
 
 
 def assess_risk(symbol: str, proposed_side: str, account_summary: dict,
-                 existing_position: dict = None, indicators: dict = None) -> dict:
+                 existing_position: dict = None, indicators: dict = None,
+                 evidence: dict = None) -> dict:
     """
     Args:
         symbol: ticker symbol
@@ -60,6 +67,12 @@ def assess_risk(symbol: str, proposed_side: str, account_summary: dict,
         account_summary: dict from alpaca_service.get_account_summary()
         existing_position: dict for this symbol from get_open_positions(), or None
         indicators: deterministic analytics (volatility/drawdown evidence)
+        evidence: evidence-quality snapshot (services/evidence.py) — PORTFOLIO
+            RISK and DECISION QUALITY are separate concepts: this agent
+            computes/defends the former and is merely INFORMED about the
+            latter (it may veto when evidence quality is insufficient, but
+            evidence quality is enforced as its own execution prerequisite
+            in the cycle, not inside the portfolio-risk math)
 
     Returns:
         {
@@ -123,6 +136,13 @@ def assess_risk(symbol: str, proposed_side: str, account_summary: dict,
         f"Gate risk level: {gate['risk_level']}\n"
         f"Gate checks: {json.dumps(gate['checks'])}\n"
     )
+    if evidence:
+        from services import evidence as evidence_service
+        context_text += (
+            f"--- DECISION QUALITY (separate from portfolio risk; the gate above "
+            f"only says what the portfolio can afford) ---\n"
+            f"{evidence_service.context_lines(evidence)}\n"
+        )
 
     result = llm_service.call_json(
         "risk",

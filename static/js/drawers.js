@@ -289,7 +289,7 @@
       return (
         '<div class="dsec">' + C.sectionTitle("cpu", "Agent Execution (per symbol)") +
           '<div class="tbl-wrap"><table class="tbl"><thead>' + head + "</thead><tbody>" + rows + "</tbody></table></div>" +
-          '<div class="note" style="margin-top:8px">' + ICON("info") + "<span>OK = stage ran cleanly · N/A = data source unavailable (e.g. Yahoo rate limit) · — = stage not required or disabled · ERROR = stage failed. A cycle is only OK when every enabled stage succeeded.</span></div>" +
+          '<div class="note" style="margin-top:8px">' + ICON("info") + "<span>OK = stage ran cleanly · N/A = data source or LLM provider unavailable · — = stage not required or disabled · ERROR = stage failed. A cycle is only OK when every enabled stage succeeded.</span></div>" +
         "</div>"
       );
     }
@@ -373,12 +373,15 @@
     var cfg = store.data.config || {};
 
     var decisionRows = (c.decisions || []).map(function (d) {
+      var qBadge = { SUFFICIENT: "badge-ok", DEGRADED: "badge-warning", INSUFFICIENT: "badge-error" };
       return (
         '<tr class="rowlink" data-action="open-decision" data-ts="' + findCioTs(d.symbol) + '" data-agent="cio" tabindex="0">' +
           '<td><span class="sym">' + U.esc(d.symbol) + "</span></td>" +
-          "<td>" + '<span class="' + U.badgeForDecision(d.decision) + '">' + U.esc(d.decision) + "</span></td>" +
+          "<td>" + '<span class="' + U.badgeForDecision(d.decision) + '">' + U.esc(d.decision) + "</span>" +
+            (d.blocked_reason ? ' <span class="badge badge-warning" title="' + U.esc(d.blocked_reason) + '">' + U.esc(d.blocked_reason) + "</span>" : "") + "</td>" +
           '<td class="r">' + (d.confidence != null ? Math.round(d.confidence * 100) + "%" : "—") + "</td>" +
           '<td class="r">' + (d.notional_usd ? U.fmtMoney(d.notional_usd, { dec: 0 }) : "—") + "</td>" +
+          '<td>' + (d.evidence_quality ? '<span class="badge ' + (qBadge[d.evidence_quality] || "") + '">' + U.esc(d.evidence_quality) + "</span>" : '<span class="t-faint">—</span>') + "</td>" +
         "</tr>"
       );
     }).join("");
@@ -437,7 +440,8 @@
       llmUsageSection(c) +
       (decisionRows
         ? '<div class="dsec">' + C.sectionTitle("gavel", "Decisions") +
-            '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Symbol</th><th>Decision</th><th class="r">Confidence</th><th class="r">Notional</th></tr></thead><tbody>' + decisionRows + "</tbody></table></div>" +
+            '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Symbol</th><th>Decision</th><th class="r">Confidence</th><th class="r">Notional</th><th>Evidence</th></tr></thead><tbody>' + decisionRows + "</tbody></table></div>" +
+          '<div class="note" style="margin-top:8px">' + ICON("info") + "<span>Evidence quality: SUFFICIENT (all analyst evidence available) · DEGRADED (some evidence missing — CIO informed) · INSUFFICIENT (critical evidence missing — BUY blocked; a risk-cap limit alone never justifies a trade).</span></div>" +
           "</div>"
         : "") +
       (orderRows
@@ -445,8 +449,20 @@
         : "") +
       ((c.warnings || 0) > 0 || (c.errors || []).length
         ? '<div class="dsec">' + C.sectionTitle("alert", "Warnings & Errors") +
-            (c.errors || []).map(function (e) { return '<div class="check err"><div class="c-ico">' + ICON("x") + '</div><div class="c-body">' + U.esc(e) + "</div></div>"; }).join("") +
-            ((c.warnings || 0) > 0 && !(c.errors || []).some(function (e) { return e.indexOf("Warning") >= 0; })
+            (c.errors || []).map(function (e) {
+              // Structured errors: {provider, type, agent, symbol, message}
+              if (e && typeof e === "object") {
+                var chips =
+                  '<span class="badge badge-error">' + U.esc(e.type || "ERROR") + "</span> " +
+                  '<span class="t-faint">' + U.esc(e.provider || "?") +
+                  (e.agent ? " · " + U.esc(e.agent) : "") +
+                  (e.symbol ? " · " + U.esc(e.symbol) : "") + "</span>";
+                return '<div class="check err"><div class="c-ico">' + ICON("x") + '</div><div class="c-body">' +
+                  chips + "<div>" + U.esc(e.message || "") + "</div></div></div>";
+              }
+              return '<div class="check err"><div class="c-ico">' + ICON("x") + '</div><div class="c-body">' + U.esc(e) + "</div></div>";
+            }).join("") +
+            ((c.warnings || 0) > 0 && !(c.errors || []).some(function (e) { return (typeof e === "string" ? e : (e && e.message) || "").indexOf("Warning") >= 0; })
               ? '<div class="check warn"><div class="c-ico">' + ICON("alert") + '</div><div class="c-body">' + c.warnings + " warning" + (c.warnings > 1 ? "s" : "") + " raised during this cycle</div></div>"
               : "") +
           "</div>"

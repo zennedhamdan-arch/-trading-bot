@@ -47,6 +47,25 @@ logger = logging.getLogger("alpaca_service")
 _trading_client: Optional["TradingClient"] = None
 _data_client: Optional["StockHistoricalDataClient"] = None
 
+# ---------------------------------------------------------------------------
+# Indicator lookback requirements (daily bars).
+#
+# The configured indicator suite needs, at minimum, as many bars as its
+# LARGEST window. The 'ta' library's ATR implementation does positional
+# indexing (atr[window-1] = ...) and RAISES IndexError when the series is
+# shorter than the window — the production "index 13 is out of bounds for
+# axis 0 with size 5" crash. The fix is structural: always request (and
+# validate) enough bars for the full suite, never patch the indexing.
+#
+#   RSI(14)        -> 15 bars      SMA(20) -> 20     EMA(20) -> ~60 (convergence)
+#   SMA(50)        -> 50 bars      MACD(26/9) -> ~35 ATR(14) -> 15
+#   SMA(200)       -> 200 bars     <== maximum
+# ---------------------------------------------------------------------------
+REQUIRED_BARS = 200
+# Calendar days that reliably contain REQUIRED_BARS trading sessions
+# (weekends ≈ 2/7 of days, plus holidays) with a safety buffer.
+REQUIRED_CALENDAR_DAYS = int(REQUIRED_BARS * 1.6) + 14
+
 
 def _resolve_feed() -> "DataFeed":
     """Resolves the market-data feed from configuration.
@@ -209,8 +228,17 @@ def get_portfolio_history(period: str = "1M", timeframe: Optional[str] = None) -
 
     Uses TradingClient.get_portfolio_history() with a GetPortfolioHistoryRequest
     (the correct alpaca-py API — this service previously called a method that
-    does not exist on the installed SDK and always failed). Equity values the
-    API reports as null are filtered out; nothing is interpolated or fabricated.
+    does not exist on the installed SDK and always failed).
+
+    Honesty rules (the chart must NEVER draw a fake line from $0):
+      - equity values the API reports as null/missing are dropped;
+      - non-positive equity values and epoch-0 timestamps are treated as
+        API artifacts and dropped (a long-only paper account cannot have
+        $0 equity, and timestamp 0 = 1970-01-01 is a placeholder, not a
+        real sample) — the dropped count is reported, never hidden;
+      - nothing is interpolated, zero-filled or fabricated. If fewer than
+        two valid points remain the frontend shows an explicit empty
+        state instead of a synthetic curve.
     """
     try:
         client = _get_trading_client()
@@ -227,15 +255,32 @@ def get_portfolio_history(period: str = "1M", timeframe: Optional[str] = None) -
         else:
             timestamps = getattr(history, "timestamp", None) or []
             equity = getattr(history, "equity", None) or []
-        points = [
-            {"timestamp": ts, "equity": eq}
-            for ts, eq in zip(timestamps, equity)
-            if eq is not None
-        ]
-        return {"points": points, "error": None}
+        points = []
+        dropped = 0
+        for ts, eq in zip(timestamps, equity):
+            if eq is None or ts is None:
+                dropped += 1
+                continue
+            try:
+                eq_f, ts_f = float(eq), float(ts)
+            except (TypeError, ValueError):
+                dropped += 1
+                continue
+            if eq_f <= 0 or ts_f <= 0:
+                # Missing/placeholder artifacts must never render as $0.
+                dropped += 1
+                continue
+            points.append({"timestamp": ts_f, "equity": eq_f})
+        if dropped:
+            logger.info(
+                f"get_portfolio_history({period}): dropped {dropped} invalid "
+                f"point(s) (null/zero equity or epoch-0 timestamps) — never "
+                f"rendered as $0."
+            )
+        return {"points": points, "error": None, "dropped_invalid_points": dropped}
     except Exception as e:
         logger.error(f"get_portfolio_history failed: {e}")
-        return {"points": [], "error": str(e)}
+        return {"points": [], "error": str(e), "dropped_invalid_points": 0}
 
 
 def get_indicators(symbol: str, lookback_days: int = 250) -> dict:
@@ -256,10 +301,17 @@ def get_indicators(symbol: str, lookback_days: int = 250) -> dict:
     if not TA_AVAILABLE:
         return {"error": "The 'ta' library is not installed.", "symbol": symbol}
 
+    # Always request enough history for the FULL indicator suite (the
+    # largest window is SMA200). A small caller-supplied lookback (e.g.
+    # the health probe's 5 days) never results in a short series again.
+    lookback_days = max(int(lookback_days or 0), REQUIRED_BARS)
+
     try:
         data_client = _get_data_client()
         end = datetime.utcnow()
-        start = end - timedelta(days=lookback_days * 1.6)  # buffer for weekends/holidays
+        # Buffer for weekends/holidays; never below the suite's requirement.
+        calendar_days = max(lookback_days * 1.6, REQUIRED_CALENDAR_DAYS)
+        start = end - timedelta(days=calendar_days)
 
         req = StockBarsRequest(
             symbol_or_symbols=symbol,
@@ -283,6 +335,29 @@ def get_indicators(symbol: str, lookback_days: int = 250) -> dict:
         closes = df["close"]
         highs = df["high"] if "high" in df else closes
         lows = df["low"] if "low" in df else closes
+
+        # Validate the returned bar count BEFORE any calculation: with too
+        # few bars the ta library raises IndexError (e.g. ATR positional
+        # indexing) — that must surface as a structured DATA_UNAVAILABLE,
+        # never as an exception, and never as fabricated indicator values.
+        available_bars = int(len(closes))
+        if available_bars < REQUIRED_BARS:
+            detail = (
+                f"DATA_UNAVAILABLE (INSUFFICIENT_BARS): received {available_bars} "
+                f"daily bar(s) for {symbol} on feed={settings.ALPACA_DATA_FEED}; "
+                f"the configured indicator suite requires at least {REQUIRED_BARS} "
+                f"bars (SMA200). No indicator values are fabricated."
+            )
+            logger.warning(f"get_indicators({symbol}): {detail}")
+            return {
+                "symbol": symbol,
+                "status": "DATA_UNAVAILABLE",
+                "reason": "insufficient_bars",
+                "available_bars": available_bars,
+                "required_bars": REQUIRED_BARS,
+                "error": detail,
+                "feed": settings.ALPACA_DATA_FEED,
+            }
 
         # --- deterministic indicators (ta + pandas) ---
         rsi = ta.momentum.RSIIndicator(close=closes, window=14).rsi()
@@ -355,6 +430,8 @@ def get_indicators(symbol: str, lookback_days: int = 250) -> dict:
             "symbol": symbol,
             "feed": settings.ALPACA_DATA_FEED,
             "latest_close": latest_close,
+            "bars_available": available_bars,
+            "last_bar_date": str(closes.index[-1]) if len(closes) else None,
             "rsi_14": _safe_last(rsi),
             "sma_20": _safe_last(sma20),
             "sma_50": sma50_v,
@@ -374,6 +451,26 @@ def get_indicators(symbol: str, lookback_days: int = 250) -> dict:
             },
             "recent_closes": [round(float(c), 2) for c in closes.tail(10).tolist()],
             "error": None,
+        }
+    except IndexError as e:
+        # Belt-and-braces: with the pre-validation above this should be
+        # unreachable, but a short-series IndexError from the indicator
+        # library is still an INSUFFICIENT_BARS condition — structured,
+        # never an exception into the trading cycle, never fabricated.
+        detail = (
+            f"DATA_UNAVAILABLE (INSUFFICIENT_BARS): indicator library ran out "
+            f"of data for {symbol} ({e}); the suite requires at least "
+            f"{REQUIRED_BARS} daily bars."
+        )
+        logger.warning(f"get_indicators({symbol}): {detail}")
+        return {
+            "symbol": symbol,
+            "status": "DATA_UNAVAILABLE",
+            "reason": "insufficient_bars",
+            "available_bars": None,
+            "required_bars": REQUIRED_BARS,
+            "error": detail,
+            "feed": settings.ALPACA_DATA_FEED,
         }
     except Exception as e:
         logger.error(f"get_indicators failed for {symbol}: {e}")

@@ -50,7 +50,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from config import settings
 from services import (alpaca_service, memory_service, llm_service,
                       market_data_service, risk_gate, health_service,
-                      realtime_service, fundamentals_service)
+                      realtime_service, fundamentals_service, evidence as evidence_service)
 from agents import news_agent, tech_agent, risk_agent, cio_agent, fundamentals_agent, debate_agent
 
 logging.basicConfig(
@@ -398,11 +398,27 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
                 _log_event({"agent": "fundamentals", "symbol": symbol, "level": _report_level(fundamentals_report),
                             "message": fundamentals_report["summary"], "data": fundamentals_report})
 
-            # 5. Bull vs Bear debate (one structured LLM call per symbol)
+            # 5. Evidence quality snapshot (which evidence is actually
+            #    available) — computed BEFORE the debate so the debate
+            #    knows exactly what is real and what is missing, and
+            #    re-computed after it for the risk/CIO/execution stages.
             current_stage = "debate"
+            fundamentals_evidence_report = (
+                fundamentals_report if settings.ENABLE_FUNDAMENTALS_AGENT else None
+            )
+            analyst_evidence = evidence_service.assess(
+                tech_report, news_report,
+                fundamentals_evidence_report,
+                debate_report=None,
+                indicators=indicators,
+            )
+
             debate_report = None
             if settings.ENABLE_DEBATE:
-                debate_report = debate_agent.run_debate(symbol, tech_report, news_report, fundamentals_report)
+                debate_report = debate_agent.run_debate(
+                    symbol, tech_report, news_report, fundamentals_report,
+                    evidence=analyst_evidence,
+                )
                 status["debate"] = _stage_status(debate_report)
                 if debate_report.get("error"):
                     _add_error(debate_report.get("provider", "llm"), _llm_error_type(debate_report.get("llm_status")),
@@ -412,11 +428,22 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
                                        f"Bear({debate_report['bear_strength']}), edge={debate_report['edge']}",
                             "data": debate_report})
 
-            # 6. Risk: deterministic gate + optional LLM reasoning
+            # Final evidence snapshot including the debate outcome.
+            evidence = evidence_service.assess(
+                tech_report, news_report,
+                fundamentals_evidence_report,
+                debate_report=debate_report if settings.ENABLE_DEBATE else None,
+                indicators=indicators,
+            )
+
+            # 6. Risk: deterministic PORTFOLIO-RISK gate + optional LLM
+            #    reasoning (informed about decision quality — a separate
+            #    prerequisite enforced before execution below).
             current_stage = "risk"
             existing_position = positions_by_symbol.get(symbol)
             risk_report = risk_agent.assess_risk(
-                symbol, "buy", account_summary, existing_position, indicators
+                symbol, "buy", account_summary, existing_position, indicators,
+                evidence=evidence,
             )
             status["risk"] = _stage_status(risk_report)
             if risk_report.get("error"):
@@ -437,6 +464,7 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
                 debate_report=debate_report,
                 agent_weights=agent_weights,
                 memory_summary=memory_summary,
+                evidence=evidence,
             )
             status["cio"] = _stage_status(decision_report)
             if decision_report.get("error"):
@@ -452,18 +480,64 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
                 "confidence": decision_report.get("confidence"),
                 "notional_usd": decision_report.get("notional_usd"),
                 "reasoning": decision_report.get("reasoning", ""),
+                "evidence_quality": evidence.get("quality"),
+                "evidence": {
+                    "agents": {name: entry["state"]
+                               for name, entry in (evidence.get("agents") or {}).items()},
+                    "available": evidence.get("available"),
+                    "missing": evidence.get("missing"),
+                    "staleness": evidence.get("staleness"),
+                },
             })
+            cycle_record.setdefault("evidence", {})[symbol] = {
+                "quality": evidence.get("quality"),
+                "agents": {name: entry["state"]
+                           for name, entry in (evidence.get("agents") or {}).items()},
+                "staleness": evidence.get("staleness"),
+            }
 
             # ------------------------------------------------------------
-            # 8. VALIDATION + RISK GATE + PAPER EXECUTION
-            #    Deterministic final gate: action, symbol, quantity, buying
-            #    power, position limits, risk constraints. AI cannot bypass.
+            # 8. DECISION-QUALITY PREREQUISITE + VALIDATION + RISK GATE +
+            #    PAPER EXECUTION.
+            #    Deterministic final gates, in order:
+            #      a. evidence quality — a trade may never be justified
+            #         solely because the portfolio-risk cap permits the
+            #         notional; missing/stale critical evidence => HOLD.
+            #      b. order validation: action, symbol, quantity, buying
+            #         power, position limits, risk constraints. AI cannot
+            #         bypass either.
             # ------------------------------------------------------------
             current_stage = "execution"
             trade_result = None
             decision = decision_report["decision"]
             order_attempted = False
             validation = None
+
+            # a. DECISION-QUALITY PREREQUISITE: portfolio risk (buying
+            #    power, position caps) and decision quality are separate.
+            #    With INSUFFICIENT evidence quality a BUY is held even if
+            #    the deterministic risk gate would permit the notional.
+            if decision == "BUY" and not evidence.get("trade_allowed", True):
+                reason_txt = "; ".join(evidence.get("reasons") or ["evidence quality insufficient"])
+                decision = "HOLD"
+                decision_report["decision"] = "HOLD"
+                decision_report["notional_usd"] = 0.0
+                if cycle_record["decisions"]:
+                    cycle_record["decisions"][-1]["decision"] = "HOLD"
+                    cycle_record["decisions"][-1]["notional_usd"] = 0.0
+                    cycle_record["decisions"][-1]["blocked_reason"] = "EVIDENCE_INSUFFICIENT"
+                status["execution"] = "UNAVAILABLE"
+                _add_error("system", "EVIDENCE_INSUFFICIENT", "execution", symbol,
+                           f"BUY held — decision quality INSUFFICIENT: {reason_txt}")
+                _log_event({
+                    "agent": "execution", "symbol": symbol, "level": "WARNING",
+                    "message": (
+                        f"BUY held: evidence quality INSUFFICIENT ({reason_txt}). "
+                        f"The portfolio-risk cap alone never justifies a trade."
+                    ),
+                    "data": {"blocked_reason": "EVIDENCE_INSUFFICIENT", "evidence": evidence},
+                })
+
             if decision == "BUY" and decision_report["notional_usd"] > 0:
                 validation = risk_gate.validate_order(
                     symbol, "buy", account_summary, positions_by_symbol,
@@ -653,9 +727,15 @@ async def lifespan(app: FastAPI):
     except Exception as exc:  # noqa: BLE001
         logger.error(f"Startup health check failed (non-fatal): {exc}")
 
-    # Real-time layer (Alpaca WebSockets). Purely observational: ticks
-    # never trigger LLM calls. Optional and failure-tolerant.
-    realtime_task = asyncio.create_task(realtime_service.run_forever())
+    # Real-time layer (Alpaca WebSockets). Each SDK stream runs in its own
+    # dedicated thread — the SDK's run() owns its event loop, so it must
+    # never be awaited inside the FastAPI loop. Ticks are bridged to this
+    # loop through a thread-safe queue. Purely observational: ticks never
+    # trigger LLM calls.
+    try:
+        await realtime_service.start_async()
+    except Exception as exc:  # noqa: BLE001 — optional layer, never fatal
+        logger.error(f"Real-time layer failed to start (non-fatal): {exc}")
 
     # Verify every configured LLM model id against each provider's LIVE
     # catalog (Groq/OpenRouter/Gemini). Providers without keys are skipped
@@ -684,9 +764,12 @@ async def lifespan(app: FastAPI):
     logger.info(f"Scheduler started. Cycle interval: {settings.CYCLE_INTERVAL_MINUTES} min.")
     yield
     # Shutdown
-    realtime_task.cancel()
+    try:
+        await realtime_service.shutdown()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"Real-time layer shutdown issue (non-fatal): {exc}")
     scheduler.shutdown(wait=False)
-    logger.info("Scheduler stopped. Real-time layer cancelled.")
+    logger.info("Scheduler stopped. Real-time layer stopped.")
 
 
 app = FastAPI(title="AI Trading Bot Dashboard", lifespan=lifespan)
@@ -745,9 +828,16 @@ async def api_orders(limit: int = 50):
 
 @app.get("/api/history")
 async def api_history(period: str = "1M"):
-    """Portfolio equity history for the chart, with a period passthrough."""
+    """Portfolio equity history for the chart, with a period passthrough.
+    Invalid points (null/zero equity, epoch-0 timestamps) are dropped and
+    counted — missing history is never represented as $0."""
     history = alpaca_service.get_portfolio_history(period=period)
-    return JSONResponse({"points": history["points"], "period": period, "error": history["error"]})
+    return JSONResponse({
+        "points": history["points"],
+        "period": period,
+        "error": history["error"],
+        "dropped_invalid_points": history.get("dropped_invalid_points", 0),
+    })
 
 
 @app.post("/api/bot/start")

@@ -88,20 +88,26 @@ def analyze_fundamentals(symbol: str, fundamentals: dict) -> dict:
         {
           "agent": "fundamentals",
           "symbol": symbol,
-          "signal": "BULLISH"/"BEARISH"/"NEUTRAL",
-          "confidence": float,
+          "evidence_status": "AVAILABLE"|"UNAVAILABLE"|"ERROR",
+          "signal": "BULLISH"/"BEARISH"/"NEUTRAL" | None (None unless AVAILABLE),
+          "confidence": float | None,
           "summary": str,
           "error": str | None,
           "provider": str, "model": str, "llm_status": str,
           "latency_ms": float | null, "cached": bool
         }
+
+    NEUTRAL is only ever a verdict on successfully analyzed data; an
+    unavailable provider yields UNAVAILABLE with null signal/confidence
+    (never a fake NEUTRAL), and an LLM failure yields ERROR.
     """
     route = llm_service.route_info("fundamentals")
     base_result = {
         "agent": "fundamentals",
         "symbol": symbol,
-        "signal": "NEUTRAL",
-        "confidence": 0.0,
+        "evidence_status": None,
+        "signal": None,
+        "confidence": None,
         "summary": "",
         "error": None,
         "provider": route["provider"],
@@ -113,6 +119,7 @@ def analyze_fundamentals(symbol: str, fundamentals: dict) -> dict:
 
     if not settings.ENABLE_FUNDAMENTALS_AGENT:
         base_result["llm_status"] = "SKIPPED_DISABLED"
+        base_result["evidence_status"] = "OFF"  # disabled by configuration, not a failure
         base_result["summary"] = "Fundamentals agent disabled via config."
         return base_result
 
@@ -123,8 +130,14 @@ def analyze_fundamentals(symbol: str, fundamentals: dict) -> dict:
             or fundamentals.get("error")
             or f"status={fundamentals.get('status', 'MISSING')}"
         )
+        # FUNDAMENTALS_PROVIDER=none is off-by-configuration (acceptable,
+        # does not degrade evidence quality); a configured provider that
+        # failed is genuinely UNAVAILABLE evidence.
+        base_result["evidence_status"] = (
+            "OFF" if reason == "NO_PROVIDER_CONFIGURED" else "UNAVAILABLE"
+        )
         base_result["error"] = f"DATA_UNAVAILABLE: {reason}"
-        base_result["summary"] = "No usable fundamentals data available."
+        base_result["summary"] = "No usable fundamentals data available — no fundamentals verdict."
         return base_result
 
     # 1. Reuse the previous LLM interpretation while the exact metrics are
@@ -173,15 +186,18 @@ def analyze_fundamentals(symbol: str, fundamentals: dict) -> dict:
 
     if not result.ok:
         logger.error(f"Fundamentals agent failed for {symbol}: {result.error}")
+        from services.evidence import state_for_llm_status
+        base_result["evidence_status"] = state_for_llm_status(result.status)
         base_result["error"] = result.error
         base_result["summary"] = (
-            "Fundamentals agent disabled: missing API key."
+            "Fundamentals agent disabled: missing API key — no fundamentals verdict."
             if result.status == "NOT_CONFIGURED"
-            else "Fundamentals agent encountered an error; defaulting to NEUTRAL."
+            else "Fundamentals agent encountered an error — no fundamentals verdict."
         )
         return base_result
 
     parsed = result.parsed
+    base_result["evidence_status"] = "AVAILABLE"
     base_result["signal"] = str(parsed.get("signal", "NEUTRAL")).upper()
     base_result["confidence"] = float(parsed.get("confidence", 0.0))
     base_result["summary"] = str(parsed.get("summary", ""))

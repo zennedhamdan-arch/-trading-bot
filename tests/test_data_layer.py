@@ -27,6 +27,8 @@ Run:  .venv/bin/python tests/test_data_layer.py
 import asyncio
 import os
 import sys
+import threading
+import time
 import types
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -108,7 +110,8 @@ def _make_bars(symbol, n=260):
     closes = [100 + (i % 20) * 0.5 for i in range(n)]
     highs = [c + 1.5 for c in closes]
     lows = [c - 1.5 for c in closes]
-    idx = pd.DatetimeIndex(pd.date_range("2025-01-01", periods=n, freq="D", tz="UTC"), name="timestamp")
+    end = pd.Timestamp.utcnow().floor("D")
+    idx = pd.DatetimeIndex(pd.date_range(end=end, periods=n, freq="D", tz="UTC"), name="timestamp")
     return pd.DataFrame({"close": closes, "open": closes, "high": highs, "low": lows,
                          "volume": [1000] * n, "trade_count": [10] * n, "vwap": closes}, index=idx)
 
@@ -299,7 +302,9 @@ for sym in UNIVERSE:
 af = fundamentals_agent.analyze_fundamentals("AAPL", fs.get_fundamentals("AAPL"))
 check("fundamentals agent degrades to explicit DATA_UNAVAILABLE",
       af["error"] == "DATA_UNAVAILABLE: NO_PROVIDER_CONFIGURED"
-      and af["llm_status"] == "SKIPPED_NO_DATA" and af["signal"] == "NEUTRAL")
+      and af["llm_status"] == "SKIPPED_NO_DATA")
+check("no provider configured -> evidence OFF (config, not a failure) with NULL stance/confidence (never a fake NEUTRAL)",
+      af["evidence_status"] == "OFF" and af["signal"] is None and af["confidence"] is None)
 
 # ---------------------------------------------------------------------------
 print("7. risk gate (deterministic; AI cannot bypass):")
@@ -347,75 +352,174 @@ v = risk_gate.validate_order("AAPL", "buy", acct, {}, notional_usd=0.0, trade_un
 check("zero-size order blocked", not v["valid"] and "positive" in v["reason"])
 
 # ---------------------------------------------------------------------------
-print("8. realtime layer (Alpaca WS; ticks never trigger LLMs):")
+print("8. realtime layer (Alpaca WS; SDK run() on dedicated threads; ticks never trigger LLMs):")
 
 
-class _FakeStockStream:
-    def __init__(self):
+class _FakeSDKStream:
+    """Models the INSTALLED alpaca-py DataStream semantics:
+    run() is SYNCHRONOUS and blocks until stop() (it owns its loop);
+    _running flips True once 'connected'; stop() is thread-safe."""
+
+    instances = []
+
+    def __init__(self, kind):
+        self.kind = kind
         self.handlers = {}
+        self._running = False
+        self._stop = threading.Event()
+        self.ran = False
+        self.stopped = False
+        _FakeSDKStream.instances.append(self)
+
     def subscribe_trades(self, handler, *symbols):
         self.handlers["trades"] = (handler, symbols)
+
     def subscribe_quotes(self, handler, *symbols):
         self.handlers["quotes"] = (handler, symbols)
+
     def subscribe_bars(self, handler, *symbols):
         self.handlers["bars"] = (handler, symbols)
-    async def run(self):
-        await asyncio.Event().wait()
 
-
-class _FakeNewsStream:
-    def __init__(self):
-        self.handlers = {}
     def subscribe_news(self, handler, *symbols):
         self.handlers["news"] = (handler, symbols)
-    async def run(self):
-        await asyncio.Event().wait()
+
+    def run(self):
+        self.ran = True
+        self._running = True  # 'connected + authed + subscribed'
+        self._stop.wait()     # blocks like the real SDK (owns its loop)
+        self._running = False
+
+    def stop(self):
+        self.stopped = True
+        self._stop.set()
+
+    def die(self):
+        """Simulates a fatal stream error: run() returns on its own."""
+        self._stop.set()
 
 
-_streams = {"stock": _FakeStockStream(), "news": _FakeNewsStream()}
+def _fake_build_stock_stream():
+    stream = _FakeSDKStream("stock")
+    stream.subscribe_trades(realtime_service._on_trade, *UNIVERSE)
+    stream.subscribe_quotes(realtime_service._on_quote, *UNIVERSE)
+    stream.subscribe_bars(realtime_service._on_bar, *UNIVERSE)
+    return stream, "iex", list(UNIVERSE)
 
 
-def _fake_build_streams():
-    """Mimics the real _build_streams: subscribes the service's real
-    handlers (trades/quotes/bars/news) to the fake stream objects."""
-    stock, news = _streams["stock"], _streams["news"]
-    stock.subscribe_trades(realtime_service._on_trade, *UNIVERSE)
-    stock.subscribe_quotes(realtime_service._on_quote, *UNIVERSE)
-    stock.subscribe_bars(realtime_service._on_bar, *UNIVERSE)
-    news.subscribe_news(realtime_service._on_news, *UNIVERSE)
-    return stock, news, "iex", UNIVERSE
+def _fake_build_news_stream():
+    stream = _FakeSDKStream("news")
+    stream.subscribe_news(realtime_service._on_news, *UNIVERSE)
+    return stream
 
 
-realtime_service._build_streams = _fake_build_streams
+realtime_service._BUILDERS = {"stock": _fake_build_stock_stream, "news": _fake_build_news_stream}
+
+
+async def _rt_wait(predicate, timeout=6.0):
+    """Async-friendly wait: must yield to the event loop (the drain task
+    runs on it) — never blocks with time.sleep."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(0.02)
+    return False
 
 
 async def _rt_test():
-    t = asyncio.create_task(realtime_service.run_forever())
-    await asyncio.sleep(0.05)
-    handler, symbols = _streams["stock"].handlers["trades"]
-    check("subscribed to trades for the whole universe", set(symbols) == set(UNIVERSE))
-    await handler(types.SimpleNamespace(symbol="AAPL", price=175.25, size=3, timestamp=None))
-    await _streams["stock"].handlers["quotes"][0](types.SimpleNamespace(
-        symbol="AAPL", bid_price=175.0, ask_price=175.5, bid_size=1, ask_size=1, timestamp=None))
-    await _streams["stock"].handlers["bars"][0](types.SimpleNamespace(
-        symbol="AAPL", open=175.0, high=176.0, low=174.5, close=175.4, volume=1200, timestamp=None))
-    await _streams["news"].handlers["news"][0](types.SimpleNamespace(
-        headline="AAPL wins", summary="big", source="api", symbols=["AAPL"], created_at=None))
+    # Fast backoff for the lifecycle test (real default is 2s base / 60s cap).
+    config.settings.REALTIME_RECONNECT_SECONDS = 0.05
+    config.settings.REALTIME_RECONNECT_MAX_SECONDS = 0.2
+    # Staleness recycle is exercised separately below (it would otherwise
+    # recycle continuously, since fake streams never emit ticks on their own).
+    config.settings.REALTIME_STALE_TICK_SECONDS = 60.0
+
+    await realtime_service.start_async()
+
+    # Status is honest: CONNECTING before genuinely running, CONNECTED after.
+    ok = await _rt_wait(lambda: realtime_service.get_state()["connection_status"] == "CONNECTED")
+    check("status becomes CONNECTED only once the stream genuinely runs", ok)
     state = realtime_service.get_state()
-    check("state CONNECTED after stream start", state["status"] == "CONNECTED")
-    check("last trade normalized", state["data"]["AAPL"]["last_trade"]["price"] == 175.25)
-    check("last quote normalized", state["data"]["AAPL"]["last_quote"]["ask_price"] == 175.5)
-    check("minute bar normalized", state["data"]["AAPL"]["minute_bar"]["close"] == 175.4)
+    check("connected_at recorded when genuinely connected", state["connected_at"] is not None)
+    check("exactly ONE stock stream instance (no duplicates)", len([s for s in _FakeSDKStream.instances if s.kind == "stock"]) == 1)
+    check("status key mirrors connection_status (legacy)", state["status"] == state["connection_status"])
+
+    stock = [s for s in _FakeSDKStream.instances if s.kind == "stock"][0]
+    news = [s for s in _FakeSDKStream.instances if s.kind == "news"][0]
+    handler, symbols = stock.handlers["trades"]
+    check("subscribed to trades for the whole universe", set(symbols) == set(UNIVERSE))
+    check("feed recorded", state["feed"] == "iex" and state["symbols"] == list(UNIVERSE))
+
+    # Handlers only enqueue; the drain task applies them on this loop.
+    await handler(types.SimpleNamespace(symbol="AAPL", price=175.25, size=3, timestamp=None))
+    await stock.handlers["quotes"][0](types.SimpleNamespace(
+        symbol="AAPL", bid_price=175.0, ask_price=175.5, bid_size=1, ask_size=1, timestamp=None))
+    await stock.handlers["bars"][0](types.SimpleNamespace(
+        symbol="AAPL", open=175.0, high=176.0, low=174.5, close=175.4, volume=1200, timestamp=None))
+    await news.handlers["news"][0](types.SimpleNamespace(
+        headline="AAPL wins", summary="big", source="api", symbols=["AAPL"], created_at=None))
+    ok = await _rt_wait(lambda: realtime_service.get_state()["data"].get("AAPL", {}).get("last_trade", {}).get("price") == 175.25)
+    check("tick bridged through the thread-safe queue (trade)", ok)
+    state = realtime_service.get_state()
+    check("last tick normalized (quote + bar)",
+          state["data"]["AAPL"]["last_quote"]["ask_price"] == 175.5
+          and state["data"]["AAPL"]["minute_bar"]["close"] == 175.4)
     check("news stream normalized", state["news"][0]["headline"] == "AAPL wins")
-    t.cancel()
-    try:
-        await t
-    except asyncio.CancelledError:
-        pass
+    check("last_tick_at recorded", state["last_tick_at"] is not None
+          and state["seconds_since_last_tick"] is not None)
+
+    # Worker death -> supervisor restarts with backoff, never duplicates.
+    stock_count_before = len([s for s in _FakeSDKStream.instances if s.kind == "stock"])
+    stock.die()  # run() returns -> worker thread exits
+    ok = await _rt_wait(lambda: realtime_service.get_state()["connection_status"] == "CONNECTED"
+                  and len([s for s in _FakeSDKStream.instances if s.kind == "stock"]) == stock_count_before + 1)
+    check("dead stream restarted (exactly one new instance)", ok)
+    ok = await _rt_wait(lambda: realtime_service.get_state()["workers"]["stock"]["genuinely_running"] is True)
+    check("restarted stream genuinely running again", ok)
+    check("reconnect counter incremented", realtime_service.get_state()["reconnects"] >= 1)
+
+    # Connected-but-silent while market open -> recycled exactly once (fake
+    # clock says the market is open; no tick will arrive on the fake stream).
+    config.settings.REALTIME_STALE_TICK_SECONDS = 0.4
+    before_silent = len([s for s in _FakeSDKStream.instances if s.kind == "stock"])
+    ok = await _rt_wait(lambda: len([s for s in _FakeSDKStream.instances if s.kind == "stock"]) == before_silent + 1,
+                  timeout=8.0)
+    check("silent stream (market open) recycled", ok)
+    # Disable further recycles, then verify the replacement is healthy and
+    # that never more than one stream instance was alive at any moment.
+    config.settings.REALTIME_STALE_TICK_SECONDS = 0.0
+    ok = await _rt_wait(lambda: realtime_service.get_state()["connection_status"] == "CONNECTED")
+    check("replacement stream CONNECTED after recycle (no storm)", ok)
+    live_instances = [s for s in _FakeSDKStream.instances if s.kind == "stock" and s._stop.is_set() is False]
+    check("no duplicate concurrent streams (all old instances stopped)",
+          len(live_instances) == 1)
+    check("every old instance was stopped before its replacement was built",
+          all(s.stopped or s is live_instances[0] for s in _FakeSDKStream.instances if s.kind == "stock"))
+
+    await realtime_service.shutdown()
+    state = realtime_service.get_state()
+    check("shutdown -> DISCONNECTED, workers stopped", state["connection_status"] == "DISCONNECTED")
+    check("every SDK stream got stop() on shutdown",
+          all(s.stopped for s in _FakeSDKStream.instances if s.kind in ("stock", "news")))
+    with realtime_service._lock:
+        check("worker registry cleared", not realtime_service._workers)
 
 
 asyncio.run(_rt_test())
 realtime_service.reset_state()
+_FakeSDKStream.instances.clear()
+
+# Bounded exponential backoff with jitter: ~2, ~4, ~8, ~16 ... capped.
+config.settings.REALTIME_RECONNECT_SECONDS = 2.0
+config.settings.REALTIME_RECONNECT_MAX_SECONDS = 60.0
+import statistics
+for attempt, expected in [(1, 2.0), (2, 4.0), (3, 8.0), (4, 16.0), (5, 32.0), (6, 60.0), (50, 60.0)]:
+    delays = [realtime_service._backoff_delay(attempt) for _ in range(200)]
+    med = statistics.median(delays)
+    check(f"backoff attempt {attempt}: median {med:.1f}s ~ {expected}s (jittered)",
+          expected * 0.7 <= med <= expected * 1.3)
+    check(f"backoff attempt {attempt}: within jitter bounds",
+          all(expected * 0.74 <= d <= expected * 1.26 for d in delays))
 
 # disabled without keys
 config.settings.ALPACA_API_KEY = ""
@@ -423,13 +527,9 @@ config.settings.ALPACA_SECRET_KEY = ""
 
 
 async def _rt_disabled():
-    t = asyncio.create_task(realtime_service.run_forever())
-    await asyncio.sleep(0.05)
-    t.cancel()
-    try:
-        await t
-    except asyncio.CancelledError:
-        pass
+    await realtime_service.start_async()
+    with realtime_service._lock:
+        check("no threads started without keys", not realtime_service._workers)
 
 
 asyncio.run(_rt_disabled())
@@ -439,9 +539,16 @@ _rt_src = open("services/realtime_service.py").read()
 check("realtime module never imports the LLM layer (ticks cannot trigger LLM calls)",
       "llm_service" not in _rt_src and "llm_router" not in _rt_src
       and "import" in _rt_src)  # sanity: source read correctly
+check("realtime never awaits stream.run() (SDK owns its loop)",
+      "await stock.run" not in _rt_src and "await news.run" not in _rt_src
+      and "asyncio.gather(stock.run" not in _rt_src)
+check("realtime never depends on the private _run_forever implementation",
+      "_run_forever" not in _rt_src)
 
 config.settings.ALPACA_API_KEY = "test-key"
 config.settings.ALPACA_SECRET_KEY = "test-secret"
+config.settings.REALTIME_STALE_TICK_SECONDS = 180.0
+config.settings.REALTIME_RECONNECT_SECONDS = 2.0
 
 # ---------------------------------------------------------------------------
 print("9. startup health report:")
@@ -453,9 +560,12 @@ llm_service._clients["groq"] = types.SimpleNamespace(
 from services import health_service
 report = health_service.run_startup_checks()
 rows = {r["component"]: r for r in report["rows"]}
-check("ALPACA READY", rows["ALPACA"]["status"] == "READY")
-check("MARKET DATA READY with feed named",
-      rows["MARKET DATA"]["status"] == "READY" and "IEX" in rows["MARKET DATA"]["detail"].upper())
+check("ALPACA ACCOUNT READY", rows["ALPACA ACCOUNT"]["status"] == "READY")
+check("ALPACA MARKET DATA READY with feed named",
+      rows["ALPACA MARKET DATA"]["status"] == "READY" and "IEX" in rows["ALPACA MARKET DATA"]["detail"].upper())
+check("INDICATORS row present and READY (full suite computed)",
+      rows["INDICATORS"]["status"] == "READY" and "bars" in str(rows["INDICATORS"]["detail"]))
+check("REAL-TIME STREAM row present", "REAL-TIME STREAM" in rows)
 check("FUNDAMENTALS DATA_UNAVAILABLE (none provider)",
       rows["FUNDAMENTALS"]["status"] == "DATA_UNAVAILABLE")
 check("GROQ READY (models verified)",
@@ -467,18 +577,27 @@ check("GEMINI NOT_CONFIGURED here (no key on router stub)",
 check("no secrets in the report",
       all("test-secret" not in str(v) and "test-key" not in str(v) for v in rows.values()))
 check("startup rows cover all required components",
-      {"ALPACA", "MARKET DATA", "FUNDAMENTALS", "GROQ", "NVIDIA", "GEMINI", "OPENROUTER"} <= set(rows))
+      {"ALPACA ACCOUNT", "ALPACA MARKET DATA", "INDICATORS", "REAL-TIME STREAM", "FUNDAMENTALS",
+       "GROQ", "NVIDIA", "GEMINI", "OPENROUTER"} <= set(rows))
+check("overall status present in the startup report",
+      report["overall"]["status"] in ("HEALTHY", "DEGRADED", "OFFLINE"))
 
 # feed probe failure path
 fake_data.fail_bars_with = RuntimeError("subscription does not permit querying recent SIP data")
 md = health_service._probe_market_data()
 check("feed probe detects SUBSCRIPTION_FEED_UNAVAILABLE",
       md["status"] == "SUBSCRIPTION_FEED_UNAVAILABLE")
+health_service._probe_cache.update({"ts": 0.0, "account": None, "market_data": None})
+overall = health_service.overall_status(live=True)
+check("SIP denial -> overall OFFLINE (critical market data)",
+      overall["status"] == "OFFLINE" and any("market data" in r.lower() for r in overall["reasons"]))
 fake_data.fail_bars_with = None
 
 live = health_service.live_health()
 check("live health includes provider circuits, market clock and realtime",
       "providers" in live and "market_clock" in live and "realtime" in live)
+check("live health carries the top-level overall status", "overall" in live
+      and live["overall"]["status"] in ("HEALTHY", "DEGRADED", "OFFLINE"))
 
 print()
 if FAILURES:

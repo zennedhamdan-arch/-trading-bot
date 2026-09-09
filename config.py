@@ -162,7 +162,28 @@ class Settings:
     # Purely a dashboard/observability layer: ticks NEVER trigger LLM calls;
     # the AI cycle stays on its scheduled interval.
     REALTIME_ENABLED: bool = _get_bool("REALTIME_ENABLED", True)
-    REALTIME_RECONNECT_SECONDS: float = _get_float("REALTIME_RECONNECT_SECONDS", 30)
+    # Base delay for the supervisor's reconnect backoff. The delay grows
+    # exponentially per consecutive failed attempt (2s, 4s, 8s, 16s, ...)
+    # with jitter, capped at REALTIME_RECONNECT_MAX_SECONDS — never a fixed
+    # every-N-seconds-forever loop.
+    REALTIME_RECONNECT_SECONDS: float = _get_float("REALTIME_RECONNECT_SECONDS", 2.0)
+    REALTIME_RECONNECT_MAX_SECONDS: float = _get_float("REALTIME_RECONNECT_MAX_SECONDS", 60.0)
+    # A live stream that receives no market tick for this many seconds
+    # WHILE THE MARKET IS OPEN is considered connected-but-silent and is
+    # recycled. Outside market hours IEX legitimately sends nothing, so no
+    # reconnect storm happens while the market is closed. 0 disables.
+    REALTIME_STALE_TICK_SECONDS: float = _get_float("REALTIME_STALE_TICK_SECONDS", 180.0)
+    # Optional opt-in passthrough to the SDK's own data_timeout (detects a
+    # silent socket at the transport level). Disabled by default: with no
+    # market data outside trading hours the SDK would otherwise force an
+    # endless reconnect cycle on quiet markets. The market-aware staleness
+    # check above is the default mechanism.
+    REALTIME_DATA_TIMEOUT_SECONDS: float = _get_float("REALTIME_DATA_TIMEOUT_SECONDS", 0.0)
+
+    # --- Evidence quality (decision-quality gate) ---
+    # Daily-bar analytics older than this many calendar days are STALE
+    # (long weekends/holidays fit comfortably below the threshold).
+    EVIDENCE_STALE_DAYS: int = _get_int("EVIDENCE_STALE_DAYS", 5)
 
     # --- Bot behavior ---
     TRADE_UNIVERSE: list = [

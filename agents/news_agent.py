@@ -73,21 +73,27 @@ def analyze_news(symbol: str, headlines: list) -> dict:
         {
           "agent": "news",
           "symbol": symbol,
-          "sentiment": "BULLISH"/"BEARISH"/"NEUTRAL",
-          "confidence": float,
+          "evidence_status": "AVAILABLE"|"UNAVAILABLE"|"ERROR",
+          "sentiment": "BULLISH"/"BEARISH"/"NEUTRAL" | None (None unless AVAILABLE),
+          "confidence": float | None,
           "summary": str,
           "key_headline": str,
           "error": str | null,
           "provider": str, "model": str, "llm_status": str,
           "latency_ms": float | null, "cached": bool
         }
+
+    NEUTRAL sentiment only ever means the agent analyzed real headlines
+    and found them directionally neutral — a failed/unavailable agent
+    yields UNAVAILABLE/ERROR with null sentiment and null confidence.
     """
     route = llm_service.route_info("news")
     base_result = {
         "agent": "news",
         "symbol": symbol,
-        "sentiment": "NEUTRAL",
-        "confidence": 0.0,
+        "evidence_status": None,
+        "sentiment": None,
+        "confidence": None,
         "summary": "",
         "key_headline": "",
         "error": None,
@@ -100,7 +106,8 @@ def analyze_news(symbol: str, headlines: list) -> dict:
 
     if not headlines:
         base_result["llm_status"] = "SKIPPED_NO_DATA"
-        base_result["summary"] = "No recent headlines available for this symbol."
+        base_result["evidence_status"] = "UNAVAILABLE"
+        base_result["summary"] = "No recent headlines available — no news verdict."
         return base_result
 
     # 1. Reuse the previous analysis while the exact headlines are unchanged
@@ -133,15 +140,18 @@ def analyze_news(symbol: str, headlines: list) -> dict:
 
     if not result.ok:
         logger.error(f"News agent failed for {symbol}: {result.error}")
+        from services.evidence import state_for_llm_status
+        base_result["evidence_status"] = state_for_llm_status(result.status)
         base_result["error"] = result.error
         base_result["summary"] = (
-            "News agent disabled: missing API key."
+            "News agent disabled: missing API key — no news verdict."
             if result.status == "NOT_CONFIGURED"
-            else "News agent encountered an error; defaulting to NEUTRAL."
+            else "News agent encountered an error — no news verdict."
         )
         return base_result
 
     parsed = result.parsed
+    base_result["evidence_status"] = "AVAILABLE"
     base_result["sentiment"] = str(parsed.get("sentiment", "NEUTRAL")).upper()
     base_result["confidence"] = float(parsed.get("confidence", 0.0))
     base_result["summary"] = str(parsed.get("summary", ""))

@@ -171,21 +171,27 @@ saved = reset()
 # no key -> legacy fail-safe
 config.settings.GEMINI_API_KEY = ""
 r = news_agent.analyze_news("AAPL", ["Apple beats earnings"])
-check("no key -> NEUTRAL fail-safe", r["sentiment"] == "NEUTRAL" and r["error"] == "GEMINI_API_KEY not configured.")
-check("no key -> disabled summary", r["summary"] == "News agent disabled: missing API key.")
+check("no key -> null stance + UNAVAILABLE evidence (never a fake NEUTRAL)",
+      r["sentiment"] is None and r["confidence"] is None and r["evidence_status"] == "UNAVAILABLE"
+      and r["error"] == "GEMINI_API_KEY not configured.")
+check("no key -> disabled summary", r["summary"] == "News agent disabled: missing API key — no news verdict.")
 
 # no headlines -> NEUTRAL, no LLM call
 config.settings.GEMINI_API_KEY = "test-key"
 gemini_service._client = None
 r = news_agent.analyze_news("AAPL", [])
-check("no headlines -> NEUTRAL", r["sentiment"] == "NEUTRAL" and r["summary"] == "No recent headlines available for this symbol.")
+check("no headlines -> null stance + UNAVAILABLE evidence, no LLM call",
+      r["sentiment"] is None and r["evidence_status"] == "UNAVAILABLE"
+      and r["summary"] == "No recent headlines available — no news verdict."
+      and r["llm_status"] == "SKIPPED_NO_DATA")
 
 # happy path via stubbed Interactions client
 fake = install_fake_client(FakeInteractions(FakeInteraction(
     '{"sentiment": "BULLISH", "confidence": 0.74, "summary": "Positive earnings coverage.", "key_headline": "Apple beats"}')))
 r = news_agent.analyze_news("NVDA", ["NVDA beats", "NVDA rallies", "x", "y", "z"])
 check("happy path maps fields", r["sentiment"] == "BULLISH" and abs(r["confidence"] - 0.74) < 1e-9
-      and r["key_headline"] == "Apple beats" and r["error"] is None)
+      and r["key_headline"] == "Apple beats" and r["error"] is None
+      and r["evidence_status"] == "AVAILABLE")
 call = fake.calls[0]
 check("system prompt sent as system_instruction", call["system_instruction"] == news_agent.SYSTEM_INSTRUCTIONS)
 check("ticker+headlines sent as input", "Ticker: NVDA" in call["input"] and "- NVDA beats" in call["input"])
@@ -194,8 +200,10 @@ check("headlines capped at 15", call["input"].count("\n- ") <= 15)
 # LLM failure -> graceful fail-safe
 install_fake_client(FakeInteractions(None, raise_exc=RuntimeError("quota exceeded")))
 r = news_agent.analyze_news("AAPL", ["h1"])
-check("LLM error -> NEUTRAL fail-safe", r["sentiment"] == "NEUTRAL" and "quota exceeded" in r["error"]
-      and r["summary"] == "News agent encountered an error; defaulting to NEUTRAL.")
+check("LLM error -> null stance + ERROR evidence (never a fake NEUTRAL)",
+      r["sentiment"] is None and r["confidence"] is None and r["evidence_status"] == "ERROR"
+      and "quota exceeded" in r["error"]
+      and r["summary"] == "News agent encountered an error — no news verdict.")
 restore(saved)
 
 # ---------------------------------------------------------------------------
@@ -213,7 +221,8 @@ config.settings.ENABLE_FUNDAMENTALS_AGENT = True
 
 # fundamentals fetch error
 r = fundamentals_agent.analyze_fundamentals("AAPL", {"symbol": "AAPL", "error": "provider down"})
-check("data error -> fail-safe", r["signal"] == "NEUTRAL"
+check("data error -> null signal + UNAVAILABLE evidence (never a fake NEUTRAL)",
+      r["signal"] is None and r["confidence"] is None and r["evidence_status"] == "UNAVAILABLE"
       and r["error"] == "DATA_UNAVAILABLE: provider down")
 
 # no key
@@ -221,7 +230,8 @@ config.settings.GEMINI_API_KEY = ""
 gemini_service._client = None
 r = fundamentals_agent.analyze_fundamentals("AAPL", {"symbol": "AAPL", "pe_ratio": 30})
 check("no key -> fail-safe", r["error"] == "GEMINI_API_KEY not configured."
-      and r["summary"] == "Fundamentals agent disabled: missing API key.")
+      and r["evidence_status"] == "UNAVAILABLE"
+      and r["summary"] == "Fundamentals agent disabled: missing API key — no fundamentals verdict.")
 
 # happy path
 config.settings.GEMINI_API_KEY = "test-key"
@@ -231,7 +241,8 @@ r = fundamentals_agent.analyze_fundamentals("MSFT", {
     "symbol": "MSFT", "pe_ratio": 35.0, "forward_pe": 30.1, "revenue_growth": 0.12,
     "profit_margin": 0.35, "debt_to_equity": 0.4, "return_on_equity": 0.2, "error": None})
 check("happy path maps fields", r["signal"] == "BEARISH" and abs(r["confidence"] - 0.61) < 1e-9
-      and r["summary"] == "Rich valuation." and r["error"] is None)
+      and r["summary"] == "Rich valuation." and r["error"] is None
+      and r["evidence_status"] == "AVAILABLE")
 call = fake.calls[0]
 check("system prompt sent as system_instruction", call["system_instruction"] == fundamentals_agent.SYSTEM_INSTRUCTIONS)
 check("metrics sent as input", "P/E ratio: 35.0" in call["input"] and "Debt-to-equity: 0.4" in call["input"])
@@ -239,8 +250,9 @@ check("metrics sent as input", "P/E ratio: 35.0" in call["input"] and "Debt-to-e
 # LLM failure
 install_fake_client(FakeInteractions(None, raise_exc=ValueError("No JSON object found in model response.")))
 r = fundamentals_agent.analyze_fundamentals("AAPL", {"symbol": "AAPL", "pe_ratio": 30})
-check("LLM error -> fail-safe", r["signal"] == "NEUTRAL"
-      and r["summary"] == "Fundamentals agent encountered an error; defaulting to NEUTRAL.")
+check("LLM error -> null signal + ERROR evidence (never a fake NEUTRAL)",
+      r["signal"] is None and r["evidence_status"] == "ERROR"
+      and r["summary"] == "Fundamentals agent encountered an error — no fundamentals verdict.")
 restore(saved)
 
 # ---------------------------------------------------------------------------

@@ -105,6 +105,97 @@ check("drawer: structured errors shown for PARTIAL cycles",
         return /Warnings &amp; Errors|Warnings & Errors/.test(d);
       })());
 
+// --- production hardening: evidence semantics, empty states, health banner ----
+const S = w.App.store;
+
+// mapHistoryPoints: epoch-0/zero/null equity must never be drawn as $0
+const mapped = w.App.mapHistoryPoints([
+  { timestamp: 0, equity: 0 },
+  { timestamp: 1757000000, equity: null },
+  { timestamp: 1757100000, equity: 99981.35 },
+  { timestamp: 1757200000, equity: 100000 },
+]);
+check("mapHistoryPoints drops epoch-0/zero/null, keeps real points",
+  mapped.length === 2 && mapped[0].v === 99981.35 && mapped[1].v === 100000);
+
+// chart engine: 0 points -> empty state; 1 point -> single marker; never a fake line
+const c0 = doc.createElement("div"); doc.body.appendChild(c0);
+w.App.chart({ el: c0, points: [], emptyTitle: "No portfolio history available" });
+check("chart with 0 points renders the empty state, no invented line",
+  /No portfolio history available/.test(c0.innerHTML) && !/class="hitbox"/.test(c0.innerHTML));
+const c1 = doc.createElement("div"); doc.body.appendChild(c1);
+w.App.chart({ el: c1, points: [{ t: 1757100000000, v: 99981.35 }], emptyTitle: "No portfolio history available" });
+check("chart with 1 point renders a single marker, no line invented",
+  /Only one valid data point/.test(c1.innerHTML) && !/class="hitbox"/.test(c1.innerHTML));
+
+// overview chart header: missing history falls back to day P&L, never $0
+const realHistory = S.data.portfolio.history;
+S.data.portfolio.history = [];
+w.App.renderPage("overview", {});
+let ovHTML = doc.querySelector("#page").innerHTML;
+check("empty history: header shows day P&L + explicit no-history copy",
+  /No portfolio history available for this time range\./.test(ovHTML) &&
+  /\+\$428\.62/.test(ovHTML) && !/\$0\.00/.test(ovHTML));
+S.data.portfolio.history = realHistory;
+
+// verdictOf: ERROR/UNAVAILABLE/STALE evidence is never NEUTRAL
+const VO = w.C.verdictOf;
+const vErr = VO({ agent: "news", level: "ERROR", data: { evidence_status: "ERROR", sentiment: null, confidence: null, error: "boom" } });
+check("verdictOf: news ERROR -> ERROR verdict, null direction + null confidence",
+  vErr.label === "ERROR" && vErr.dir === "none" && vErr.conf === null);
+const vNeu = VO({ agent: "technical", level: "INFO", data: { evidence_status: "AVAILABLE", signal: "NEUTRAL", confidence: 0.55 } });
+check("verdictOf: technical AVAILABLE NEUTRAL keeps its confidence",
+  vNeu.label === "NEUTRAL" && vNeu.dir === "neutral" && vNeu.conf === 0.55);
+const vStale = VO({ agent: "technical", level: "INFO", data: { evidence_status: "STALE", signal: "BULLISH", confidence: 0.9 } });
+check("verdictOf: STALE evidence -> STALE verdict (verdict suppressed)",
+  vStale.label === "STALE" && vStale.dir === "none" && vStale.conf === null);
+const vOff = VO({ agent: "fundamentals", level: "INFO", data: { evidence_status: "OFF" } });
+check("verdictOf: OFF (provider=none) -> OFF verdict, not UNAVAILABLE",
+  vOff.label === "OFF" && vOff.dir === "none");
+
+// AI page: Evidence Quality card from the cycle record
+w.App.renderPage("ai", {});
+const aiHTML = doc.querySelector("#page").innerHTML;
+check("ai page: Evidence Quality card with worst-quality badge",
+  /Evidence Quality/.test(aiHTML) && /DEGRADED|SUFFICIENT|INSUFFICIENT/.test(aiHTML));
+check("ai page: fundamentals shown OFF (provider=none), not a failure",
+  /Fundamentals<\/span><\/td><td><span class="t-faint">OFF/.test(aiHTML.replace(/\s+/g, " ")) || (/Fundamentals/.test(aiHTML) && /OFF/.test(aiHTML)));
+
+// health banner: honest overall state from /api/health
+const realOverall = S.data.health.overall;
+S.data.health.overall = { status: "DEGRADED", reasons: ["Real-time stream DISCONNECTED (attempt 2/6, next in 4s)"] };
+w.App.renderPage("health", {});
+check("health page: systemHealthBanner renders DEGRADED + reasons",
+  /System DEGRADED/.test(doc.querySelector("#page").innerHTML) && /Real-time stream DISCONNECTED/.test(doc.querySelector("#page").innerHTML));
+S.data.health.overall = { status: "OFFLINE", reasons: ["Alpaca account ERROR: connection refused"] };
+w.App.renderPage("overview", {});
+check("overview: OFFLINE banner renders with the account reason",
+  /System OFFLINE/.test(doc.querySelector("#page").innerHTML) && /connection refused/.test(doc.querySelector("#page").innerHTML));
+S.data.health.overall = realOverall;
+
+// cycle drawer: decisions carry evidence quality; structured errors render their message
+w.App.renderPage("cycles", {});
+w.App.openCycleDrawer(1841); // PARTIAL_ERROR fixture: TSLA news ERROR
+const drawer2 = doc.querySelector("#drawer-root").innerHTML;
+check("drawer: decisions table has Evidence column with quality badge",
+  /<th>Evidence<\/th>/.test(drawer2) && /DEGRADED/.test(drawer2));
+check("drawer: structured error message rendered (never [object Object])",
+  /No news verdict — evidence marked ERROR, not neutral\./.test(drawer2) && !/\[object Object\]/.test(drawer2));
+check("drawer: no legacy 'falling back to neutral' copy anywhere",
+  !/falling back to neutral/i.test(drawer2));
+
+// realtime demo state carries the connection contract fields
+check("realtime state exposes connection_status/last_tick_at/reconnect_attempt",
+  S.data.realtime.connection_status === "CONNECTED" &&
+  S.data.realtime.last_tick_at != null &&
+  ("reconnect_attempt" in S.data.realtime) && ("last_error" in S.data.realtime));
+
+// news ERROR log renders as ERROR, never as a neutral verdict chip
+w.App.renderPage("activity", {});
+const logsHTML = doc.querySelector("#page").innerHTML;
+check("logs page: news ERROR entry shows ERROR state (not NEUTRAL)",
+  /ERROR/.test(logsHTML) && !/Falling back to neutral sentiment/.test(logsHTML));
+
 // --- config page still read-only ---------------------------------------------
 w.App.renderPage("config", {});
 const configHTML = doc.querySelector("#page").innerHTML;

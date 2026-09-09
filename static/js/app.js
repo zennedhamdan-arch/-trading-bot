@@ -587,12 +587,30 @@
     var H = cfg.height || 320;
     var P = { t: 14, r: 54, b: 24, l: 10 };
 
-    if (pts.length < 2) {
+    if (pts.length === 0) {
       el.innerHTML = window.C ? window.C.stateHTML({
         icon: "trend-up", title: cfg.emptyTitle || "No chart data",
         msg: cfg.emptyMsg || "Portfolio history is not available from the broker for this range yet.",
         compact: true,
       }) : '<div class="state">' + U.esc(cfg.emptyTitle || "No chart data") + "</div>";
+      return;
+    }
+
+    if (pts.length === 1) {
+      // Exactly one valid sample: draw a single marker with its value.
+      // No line, no area, no synthetic previous points — a single point is
+      // never inflated into a curve, and missing history is never $0.
+      var p1 = pts[0];
+      var d1 = new Date(p1.t);
+      el.innerHTML =
+        (window.C ? window.C.stateHTML({
+          icon: "trend-up",
+          title: U.fmtMoney(p1.v),
+          msg: (cfg.singleMsg || "Only one valid data point for this range.") +
+               " Sampled " + d1.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }) +
+               " " + d1.toLocaleTimeString("en-US", { hour12: false }) + ".",
+          compact: true,
+        }) : '<div class="state">' + U.esc(U.fmtMoney(p1.v)) + "</div>");
       return;
     }
 
@@ -856,13 +874,19 @@
       L("technical", "SPY", "INFO", "NEUTRAL: Above SMA200 but below SMA50; RSI 51 — indecisive.", 11.5, { agent: "technical", symbol: "SPY", signal: "NEUTRAL", confidence: 0.54, summary: "Above SMA200 but below SMA50; RSI 51 — indecisive.", error: null }),
       L("memory", "TSLA", "INFO", "Trade closed. Realized P&L: -1.86%. Recorded for agent accuracy scoring.", 52, { realized_pl_pct: -1.86, symbol: "TSLA" }),
       L("system", null, "WARNING", "TSLA concentration at 9.3% of equity — approaching the configured 10% maximum position size.", 53),
-      L("news", "TSLA", "ERROR", "News fetch failed for TSLA: Alpaca News API rate limit (429). Falling back to neutral sentiment.", 54, { error: "Alpaca News API rate limit (429)" }),
+      L("news", "TSLA", "ERROR", "News analysis failed for TSLA: Alpaca News API rate limit (429). No news verdict — evidence marked ERROR (not neutral).", 54, { error: "Alpaca News API rate limit (429)", evidence_status: "ERROR" }),
       L("execution", "TSLA", "INFO", "Order submitted: SELL TSLA", 52.5, { success: true, order_id: "ord-9f20", symbol: "TSLA", side: "sell", qty: 6, status: "filled", error: null }),
       L("cio", "TSLA", "INFO", "SELL: Bear case decisively stronger; trimming exposure by half while the risk agent still permits the trade.", 53, { agent: "cio", symbol: "TSLA", decision: "SELL", confidence: 0.77, notional_usd: 0, reasoning: "Bear case decisively stronger; trimming exposure by half while the risk agent still permits the trade.", error: null }),
       L("system", null, "INFO", "Bot started. Automated cycle is now active.", 1440 * 3),
       L("memory", "NVDA", "INFO", "Trade closed. Realized P&L: +2.46%. Recorded for agent accuracy scoring.", 1440 * 2.2, { realized_pl_pct: 2.46, symbol: "NVDA" }),
       L("memory", "AMD", "INFO", "Trade closed. Realized P&L: +5.10%. Recorded for agent accuracy scoring.", 1440 * 5, { realized_pl_pct: 5.1, symbol: "AMD" }),
     ];
+    // evidence states on analyst payloads (ERROR logs already carry theirs)
+    logs.forEach(function (l) {
+      if ((l.agent === "technical" || l.agent === "news" || l.agent === "fundamentals") && l.data && !l.data.evidence_status) {
+        l.data.evidence_status = l.level === "ERROR" ? "ERROR" : "AVAILABLE";
+      }
+    });
     // give the TSLA risk warning its structured payload
     logs.forEach(function (l) {
       if (l.message === "Position size within configured limit; concentration approaching the configured threshold — flag for monitoring.") {
@@ -891,21 +915,39 @@
         status: c.status,
         symbols_processed: ["AAPL", "MSFT", "NVDA", "TSLA", "SPY"],
         decisions: [
-          { symbol: "NVDA", decision: c.id === 1842 ? "BUY" : "HOLD", confidence: c.id === 1842 ? 0.84 : 0.52, notional_usd: c.id === 1842 ? 2100 : 0 },
-          { symbol: "AAPL", decision: "HOLD", confidence: 0.55, notional_usd: 0 },
-          { symbol: "MSFT", decision: "HOLD", confidence: 0.58, notional_usd: 0 },
-          { symbol: "TSLA", decision: c.id === 1841 ? "SELL" : "HOLD", confidence: 0.77, notional_usd: 0 },
-          { symbol: "SPY", decision: "HOLD", confidence: 0.6, notional_usd: 0 },
+          { symbol: "NVDA", decision: c.id === 1842 ? "BUY" : "HOLD", confidence: c.id === 1842 ? 0.84 : 0.52, notional_usd: c.id === 1842 ? 2100 : 0, evidence_quality: "SUFFICIENT" },
+          { symbol: "AAPL", decision: "HOLD", confidence: 0.55, notional_usd: 0, evidence_quality: "SUFFICIENT" },
+          { symbol: "MSFT", decision: "HOLD", confidence: 0.58, notional_usd: 0, evidence_quality: "SUFFICIENT" },
+          { symbol: "TSLA", decision: c.id === 1841 ? "SELL" : "HOLD", confidence: 0.77, notional_usd: 0, evidence_quality: c.status === "PARTIAL_ERROR" ? "DEGRADED" : "SUFFICIENT" },
+          { symbol: "SPY", decision: "HOLD", confidence: 0.6, notional_usd: 0, evidence_quality: "SUFFICIENT" },
         ],
+        evidence: (function () {
+          // per-symbol evidence states the decisions were made under
+          // (technical/news/fundamentals/debate + overall quality)
+          var ev = {};
+          ["AAPL", "MSFT", "NVDA", "TSLA", "SPY"].forEach(function (s) {
+            var newsErr = s === "TSLA" && c.status === "PARTIAL_ERROR";
+            ev[s] = {
+              agents: {
+                technical: "AVAILABLE",
+                news: newsErr ? "ERROR" : "AVAILABLE",
+                fundamentals: "OFF", // provider=none: configured off, not a failure
+                debate: "AVAILABLE",
+              },
+              quality: newsErr ? "DEGRADED" : "SUFFICIENT",
+            };
+          });
+          return ev;
+        })(),
         orders: c.id === 1842 ? [{ symbol: "NVDA", side: "buy", order_id: "ord-9f21", status: "filled", success: true, notional_usd: 2100 }]
              : c.id === 1841 ? [{ symbol: "TSLA", side: "sell", order_id: "ord-9f20", status: "filled", success: true, qty: 6 }]
              : [],
         agent_status: {
-          AAPL: { market_data: "OK", technical: "OK", news: "OK", fundamentals: "OK", debate: "OK", risk: "OK", cio: "OK", execution: "SKIPPED", memory: "SKIPPED" },
-          MSFT: { market_data: "OK", technical: "OK", news: "OK", fundamentals: "OK", debate: "OK", risk: "OK", cio: "OK", execution: "SKIPPED", memory: "SKIPPED" },
-          NVDA: { market_data: "OK", technical: "OK", news: "OK", fundamentals: "OK", debate: "OK", risk: "OK", cio: "OK", execution: c.id === 1842 ? "OK" : "SKIPPED", memory: c.id === 1842 ? "OK" : "SKIPPED" },
-          TSLA: { market_data: "OK", technical: "OK", news: "ERROR", fundamentals: "UNAVAILABLE", debate: "OK", risk: "OK", cio: "OK", execution: c.id === 1841 ? "OK" : "SKIPPED", memory: "SKIPPED" },
-          SPY: { market_data: "OK", technical: "OK", news: "OK", fundamentals: "OK", debate: "OK", risk: "OK", cio: "OK", execution: "SKIPPED", memory: "SKIPPED" },
+          AAPL: { market_data: "OK", technical: "OK", news: "OK", fundamentals: "SKIPPED", debate: "OK", risk: "OK", cio: "OK", execution: "SKIPPED", memory: "SKIPPED" },
+          MSFT: { market_data: "OK", technical: "OK", news: "OK", fundamentals: "SKIPPED", debate: "OK", risk: "OK", cio: "OK", execution: "SKIPPED", memory: "SKIPPED" },
+          NVDA: { market_data: "OK", technical: "OK", news: "OK", fundamentals: "SKIPPED", debate: "OK", risk: "OK", cio: "OK", execution: c.id === 1842 ? "OK" : "SKIPPED", memory: c.id === 1842 ? "OK" : "SKIPPED" },
+          TSLA: { market_data: "OK", technical: "OK", news: "ERROR", fundamentals: "SKIPPED", debate: "OK", risk: "OK", cio: "OK", execution: c.id === 1841 ? "OK" : "SKIPPED", memory: "SKIPPED" },
+          SPY: { market_data: "OK", technical: "OK", news: "OK", fundamentals: "SKIPPED", debate: "OK", risk: "OK", cio: "OK", execution: "SKIPPED", memory: "SKIPPED" },
         },
         llm_usage: {
           groq: { requests: 15, ok: c.status === "PARTIAL_ERROR" ? 14 : 15,
@@ -941,7 +983,10 @@
           fundamentals: { provider: "none", symbols_ok: 0, symbols_unavailable: 5 },
         },
         warnings: c.status === "PARTIAL_ERROR" ? 1 : 0,
-        errors: c.status === "PARTIAL_ERROR" ? ["TSLA: News fetch failed: Alpaca News API rate limit (429)"] : [],
+        errors: c.status === "PARTIAL_ERROR" ? [
+          { provider: "news", type: "PROVIDER_ERROR", agent: "news", symbol: "TSLA",
+            message: "News analysis failed for TSLA: Alpaca News API rate limit (429). No news verdict — evidence marked ERROR, not neutral." },
+        ] : [],
       });
     });
 
@@ -1010,6 +1055,7 @@
       },
       health: {
         checked_at: "2026-09-09T18:00:00Z",
+        overall: { status: "HEALTHY", reasons: [] },
         startup: {
           rows: [
             { component: "ALPACA", status: "READY", detail: "paper account OK (equity $25,104.00, status ACTIVE)" },
@@ -1029,6 +1075,11 @@
       },
       realtime: {
         status: "CONNECTED",
+        connection_status: "CONNECTED",
+        connected_at: t(1440 * 2.9),
+        last_tick_at: t(0.1),
+        last_error: null,
+        reconnect_attempt: null,
         feed: "iex",
         symbols: ["AAPL", "MSFT", "NVDA", "TSLA", "SPY"],
         data: {

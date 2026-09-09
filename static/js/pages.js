@@ -79,6 +79,24 @@
       '<button class="btn btn-sm btn-success" data-action="start-bot">' + ICON("power") + "Start Bot</button>");
   }
 
+  // Top-level SYSTEM health (HEALTHY / DEGRADED / OFFLINE) from /api/health.
+  // HTTP 200 never means "all subsystems healthy" — this reads the honest
+  // overall classification and its reasons. Returns "" when health data
+  // is not (yet) available (e.g. demo mode).
+  function systemHealthBanner() {
+    var h = store.data.health;
+    var o = h && h.overall;
+    if (!o || !o.status) return "";
+    var tone = o.status === "HEALTHY" ? "ok" : o.status === "DEGRADED" ? "warn" : "err";
+    var reasons = (o.reasons || []).map(function (r) { return U.esc(r); }).join("<br>");
+    var title = o.status === "HEALTHY" ? "System healthy."
+      : o.status === "OFFLINE" ? "System OFFLINE — critical trading infrastructure unavailable."
+      : "System DEGRADED — one or more subsystems unavailable.";
+    if (typeof C.bannerHTML !== "function") return "";
+    return C.bannerHTML(tone, title, reasons || "All critical trading subsystems are ready.");
+  }
+  App.systemHealthBanner = systemHealthBanner;
+
   function ringHTML(pct, label, sub, colorVar) {
     var r = 26, c = 2 * Math.PI * r;
     var off = c * (1 - U.clamp(pct, 0, 100) / 100);
@@ -107,14 +125,17 @@
     var acct = account();
     var st = botState();
 
-    var banners = accountErrorBanner(acct) + botOfflineBanner();
+    var banners = accountErrorBanner(acct) + botOfflineBanner() + systemHealthBanner();
 
     // Live market strip (Alpaca WebSockets), refreshed in place by
     // App.updateLiveStrip on each realtime poll — ticks never trigger AI.
     function liveStripHTML() {
       var rt = store.data.realtime;
       if (!rt || !rt.data || !Object.keys(rt.data).length) return "";
-      var tone = rt.status === "CONNECTED" ? "badge-ok" : rt.status === "DISCONNECTED" ? "badge-error" : "badge-neutral";
+      var tone = rt.status === "CONNECTED" ? "badge-ok"
+        : rt.status === "CONNECTING" || rt.status === "STALE" ? "badge-warning"
+        : rt.status === "DISABLED" || rt.status === "NO_KEYS" ? "badge-neutral"
+        : "badge-error";
       var cells = Object.keys(rt.data).map(function (s) {
         var d = rt.data[s] || {};
         var t = d.last_trade || {}, q = d.last_quote || {};
@@ -265,6 +286,22 @@
 
   /* Chart card (shared by overview + portfolio) ------------------------------ */
 
+  // Shared mapping for equity history points ({timestamp, equity} from the
+  // broker or {t, v} from demo data) -> {t, v}. Invalid samples are NEVER
+  // coerced: null/missing equity, non-finite values, non-positive equity
+  // and epoch-0 timestamps are dropped — missing history must never be
+  // drawn as $0 or interpolated from zero.
+  function mapHistoryPoints(pts) {
+    return (pts || []).map(function (p) {
+      var d = U.parseDate(p.timestamp != null ? p.timestamp : p.t);
+      return { t: d ? d.getTime() : null, v: p.equity != null ? p.equity : p.v };
+    }).filter(function (p) {
+      return p.t != null && isFinite(p.t) && p.t > 0 &&
+             p.v != null && isFinite(p.v) && p.v > 0;
+    });
+  }
+  App.mapHistoryPoints = mapHistoryPoints;
+
   P._chartCard = function (opts) {
     opts = opts || {};
     var pf = store.data.portfolio || {};
@@ -281,20 +318,26 @@
 
     // data: use history endpoint cache if present, else portfolio.history (1M)
     var hkey = "history:" + cur;
-    var pts = [];
+    var rawPts = [];
     var source = "api";
     if (store.histCache[cur] && store.histCache[cur].points) {
-      pts = store.histCache[cur].points;
+      rawPts = store.histCache[cur].points;
     } else if (cur === "1M" && pf.history && pf.history.length) {
-      pts = pf.history; source = "portfolio";
+      rawPts = pf.history; source = "portfolio";
     }
+    var cpts = mapHistoryPoints(rawPts);
+    var hasHistory = cpts.length >= 2;
+    var singlePoint = cpts.length === 1;
 
     var acct = account();
-    var brokerDown = !!acct.error && !pts.length;
-    var last = pts.length ? pts[pts.length - 1].v : (brokerDown ? null : (acct.portfolio_value || acct.equity));
-    var first = pts.length ? pts[0].v : null;
-    var delta = first != null && last != null ? last - first : null;
-    var deltaPct = first && last ? (delta / first) * 100 : null;
+    var brokerDown = !!acct.error && !hasHistory;
+    // Header value: the real latest history sample when history exists;
+    // otherwise the live account value (never a fabricated number, never 0).
+    var last = hasHistory || singlePoint ? cpts[cpts.length - 1].v
+      : (brokerDown ? null : (acct.portfolio_value || acct.equity));
+    var first = hasHistory ? cpts[0].v : null;
+    var delta = hasHistory ? last - first : null;
+    var deltaPct = hasHistory && first ? (delta / first) * 100 : null;
 
     var head =
       '<div class="chart-head">' +
@@ -306,19 +349,18 @@
               ? '<span class="' + U.classFor(delta) + '">' + U.fmtSigned(delta) + "</span>" +
                 '<span class="' + U.classFor(delta) + '">' + U.fmtPct(deltaPct) + "</span>" +
                 '<span class="t-faint" style="font-family:var(--font-ui);font-size:11px">· ' + cur + " range</span>"
-              : brokerDown
-                ? '<span class="t-faint">Broker API unreachable — no account data</span>'
-                : '<span class="t-faint">No history for this range</span>') +
+              : singlePoint
+                ? '<span class="t-faint">Only one valid data point for this range</span>'
+                : brokerDown
+                  ? '<span class="t-faint">Broker API unreachable — no account data</span>'
+                  : '<span class="' + (acct.day_pl != null ? U.classFor(acct.day_pl) : "t-faint") + '">' +
+                    (acct.day_pl != null ? U.fmtSigned(acct.day_pl) + " (" + U.fmtPct(acct.day_pl_pct) + ") today" : "") +
+                  '</span><span class="t-faint">No portfolio history available for this time range.</span>') +
           "</div>" +
         "</div>" +
         '<div class="spacer"></div>' +
         seg +
       "</div>";
-
-    // map to chart points {t, v}
-    var cpts = pts.map(function (p) {
-      return { t: U.parseDate(p.timestamp != null ? p.timestamp : p.t).getTime(), v: p.equity != null ? p.equity : p.v };
-    }).filter(function (p) { return p.t && p.v != null; });
 
     return (
       '<section class="card">' +
@@ -576,6 +618,57 @@
           "</div>" +
           '<div class="card-bd" style="padding-top:6px;padding-bottom:4px">' + C.pipelineHTML(latest) + "</div>" +
         "</section>";
+
+      // Evidence quality card (from the latest cycle record): which
+      // evidence was actually AVAILABLE when the decisions were made.
+      // Missing evidence is missing information — never neutral.
+      var evidenceCard = "";
+      var cyclesList = (store.data.cycles && store.data.cycles.cycles) || [];
+      var evCycle = null;
+      for (var ci = 0; ci < cyclesList.length; ci++) {
+        if (cyclesList[ci] && cyclesList[ci].evidence && Object.keys(cyclesList[ci].evidence).length) { evCycle = cyclesList[ci]; break; }
+      }
+      if (evCycle) {
+        var EV_AGENTS = [
+          { key: "technical", label: "Technical" },
+          { key: "news", label: "News" },
+          { key: "fundamentals", label: "Fundamentals" },
+          { key: "debate", label: "Debate" },
+        ];
+        var qOrder = { SUFFICIENT: 0, DEGRADED: 1, INSUFFICIENT: 2 };
+        var qBadge = { SUFFICIENT: "badge-ok", DEGRADED: "badge-warning", INSUFFICIENT: "badge-error" };
+        var worstQ = "SUFFICIENT";
+        var evRows = "";
+        EV_AGENTS.forEach(function (m) {
+          var counts = {};
+          var total = 0;
+          Object.keys(evCycle.evidence).forEach(function (sym) {
+            var st = ((evCycle.evidence[sym] || {}).agents || {})[m.key] || "OFF";
+            counts[st] = (counts[st] || 0) + 1;
+            total++;
+          });
+          var states = Object.keys(counts).map(function (st) {
+            return '<span class="' + (st === "AVAILABLE" ? "pos" : st === "OFF" ? "t-faint" : st === "STALE" ? "" : "neg") + '">' +
+              U.esc(st) + (total > 1 && counts[st] < total ? " · " + counts[st] + "/" + total : "") + "</span>";
+          }).join('<span class="t-faint"> · </span>');
+          evRows +=
+            "<tr><td><span style=\"font-weight:650\">" + m.label + "</span></td>" +
+            '<td>' + (states || '<span class="t-faint">—</span>') + "</td></tr>";
+        });
+        Object.keys(evCycle.evidence).forEach(function (sym) {
+          var q = (evCycle.evidence[sym] || {}).quality;
+          if (q && qOrder[q] > qOrder[worstQ]) worstQ = q;
+        });
+        evidenceCard =
+          '<section class="card mb-12">' +
+            '<div class="card-hd">' + ICON("shield") + '<span class="card-title">Evidence Quality</span>' +
+              '<span class="badge ' + qBadge[worstQ] + '">' + worstQ + "</span>" +
+              '<span class="spacer"></span><span class="aux">cycle #' + evCycle.id + " · " + U.fmtTime(evCycle.finished_at || evCycle.started_at) + "</span></div>" +
+            '<div class="card-bd-flush"><div class="tbl-wrap"><table class="tbl"><thead><tr><th>Evidence source</th><th>State (latest cycle)</th></tr></thead><tbody>' + evRows + "</tbody></table></div>" +
+            '<div class="tbl-note">' + ICON("info") + "<span>NEUTRAL is a verdict on analyzed evidence — it never means an agent failed. UNAVAILABLE / ERROR / STALE sources produced no evidence and are treated as missing information, not neutral.</span></div>" +
+          "</section>";
+        hero = hero + evidenceCard;
+      }
 
       // debate
       var debateCard =
@@ -921,8 +1014,9 @@
     var startupRows = (health.startup && health.startup.rows) || [];
 
     function statusBadge(status) {
-      var tone = status === "READY" ? "badge-ok"
-        : status === "NOT_CONFIGURED" || status === "DATA_UNAVAILABLE" ? "badge-neutral"
+      var tone = status === "READY" || status === "CONNECTED" ? "badge-ok"
+        : status === "NOT_CONFIGURED" || status === "DATA_UNAVAILABLE" || status === "OFF" ? "badge-neutral"
+        : status === "STALE" || status === "CONNECTING" || status === "DEGRADED" ? "badge-warning"
         : "badge-error";
       return '<span class="badge ' + tone + '">' + U.esc(status) + "</span>";
     }
@@ -963,10 +1057,13 @@
       healthCard("Market", mkClock.is_open === true ? "OPEN" : mkClock.is_open === false ? "CLOSED" : "UNKNOWN",
         mkClock.is_open === true ? "ok" : mkClock.is_open === false ? "warn" : "err", "clock",
         mkClock.error ? U.esc(mkClock.error) : (mkClock.is_open ? "Regular trading hours" : "Outside regular hours")) +
-      healthCard("Realtime Feed", rtStatus === "CONNECTED" ? "CONNECTED" : rtStatus === "DISABLED" || rtStatus === "NO_KEYS" ? "OFF" : rtStatus,
-        rtStatus === "CONNECTED" ? "ok" : rtStatus === "DISCONNECTED" ? "err" : "warn", "pulse",
+      healthCard("Realtime Feed", rtStatus,
+        rtStatus === "CONNECTED" ? "ok" : rtStatus === "DISABLED" || rtStatus === "NO_KEYS" ? "warn"
+          : rtStatus === "STALE" || rtStatus === "CONNECTING" ? "warn" : "err", "pulse",
         rtStatus === "CONNECTED" ? "Alpaca WebSocket · feed " + U.esc((health.realtime && health.realtime.feed) || "—")
-          : rtStatus === "NO_KEYS" ? "Alpaca keys not configured" : rtStatus === "DISABLED" ? "Disabled via REALTIME_ENABLED=false" : U.esc(rtStatus)) +
+          + ((health.realtime && health.realtime.seconds_since_last_tick != null) ? " · last tick " + Math.round(health.realtime.seconds_since_last_tick) + "s ago" : "")
+          : rtStatus === "NO_KEYS" ? "Alpaca keys not configured" : rtStatus === "DISABLED" ? "Disabled via REALTIME_ENABLED=false"
+          : U.esc(((health.realtime && health.realtime.last_error) || rtStatus)) + ((health.realtime && health.realtime.reconnect_attempt) ? " · reconnect attempt #" + health.realtime.reconnect_attempt : "")) +
       healthCard("Data Feed", "IEX/SIP", (cfg.market_data && cfg.market_data.configured_feed) === "IEX" ? "warn" : "ok", "globe",
         "Configured feed: " + U.esc((cfg.market_data && cfg.market_data.configured_feed) || "IEX") + " — IEX is the free/paper feed; never switched silently");
 
@@ -1008,6 +1105,7 @@
       (store.demo ? window.DemoBanner : "") +
       botOfflineBanner() +
       (acct.error ? C.bannerHTML("err", "Broker API unreachable.", U.esc(acct.error)) : "") +
+      systemHealthBanner() +
       '<div class="grid g-3 mb-12">' + cards + "</div>" +
       (startupTable
         ? '<div class="mb-12">' + headCard("Startup Health Check", "shield",
@@ -1320,16 +1418,16 @@
     } else {
       pts = [];
     }
-    var mapped = (pts || []).map(function (p) {
-      return { t: U.parseDate(p.timestamp != null ? p.timestamp : p.t).getTime(), v: p.equity != null ? p.equity : p.v };
-    }).filter(function (p) { return p.t && p.v != null; });
+    var mapped = mapHistoryPoints(pts);
 
     App.chart({
       el: wrap,
       points: mapped,
       height: 300,
       aria: "Portfolio equity over " + range,
-      emptyMsg: "No equity history available for this range from the broker yet.",
+      emptyTitle: "No portfolio history available",
+      emptyMsg: "No valid equity history for this range from the broker. Missing history is never drawn as $0 or filled with synthetic points.",
+      singleMsg: "Only one valid data point for this range — shown as a single marker (no line is invented).",
     });
   }
 
@@ -1338,9 +1436,7 @@
     if (!fb) return;
     var range = store.ui.range || "1M";
     var pts = store.demo ? demoPts(range) : (store.histCache[range] && store.histCache[range].points) || (range === "1M" ? ((store.data.portfolio && store.data.portfolio.history) || []) : []);
-    var mapped = (pts || []).map(function (p) {
-      return { t: U.parseDate(p.timestamp != null ? p.timestamp : p.t).getTime(), v: p.equity != null ? p.equity : p.v };
-    }).filter(function (p) { return p.t && p.v != null; });
+    var mapped = mapHistoryPoints(pts);
     fb.innerHTML = mapped.slice(-40).map(function (p) {
       var d = new Date(p.t);
       return "<tr><td>" + d.toLocaleString() + '</td><td class="r num-strong">' + U.fmtMoney(p.v) + "</td></tr>";

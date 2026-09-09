@@ -162,7 +162,11 @@ class _FakeDataClient:
         closes = [100 + (i % 20) * 0.5 for i in range(n)]
         highs = [c + 1.5 for c in closes]
         lows = [c - 1.5 for c in closes]
-        idx = pd.DatetimeIndex(pd.date_range("2025-01-01", periods=n, freq="D", tz="UTC"), name="timestamp")
+        # Bars end TODAY: the evidence-quality gate treats analytics built
+        # on bars older than EVIDENCE_STALE_DAYS as STALE, and a fixture
+        # pinned to a past date would (correctly) block every BUY.
+        end = pd.Timestamp.utcnow().floor("D")
+        idx = pd.DatetimeIndex(pd.date_range(end=end, periods=n, freq="D", tz="UTC"), name="timestamp")
         df = pd.DataFrame({"close": closes, "open": closes, "high": highs, "low": lows,
                            "volume": [1000] * n, "trade_count": [10] * n, "vwap": closes}, index=idx)
         return types.SimpleNamespace(df=df)
