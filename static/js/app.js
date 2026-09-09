@@ -887,6 +887,13 @@
         orders: c.id === 1842 ? [{ symbol: "NVDA", side: "buy", order_id: "ord-9f21", status: "filled", success: true, notional_usd: 2100 }]
              : c.id === 1841 ? [{ symbol: "TSLA", side: "sell", order_id: "ord-9f20", status: "filled", success: true, qty: 6 }]
              : [],
+        agent_status: {
+          AAPL: { market_data: "OK", technical: "OK", news: "OK", fundamentals: "OK", debate: "OK", risk: "OK", cio: "OK", execution: "SKIPPED", memory: "SKIPPED" },
+          MSFT: { market_data: "OK", technical: "OK", news: "OK", fundamentals: "OK", debate: "OK", risk: "OK", cio: "OK", execution: "SKIPPED", memory: "SKIPPED" },
+          NVDA: { market_data: "OK", technical: "OK", news: "OK", fundamentals: "OK", debate: "OK", risk: "OK", cio: "OK", execution: c.id === 1842 ? "OK" : "SKIPPED", memory: c.id === 1842 ? "OK" : "SKIPPED" },
+          TSLA: { market_data: "OK", technical: "OK", news: "ERROR", fundamentals: "UNAVAILABLE", debate: "OK", risk: "OK", cio: "OK", execution: c.id === 1841 ? "OK" : "SKIPPED", memory: "SKIPPED" },
+          SPY: { market_data: "OK", technical: "OK", news: "OK", fundamentals: "OK", debate: "OK", risk: "OK", cio: "OK", execution: "SKIPPED", memory: "SKIPPED" },
+        },
         warnings: c.status === "PARTIAL_ERROR" ? 1 : 0,
         errors: c.status === "PARTIAL_ERROR" ? ["TSLA: News fetch failed: Alpaca News API rate limit (429)"] : [],
       });

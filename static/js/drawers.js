@@ -262,6 +262,38 @@
       return t >= a - 30000 && t <= b + 30000;
     });
 
+    function agentStatusMatrix(c) {
+      var as = c.agent_status;
+      if (!as || !Object.keys(as).length) return "";
+      var symbols = Object.keys(as);
+      var stageNames = {
+        market_data: "Market Data", technical: "Technical", news: "News",
+        fundamentals: "Fundamentals", debate: "Debate", risk: "Risk",
+        cio: "CIO", execution: "Execution", memory: "Memory",
+      };
+      var stages = Object.keys(stageNames);
+      function cell(status) {
+        if (status === "OK") return '<span class="badge badge-ok">' + ICON("check") + "OK</span>";
+        if (status === "ERROR") return '<span class="badge badge-error">' + ICON("x") + "ERROR</span>";
+        if (status === "UNAVAILABLE") return '<span class="badge badge-warning">' + ICON("alert") + "N/A</span>";
+        return '<span class="badge badge-neutral">—</span>';
+      }
+      var head = "<tr><th>Symbol</th>" + stages.map(function (s) { return "<th class='c'>" + stageNames[s] + "</th>"; }).join("") + "</tr>";
+      var rows = symbols.map(function (sym) {
+        return "<tr><td><span class='sym'>" + U.esc(sym) + "</span></td>" +
+          stages.map(function (s) {
+            var st = (as[sym] || {})[s];
+            return "<td class='c'>" + cell(st || "SKIPPED") + "</td>";
+          }).join("") + "</tr>";
+      }).join("");
+      return (
+        '<div class="dsec">' + C.sectionTitle("cpu", "Agent Execution (per symbol)") +
+          '<div class="tbl-wrap"><table class="tbl"><thead>' + head + "</thead><tbody>" + rows + "</tbody></table></div>" +
+          '<div class="note" style="margin-top:8px">' + ICON("info") + "<span>OK = stage ran cleanly · N/A = data source unavailable (e.g. Yahoo rate limit) · — = stage not required or disabled · ERROR = stage failed. A cycle is only OK when every enabled stage succeeded.</span></div>" +
+        "</div>"
+      );
+    }
+
     var stages = [
       { name: "Market Data", icon: "globe", ok: c.status !== "ERROR" && logs.length > 0 },
       { name: "Technical Agent", icon: "chart-candle", ok: has("technical") },
@@ -338,6 +370,7 @@
           );
         }).join("") +
       "</div>" +
+      agentStatusMatrix(c) +
       (decisionRows
         ? '<div class="dsec">' + C.sectionTitle("gavel", "Decisions") +
             '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Symbol</th><th>Decision</th><th class="r">Confidence</th><th class="r">Notional</th></tr></thead><tbody>' + decisionRows + "</tbody></table></div>" +

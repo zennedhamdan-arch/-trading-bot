@@ -71,6 +71,22 @@ class Settings:
     CYCLE_INTERVAL_MINUTES: int = _get_int("CYCLE_INTERVAL_MINUTES", 15)
     MAX_POSITION_PCT: float = _get_float("MAX_POSITION_PCT", 0.10)
 
+    # --- Market data ---
+    # The free Alpaca paper-trading subscription only permits the IEX feed;
+    # requesting the SIP feed fails with "subscription does not permit
+    # querying recent SIP data". Default to IEX; set ALPACA_DATA_FEED=SIP on
+    # a paid subscription.
+    ALPACA_DATA_FEED: str = os.getenv("ALPACA_DATA_FEED", "IEX").strip().upper() or "IEX"
+
+    # --- Fundamentals data layer (yfinance rate-limit protection) ---
+    # How long a successful fundamentals fetch is cached per symbol.
+    FUNDAMENTALS_CACHE_TTL_MINUTES: int = _get_int("FUNDAMENTALS_CACHE_TTL_MINUTES", 60)
+    # Minimum spacing between two live yfinance calls (they share one
+    # rate-limit budget across symbols).
+    FUNDAMENTALS_MIN_INTERVAL_SECONDS: float = _get_float("FUNDAMENTALS_MIN_INTERVAL_SECONDS", 2.0)
+    # After an HTTP 429, back off from yfinance entirely for this long.
+    FUNDAMENTALS_RATE_LIMIT_BACKOFF_MINUTES: float = _get_float("FUNDAMENTALS_RATE_LIMIT_BACKOFF_MINUTES", 10)
+
     # --- New feature toggles (all free to run) ---
     ENABLE_FUNDAMENTALS_AGENT: bool = _get_bool("ENABLE_FUNDAMENTALS_AGENT", True)
     ENABLE_DEBATE: bool = _get_bool("ENABLE_DEBATE", True)
