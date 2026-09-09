@@ -894,6 +894,18 @@
           TSLA: { market_data: "OK", technical: "OK", news: "ERROR", fundamentals: "UNAVAILABLE", debate: "OK", risk: "OK", cio: "OK", execution: c.id === 1841 ? "OK" : "SKIPPED", memory: "SKIPPED" },
           SPY: { market_data: "OK", technical: "OK", news: "OK", fundamentals: "OK", debate: "OK", risk: "OK", cio: "OK", execution: "SKIPPED", memory: "SKIPPED" },
         },
+        llm_usage: {
+          groq: { requests: 15, ok: c.status === "PARTIAL_ERROR" ? 14 : 15,
+                  errors: c.status === "PARTIAL_ERROR" ? { PROVIDER_ERROR: 1 } : {},
+                  by_agent: { technical: { requests: 5, ok: 5, errors: {} }, debate: { requests: 5, ok: 5, errors: {} }, cio: { requests: 5, ok: c.status === "PARTIAL_ERROR" ? 4 : 5, errors: c.status === "PARTIAL_ERROR" ? { PROVIDER_ERROR: 1 } : {} } },
+                  by_symbol: {} },
+          gemini: { requests: 7, ok: 7, errors: {},
+                  by_agent: { news: { requests: 5, ok: 5, errors: {} }, fundamentals: { requests: 2, ok: 2, errors: {} } },
+                  by_symbol: {} },
+          openrouter: { requests: 5, ok: 5, errors: {},
+                  by_agent: { risk: { requests: 5, ok: 5, errors: {} } },
+                  by_symbol: {} },
+        },
         warnings: c.status === "PARTIAL_ERROR" ? 1 : 0,
         errors: c.status === "PARTIAL_ERROR" ? ["TSLA: News fetch failed: Alpaca News API rate limit (429)"] : [],
       });
@@ -929,6 +941,27 @@
         trading_mode: "PAPER",
         memory_db_path: "data/memory.db",
         agent_accuracy_lookback: 20,
+        llm_routes: {
+          cio: { provider: "groq", model: "openai/gpt-oss-120b", fallback: "" },
+          debate: { provider: "groq", model: "openai/gpt-oss-20b", fallback: "" },
+          fundamentals: { provider: "gemini", model: "gemini-3.6-flash", fallback: "" },
+          news: { provider: "gemini", model: "gemini-3.6-flash", fallback: "" },
+          risk: { provider: "openrouter", model: "openai/gpt-oss-20b:free", fallback: "" },
+          technical: { provider: "groq", model: "openai/gpt-oss-20b", fallback: "" },
+        },
+        llm_model_validation: {
+          providers: {
+            groq: { ok: true, models_found: 12, checked: { "technical.model": true, "debate.model": true, "cio.model": true }, missing: [], error: null },
+            gemini: { ok: true, models_found: 21, checked: { "news.model": true, "fundamentals.model": true }, missing: [], error: null },
+            openrouter: { ok: true, models_found: 430, checked: { "risk.model": true }, missing: [], error: null },
+          },
+          routes: {},
+        },
+        llm_quota: {
+          groq: { daily_request_limit: 0, requests_last_24h: 15, backoff_active: false, backoff_seconds_remaining: 0 },
+          gemini: { daily_request_limit: 20, requests_last_24h: 7, backoff_active: false, backoff_seconds_remaining: 0 },
+          openrouter: { daily_request_limit: 0, requests_last_24h: 5, backoff_active: false, backoff_seconds_remaining: 0 },
+        },
         warnings: [],
       },
     };

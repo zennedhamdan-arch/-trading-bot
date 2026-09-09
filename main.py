@@ -39,7 +39,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from config import settings
-from services import alpaca_service, memory_service
+from services import alpaca_service, memory_service, llm_service
 from agents import news_agent, tech_agent, risk_agent, cio_agent, fundamentals_agent, debate_agent
 
 logging.basicConfig(
@@ -159,14 +159,34 @@ def _report_level(report: dict) -> str:
     return "ERROR" if report and report.get("error") else "INFO"
 
 
+def _stage_status(report: dict) -> str:
+    """Maps an agent report to its pipeline-stage status.
+
+    OK          the agent produced a valid result
+    UNAVAILABLE the LLM provider was unavailable: no API key configured,
+                quota exhausted (PROVIDER_QUOTA_EXCEEDED), or the model
+                does not exist / is not accessible (MODEL_NOT_FOUND)
+    ERROR       any other failure (provider error, unparseable response)
+    """
+    if not report:
+        return "SKIPPED"
+    if not report.get("error"):
+        return "OK"
+    llm_status = report.get("llm_status")
+    if llm_status in ("NOT_CONFIGURED", "PROVIDER_QUOTA_EXCEEDED", "MODEL_NOT_FOUND"):
+        return "UNAVAILABLE"
+    return "ERROR"
+
+
 def _compute_cycle_status(cycle_record: dict, cycle_summary: dict) -> str:
     """Honest cycle status.
 
     ERROR        - the cycle aborted (e.g. broker unreachable) or every
                    symbol failed outright.
     PARTIAL_ERROR- any pipeline stage across any symbol errored or its data
-                   source was unavailable. The scheduler's "job executed
-                   successfully" NEVER implies cycle OK.
+                   source / LLM provider was unavailable (including quota
+                   exhaustion and missing models). The scheduler's "job
+                   executed successfully" NEVER implies cycle OK.
     OK           - every enabled stage ran cleanly for every symbol.
     """
     if not cycle_summary["symbols_processed"] and cycle_summary["errors"]:
@@ -194,6 +214,10 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
     cycle_summary = {"triggered_by": triggered_by, "symbols_processed": [], "errors": []}
     logger.info(f"Starting trading cycle (triggered by: {triggered_by})")
 
+    # Per-cycle LLM usage accounting (provider/model/call counts) — see
+    # services/llm_service.cycle_usage().
+    llm_service.reset_cycle_usage()
+
     # Real cycle record for the dashboard's cycle monitor.
     _cycle_counter["n"] += 1
     _active_cycle = {"warnings": 0}
@@ -208,6 +232,7 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
         "decisions": [],
         "orders": [],
         "agent_status": {},
+        "llm_usage": None,
         "warnings": 0,
         "errors": [],
     }
@@ -220,6 +245,7 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
         cycle_record["symbols_processed"] = cycle_summary["symbols_processed"]
         cycle_record["errors"] = cycle_summary["errors"]
         cycle_record["warnings"] = _active_cycle["warnings"] if _active_cycle else 0
+        cycle_record["llm_usage"] = llm_service.cycle_usage()
         cycle_history.appendleft(cycle_record)
 
     account_summary = alpaca_service.get_account_summary()
@@ -252,7 +278,7 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
             # 2. Technical analysis
             current_stage = "technical"
             tech_report = tech_agent.analyze_technicals(symbol, indicators)
-            status["technical"] = "ERROR" if tech_report.get("error") else "OK"
+            status["technical"] = _stage_status(tech_report)
             _log_event({"agent": "technical", "symbol": symbol, "level": _report_level(tech_report),
                         "message": tech_report["summary"], "data": tech_report})
 
@@ -260,7 +286,7 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
             current_stage = "news"
             headlines = _placeholder_headlines(symbol)
             news_report = news_agent.analyze_news(symbol, headlines)
-            status["news"] = "ERROR" if news_report.get("error") else "OK"
+            status["news"] = _stage_status(news_report)
             _log_event({"agent": "news", "symbol": symbol, "level": _report_level(news_report),
                         "message": news_report["summary"], "data": news_report})
 
@@ -273,9 +299,9 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
                 # Distinguish provider unavailability (Yahoo 429 etc.) from an
                 # agent/LLM failure — both are recorded honestly.
                 if fundamentals_data.get("error"):
-                    status["fundamentals"] = "UNAVAILABLE"
+                    status["fundamentals"] = "UNAVAILABLE"  # data source down (e.g. Yahoo 429)
                 else:
-                    status["fundamentals"] = "ERROR" if fundamentals_report.get("error") else "OK"
+                    status["fundamentals"] = _stage_status(fundamentals_report)
                 _log_event({"agent": "fundamentals", "symbol": symbol, "level": _report_level(fundamentals_report),
                             "message": fundamentals_report["summary"], "data": fundamentals_report})
 
@@ -284,7 +310,7 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
             debate_report = None
             if settings.ENABLE_DEBATE:
                 debate_report = debate_agent.run_debate(symbol, tech_report, news_report, fundamentals_report)
-                status["debate"] = "ERROR" if debate_report.get("error") else "OK"
+                status["debate"] = _stage_status(debate_report)
                 _log_event({"agent": "debate", "symbol": symbol, "level": _report_level(debate_report),
                             "message": f"Bull({debate_report['bull_strength']}) vs "
                                        f"Bear({debate_report['bear_strength']}), edge={debate_report['edge']}",
@@ -295,7 +321,7 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
             current_stage = "risk"
             existing_position = positions_by_symbol.get(symbol)
             risk_report = risk_agent.assess_risk(symbol, "buy", account_summary, existing_position)
-            status["risk"] = "ERROR" if risk_report.get("error") else "OK"
+            status["risk"] = _stage_status(risk_report)
             _log_event({"agent": "risk", "symbol": symbol, "level": _report_level(risk_report),
                         "message": risk_report["reasoning"], "data": risk_report})
 
@@ -312,7 +338,7 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
                 agent_weights=agent_weights,
                 memory_summary=memory_summary,
             )
-            status["cio"] = "ERROR" if decision_report.get("error") else "OK"
+            status["cio"] = _stage_status(decision_report)
             _log_event({"agent": "cio", "symbol": symbol, "level": _report_level(decision_report),
                         "message": f"{decision_report['decision']}: {decision_report['reasoning']}",
                         "data": decision_report})
@@ -412,6 +438,23 @@ async def lifespan(app: FastAPI):
     for w in warnings:
         logger.warning(w)
         _log_event({"agent": "system", "symbol": None, "level": "WARNING", "message": w})
+
+    # Verify every configured LLM model id against each provider's LIVE
+    # catalog (Groq/OpenRouter/Gemini). Providers without keys are skipped
+    # (already reported by settings.validate). Missing models are surfaced
+    # as warnings — they will fail per-request with MODEL_NOT_FOUND, never
+    # silently.
+    validation = llm_service.validate_models()
+    for provider, entry in validation["providers"].items():
+        for missing in entry.get("missing", []):
+            msg = f"LLM model validation ({provider}): {missing} is not in the provider's current model list."
+            logger.warning(msg)
+            _log_event({"agent": "system", "symbol": None, "level": "WARNING", "message": msg})
+        error = entry.get("error")
+        if error and "not configured" not in error:
+            msg = f"LLM model validation ({provider}): {error}"
+            logger.warning(msg)
+            _log_event({"agent": "system", "symbol": None, "level": "WARNING", "message": msg})
 
     scheduler.add_job(
         _scheduled_job,
@@ -514,7 +557,9 @@ async def api_bot_run_now():
 
 @app.get("/api/config")
 async def api_config():
-    """Non-sensitive config info for the dashboard to display (no secrets)."""
+    """Non-sensitive config info for the dashboard to display (no secrets).
+    Includes the LLM routing table (which provider/model each agent uses),
+    live model-validation results and per-provider quota posture."""
     warnings = settings.validate()
     return JSONResponse({
         "trade_universe": settings.TRADE_UNIVERSE,
@@ -527,6 +572,9 @@ async def api_config():
         "alpaca_data_feed": settings.ALPACA_DATA_FEED,
         "memory_db_path": settings.MEMORY_DB_PATH,
         "agent_accuracy_lookback": settings.AGENT_ACCURACY_LOOKBACK,
+        "llm_routes": llm_service.llm_routes(),
+        "llm_model_validation": llm_service.last_validation(),
+        "llm_quota": llm_service.quota_state(),
         "warnings": warnings,
     })
 

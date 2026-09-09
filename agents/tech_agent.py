@@ -1,16 +1,20 @@
 """
 agents/tech_agent.py
 
-Technical Agent powered by Groq (llama-3.1-8b-instant).
-Interprets RSI, moving averages, and MACD for a given symbol and
-returns a structured technical read used by the CIO agent.
+Technical Agent. Interprets RSI, moving averages, and MACD for a given
+symbol and returns a structured technical read used by the CIO agent.
+
+Provider/model: configured centrally via services/llm_service.py
+(default Groq — see GROQ_TECH_MODEL in config.py; no model id lives in
+this file). The report carries provider/model/llm_status/latency_ms so
+every cycle record says exactly which model produced it and how the
+request fared.
 """
 
-import json
 import logging
-import re
 
 from config import settings
+from services import llm_service
 
 logger = logging.getLogger("tech_agent")
 
@@ -29,16 +33,6 @@ Respond ONLY with a single valid JSON object, no markdown fences, no preamble, i
 """
 
 
-def _extract_json(text: str) -> dict:
-    text = text.strip()
-    text = re.sub(r"^```(json)?", "", text).strip()
-    text = re.sub(r"```$", "", text).strip()
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if not match:
-        raise ValueError("No JSON object found in model response.")
-    return json.loads(match.group(0))
-
-
 def analyze_technicals(symbol: str, indicators: dict) -> dict:
     """
     Args:
@@ -52,9 +46,11 @@ def analyze_technicals(symbol: str, indicators: dict) -> dict:
           "signal": "BULLISH"/"BEARISH"/"NEUTRAL",
           "confidence": float,
           "summary": str,
-          "error": str | None
+          "error": str | None,
+          "provider": str, "model": str, "llm_status": str, "latency_ms": float
         }
     """
+    route = llm_service.route_info("technical")
     base_result = {
         "agent": "technical",
         "symbol": symbol,
@@ -62,6 +58,10 @@ def analyze_technicals(symbol: str, indicators: dict) -> dict:
         "confidence": 0.0,
         "summary": "",
         "error": None,
+        "provider": route["provider"],
+        "model": route["model"],
+        "llm_status": "NOT_CONFIGURED",
+        "latency_ms": None,
     }
 
     if not settings.GROQ_API_KEY:
@@ -70,46 +70,43 @@ def analyze_technicals(symbol: str, indicators: dict) -> dict:
         return base_result
 
     if indicators.get("error"):
+        base_result["llm_status"] = "SKIPPED_NO_DATA"
         base_result["error"] = indicators["error"]
         base_result["summary"] = "No usable indicator data available."
         return base_result
 
-    try:
-        from groq import Groq
+    indicator_text = (
+        f"Symbol: {symbol}\n"
+        f"Latest close: {indicators.get('latest_close')}\n"
+        f"RSI(14): {indicators.get('rsi_14')}\n"
+        f"SMA(50): {indicators.get('sma_50')}\n"
+        f"SMA(200): {indicators.get('sma_200')}\n"
+        f"MACD: {indicators.get('macd')}\n"
+        f"MACD Signal: {indicators.get('macd_signal')}\n"
+        f"Recent closes (oldest to newest): {indicators.get('recent_closes')}\n"
+    )
 
-        client = Groq(api_key=settings.GROQ_API_KEY)
+    result = llm_service.call_json(
+        "technical",
+        system=SYSTEM_INSTRUCTIONS,
+        user=indicator_text,
+        temperature=0.2,
+        max_tokens=400,
+        symbol=symbol,
+    )
 
-        indicator_text = (
-            f"Symbol: {symbol}\n"
-            f"Latest close: {indicators.get('latest_close')}\n"
-            f"RSI(14): {indicators.get('rsi_14')}\n"
-            f"SMA(50): {indicators.get('sma_50')}\n"
-            f"SMA(200): {indicators.get('sma_200')}\n"
-            f"MACD: {indicators.get('macd')}\n"
-            f"MACD Signal: {indicators.get('macd_signal')}\n"
-            f"Recent closes (oldest to newest): {indicators.get('recent_closes')}\n"
-        )
+    base_result["llm_status"] = result.status
+    base_result["model"] = result.model
+    base_result["latency_ms"] = result.latency_ms
 
-        completion = client.chat.completions.create(
-            model=settings.GROQ_TECH_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_INSTRUCTIONS},
-                {"role": "user", "content": indicator_text},
-            ],
-            temperature=0.2,
-            max_tokens=400,
-        )
-
-        raw_text = completion.choices[0].message.content or ""
-        parsed = _extract_json(raw_text)
-
-        base_result["signal"] = str(parsed.get("signal", "NEUTRAL")).upper()
-        base_result["confidence"] = float(parsed.get("confidence", 0.0))
-        base_result["summary"] = str(parsed.get("summary", ""))
-        return base_result
-
-    except Exception as e:
-        logger.error(f"Technical agent failed for {symbol}: {e}")
-        base_result["error"] = str(e)
+    if not result.ok:
+        logger.error(f"Technical agent failed for {symbol}: {result.error}")
+        base_result["error"] = result.error
         base_result["summary"] = "Technical agent encountered an error; defaulting to NEUTRAL."
         return base_result
+
+    parsed = result.parsed
+    base_result["signal"] = str(parsed.get("signal", "NEUTRAL")).upper()
+    base_result["confidence"] = float(parsed.get("confidence", 0.0))
+    base_result["summary"] = str(parsed.get("summary", ""))
+    return base_result

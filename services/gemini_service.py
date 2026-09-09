@@ -1,7 +1,9 @@
 """
 services/gemini_service.py
 
-Shared Gemini client for the news and fundamentals agents.
+Shared Gemini transport (the "gemini" adapter of the common provider layer
+in services/llm_service.py, which owns routing, quota handling, retries,
+fallbacks and usage accounting).
 
 Uses the current Google Gemini **Interactions API** (GA June 2026) via the
 `google-genai` SDK rather than the legacy `generateContent` surface:
@@ -62,10 +64,49 @@ def _normalize_model(model: str) -> str:
     return model[len("models/"):] if model.startswith("models/") else model
 
 
+def generate_raw(system_instructions: str, input_text: str, model: str = None) -> str:
+    """
+    Runs one stateless Gemini interaction and returns the model's raw
+    output text. This is the transport used by services.llm_service (the
+    common provider layer); JSON parsing/quota/retry policy live there.
+
+    Args:
+        system_instructions: the agent's system prompt (role + output contract)
+        input_text: the user input carrying the data to analyze
+        model: optional model id override (defaults to settings.GEMINI_MODEL)
+
+    Returns:
+        the interaction's output text (stripped)
+
+    Raises:
+        RuntimeError if the API key is missing; whatever the SDK raises on
+        API/transport errors. Callers classify and degrade gracefully.
+    """
+    client = _get_client()
+
+    interaction = client.interactions.create(
+        model=_normalize_model(model or settings.GEMINI_MODEL),
+        input=input_text,
+        system_instruction=system_instructions,
+        store=False,  # stateless analysis calls; no server-side retention
+    )
+
+    raw_text = (getattr(interaction, "output_text", None) or "").strip()
+    if not raw_text:
+        # Defensive: surface interaction-level errors if any were reported.
+        errors = getattr(interaction, "errors", None)
+        if errors:
+            raise RuntimeError(f"Gemini interaction returned errors: {errors}")
+        raise ValueError("Empty response from Gemini interaction.")
+    return raw_text
+
+
 def generate_json(system_instructions: str, input_text: str) -> dict:
     """
     Runs one Gemini interaction and returns the model's response parsed as
-    a JSON object.
+    a JSON object. Kept for direct callers and tests; the agent pipeline
+    goes through services.llm_service (same transport, plus quota handling,
+    usage accounting and status classification).
 
     Args:
         system_instructions: the agent's system prompt (role + output contract)
@@ -79,21 +120,5 @@ def generate_json(system_instructions: str, input_text: str) -> dict:
         API/transport errors; ValueError if the response is not parseable
         JSON. Callers are expected to catch and degrade gracefully.
     """
-    client = _get_client()
+    return _extract_json(generate_raw(system_instructions, input_text))
 
-    interaction = client.interactions.create(
-        model=_normalize_model(settings.GEMINI_MODEL),
-        input=input_text,
-        system_instruction=system_instructions,
-        store=False,  # stateless analysis calls; no server-side retention
-    )
-
-    raw_text = (getattr(interaction, "output_text", None) or "").strip()
-    if not raw_text:
-        # Defensive: surface interaction-level errors if any were reported.
-        errors = getattr(interaction, "errors", None)
-        if errors:
-            raise RuntimeError(f"Gemini interaction returned errors: {errors}")
-        raise ValueError("Empty response from Gemini interaction.")
-
-    return _extract_json(raw_text)
