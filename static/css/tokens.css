@@ -1,0 +1,184 @@
+/* ============================================================================
+   AI TRADER — Design tokens & base
+   Institutional dark theme. Near-black layered surfaces, restrained
+   semantic color, tabular numerals, 4px spacing grid.
+   ========================================================================== */
+
+:root {
+  /* -- Surfaces ------------------------------------------------------------ */
+  --bg-0: #0a0d12;            /* app background            */
+  --bg-1: #10141c;            /* card / panel surface      */
+  --bg-2: #151a24;            /* raised surface, inputs    */
+  --bg-3: #1a2130;            /* hover / elevated          */
+  --bg-inset: #0d1118;        /* wells, table headers      */
+
+  /* -- Lines --------------------------------------------------------------- */
+  --line: #1e2532;            /* hairline borders          */
+  --line-2: #2a3444;          /* stronger borders, hovers  */
+
+  /* -- Ink ------------------------------------------------------------------ */
+  --ink-hi: #e9edf4;          /* primary text              */
+  --ink: #b9c3d2;             /* body text                 */
+  --ink-lo: #8692a5;          /* secondary text            */
+  --ink-faint: #6b7689;       /* labels, captions          */
+  --ink-disabled: #4b5468;
+
+  /* -- Semantic ------------------------------------------------------------- */
+  --green: #3fce8f;           /* profit / buy / healthy    */
+  --green-dim: #2aa06c;
+  --green-bg: rgba(63, 206, 143, 0.10);
+  --green-line: rgba(63, 206, 143, 0.32);
+
+  --red: #f0616d;             /* loss / sell / critical    */
+  --red-dim: #c74a55;
+  --red-bg: rgba(240, 97, 109, 0.10);
+  --red-line: rgba(240, 97, 109, 0.32);
+
+  --amber: #e8a33d;           /* warning / hold / caution  */
+  --amber-dim: #bd832f;
+  --amber-bg: rgba(232, 163, 61, 0.10);
+  --amber-line: rgba(232, 163, 61, 0.32);
+
+  --blue: #5fa2f8;            /* system / information      */
+  --blue-dim: #4a82c9;
+  --blue-bg: rgba(95, 162, 248, 0.10);
+  --blue-line: rgba(95, 162, 248, 0.32);
+
+  --violet: #a78bfa;          /* AI / agent accent         */
+  --violet-bg: rgba(167, 139, 250, 0.10);
+  --violet-line: rgba(167, 139, 250, 0.32);
+
+  /* -- Interaction ----------------------------------------------------------- */
+  --accent: #4d8df0;          /* links, focus, primary     */
+  --accent-hi: #74a7f5;
+  --accent-bg: rgba(77, 141, 240, 0.12);
+  --accent-line: rgba(77, 141, 240, 0.36);
+
+  /* -- Typography ------------------------------------------------------------ */
+  --font-ui: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+             "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "JetBrains Mono", "SF Mono", "Cascadia Code", Menlo, Consolas,
+               "Liberation Mono", monospace;
+
+  /* -- Metrics ---------------------------------------------------------------- */
+  --r-sm: 4px;
+  --r-md: 6px;
+  --r-lg: 8px;
+  --sp: 4px;                  /* base spacing unit */
+  --sidebar-w: 224px;
+  --header-h: 52px;
+  --ease: cubic-bezier(0.25, 0.46, 0.45, 0.94);
+
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.35), 0 0 0 1px rgba(255, 255, 255, 0.02) inset;
+  --shadow-2: 0 8px 28px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.03) inset;
+  --shadow-3: 0 20px 60px rgba(0, 0, 0, 0.6);
+
+  --focus-ring: 0 0 0 2px var(--bg-0), 0 0 0 4px var(--accent);
+}
+
+/* ============================================================================
+   Reset
+   ========================================================================== */
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  font-family: var(--font-ui);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ink);
+  background: var(--bg-0);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  font-feature-settings: "cv05", "ss01";
+}
+
+h1, h2, h3, h4, h5, h6, p, figure, blockquote { margin: 0; }
+
+ul, ol { margin: 0; padding: 0; list-style: none; }
+
+button, input, select, textarea {
+  font: inherit;
+  color: inherit;
+}
+
+button { cursor: pointer; background: none; border: none; padding: 0; }
+button:disabled { cursor: not-allowed; }
+
+a { color: var(--accent-hi); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+svg { display: block; }
+svg * { vector-effect: non-scaling-stroke; }
+
+hr { border: 0; border-top: 1px solid var(--line); margin: 0; }
+
+::selection { background: rgba(77, 141, 240, 0.35); color: var(--ink-hi); }
+
+/* Scrollbars */
+* { scrollbar-width: thin; scrollbar-color: #2a3444 transparent; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #262f3f; border-radius: 4px; border: 2px solid var(--bg-0); }
+::-webkit-scrollbar-thumb:hover { background: #33405a; }
+
+/* ============================================================================
+   Typography utilities
+   ========================================================================== */
+
+.num, .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+
+.t-hi  { color: var(--ink-hi); }
+.t-lo  { color: var(--ink-lo); }
+.t-faint { color: var(--ink-faint); }
+
+.pos { color: var(--green); }
+.neg { color: var(--red); }
+.neu { color: var(--ink-lo); }
+
+/* Micro label — used everywhere for column headers / field labels */
+.lbl {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.page-title { font-size: 15px; font-weight: 650; color: var(--ink-hi); letter-spacing: -0.01em; }
+.page-sub { font-size: 12px; color: var(--ink-lo); }
+
+.sr-only {
+  position: absolute; width: 1px; height: 1px; margin: -1px;
+  clip: rect(0 0 0 0); clip-path: inset(50%); overflow: hidden; white-space: nowrap;
+}
+
+/* ============================================================================
+   Focus / keyboard
+   ========================================================================== */
+
+:focus { outline: none; }
+:focus-visible { outline: none; box-shadow: var(--focus-ring); border-radius: var(--r-sm); }
+
+.skip-link {
+  position: absolute; left: 8px; top: -48px; z-index: 200;
+  background: var(--accent); color: #fff; font-weight: 600; font-size: 12px;
+  padding: 8px 14px; border-radius: var(--r-md); transition: top 0.15s var(--ease);
+}
+.skip-link:focus { top: 8px; }
+
+/* ============================================================================
+   Motion
+   ========================================================================== */
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001s !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001s !important;
+  }
+}

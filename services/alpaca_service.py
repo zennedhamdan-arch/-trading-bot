@@ -161,7 +161,10 @@ def get_portfolio_history(period: str = "1M", timeframe: str = "1D") -> dict:
     """Returns historical equity curve data points for charting."""
     try:
         client = _get_trading_client()
-        history = client.get_portfolio_history(history_filter=None)
+        kwargs = {"history_filter": None}
+        if period:
+            kwargs["period"] = period
+        history = client.get_portfolio_history(**kwargs)
         timestamps = history.timestamp or []
         equity = history.equity or []
         points = [
