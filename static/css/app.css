@@ -150,8 +150,12 @@
 .mbot a:active, .mbot button:active { background: var(--bg-2); }
 
 /* More sheet */
-.more-veil { position: fixed; inset: 0; z-index: 80; background: rgba(5,8,12,0.6); opacity: 0; transition: opacity 0.16s var(--ease); }
-.more-veil.on { opacity: 1; }
+.more-veil {
+  position: fixed; inset: 0; z-index: 80; background: rgba(5,8,12,0.6);
+  opacity: 0; visibility: hidden; pointer-events: none;
+  transition: opacity 0.16s var(--ease), visibility 0.16s var(--ease);
+}
+.more-veil.on { opacity: 1; visibility: visible; pointer-events: auto; }
 .moresheet {
   position: fixed; left: 0; right: 0; bottom: 0; z-index: 85;
   background: var(--bg-1); border-top: 1px solid var(--line-2);
