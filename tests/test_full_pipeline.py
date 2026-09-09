@@ -2,17 +2,21 @@
 tests/test_full_pipeline.py
 
 Full trading-cycle integration test: runs main.run_trading_cycle() with the
-REAL agent implementations and the REAL cycle orchestration — only the
-external transports are stubbed (Groq, OpenAI/OpenRouter, Gemini, Alpaca,
-yfinance). Verifies the complete pipeline for AAPL, MSFT, NVDA, TSLA, SPY:
-market data -> technical (Groq) -> news (Gemini) -> fundamentals (yfinance
-+ Gemini) -> debate (Groq, ONE call) -> risk (OpenRouter) -> CIO (Groq)
--> execution -> per-symbol/per-agent status -> LLM usage accounting ->
-honest cycle status.
+REAL agents, the REAL normalized data layer, the REAL deterministic
+analytics and the REAL risk/validation gates — only the external transports
+are stubbed (Groq/NVIDIA/OpenRouter/Gemini LLM clients, Alpaca REST,
+news). Exercises the complete architecture for AAPL, MSFT, NVDA, TSLA, SPY:
 
-Two consecutive cycles are run with unchanged inputs to prove the Gemini
-call reduction: cycle 1 sends 10 Gemini requests (5 news + 5 fundamentals),
-cycle 2 reuses the cached analyses and sends ZERO.
+    MARKET DATA (Alpaca stub) -> NORMALIZED DATA LAYER (data_quality)
+    -> DETERMINISTIC ANALYTICS (RSI/SMA/EMA/MACD/ATR/vol/drawdown/returns)
+    -> AI REASONING (tech/news [Gemini] /fundamentals [SKIPPED, no provider]
+       /debate/risk/cio [Groq]) -> VALIDATION + RISK GATE -> paper execution
+
+Three cycles are run:
+  A. everything healthy  -> OK, exact LLM call-count contract
+  B. unchanged inputs    -> Gemini 0 calls (news analysis cached)
+  C. Gemini quota death  -> news UNAVAILABLE x5, PARTIAL_ERROR with 5
+     structured errors, agent_results news 0/5, provider circuit open.
 
 Run:  .venv/bin/python tests/test_full_pipeline.py
 """
@@ -47,12 +51,10 @@ GROQ_CIO = json.dumps({"decision": "BUY", "confidence": 0.8, "notional_usd": 250
                        "reasoning": "Momentum intact and debate edge positive."})
 GROQ_DEBATE = json.dumps({"bull_strength": 0.7, "bull_summary": "Trend and sentiment align.",
                           "bear_strength": 0.3, "bear_summary": "Valuation is full."})
-OPENROUTER_RISK = json.dumps({"approved": True, "max_notional_usd": 500.0, "risk_level": "LOW",
-                              "reasoning": "Position within limits."})
+RISK_LLM = json.dumps({"approved": True, "max_notional_usd": 500.0, "risk_level": "LOW",
+                       "reasoning": "Position within limits."})
 GEMINI_NEWS = json.dumps({"sentiment": "BULLISH", "confidence": 0.7,
                           "summary": "Coverage is positive.", "key_headline": "Beats earnings"})
-GEMINI_FUND = json.dumps({"signal": "BULLISH", "confidence": 0.65,
-                          "summary": "Growth strong, valuation reasonable."})
 
 
 class _Msg:
@@ -82,28 +84,27 @@ class _Completions:
         return _Completion(out)
 
 
-class _FakeGroq:
-    """Stands in for groq.Groq; routes CIO/tech/debate calls by system prompt."""
-    def __init__(self, api_key=None):
-        self.chat = types.SimpleNamespace()
-    def _respond(self, kwargs):
-        sys_prompt = str(kwargs.get("messages", [{}])[0].get("content", ""))
-        if "Chief Investment Officer" in sys_prompt:
-            return GROQ_CIO
-        if "bull vs. bear debate" in sys_prompt:
-            return GROQ_DEBATE
-        return GROQ_TECH
+def _groq_responder(kwargs):
+    sys_prompt = str(kwargs.get("messages", [{}])[0].get("content", ""))
+    if "Chief Investment Officer" in sys_prompt:
+        return GROQ_CIO
+    if "bull vs. bear debate" in sys_prompt:
+        return GROQ_DEBATE
+    if "risk manager" in sys_prompt:
+        return RISK_LLM
+    return GROQ_TECH
 
 
-def _make_groq(api_key=None):
-    g = _FakeGroq(api_key)
-    g.chat = types.SimpleNamespace(completions=_Completions(g._respond))
-    return g
+class _ModelsList:
+    def __init__(self, ids):
+        self.data = [types.SimpleNamespace(id=i) for i in ids]
 
 
-class _FakeOpenAI:
-    def __init__(self, api_key=None, base_url=None):
-        self.chat = types.SimpleNamespace(completions=_Completions(lambda kw: OPENROUTER_RISK))
+def _llm_client(responder, model_ids):
+    client = types.SimpleNamespace()
+    client.chat = types.SimpleNamespace(completions=_Completions(responder))
+    client.models = types.SimpleNamespace(list=lambda: _ModelsList(list(model_ids)))
+    return client
 
 
 class _FakeInteraction:
@@ -117,17 +118,13 @@ class _FakeGeminiInteractions:
         self.calls = []
     def create(self, **kwargs):
         self.calls.append(kwargs)
-        sys_prompt = str(kwargs.get("system_instruction", ""))
-        if "financial news sentiment analyst" in sys_prompt:
-            return _FakeInteraction(GEMINI_NEWS)
-        return _FakeInteraction(GEMINI_FUND)
+        return _FakeInteraction(GEMINI_NEWS)
 
 
 class _FakeGeminiClient:
     def __init__(self):
         self.interactions = _FakeGeminiInteractions()
-        self.models = types.SimpleNamespace(list=lambda: types.SimpleNamespace(
-            data=[types.SimpleNamespace(id="gemini-3.6-flash")]))
+        self.models = types.SimpleNamespace(list=lambda: _ModelsList(["gemini-3.6-flash"]))
 
 
 # Alpaca fakes
@@ -138,180 +135,264 @@ class _FakeAccount:
 
 class _FakeTradingClient:
     def __init__(self):
-        self.captured = []
+        self.submitted = []
     def get_account(self):
         return _FakeAccount()
     def get_all_positions(self):
         return []
     def get_portfolio_history(self, history_filter=None):
         return types.SimpleNamespace(timestamp=[1700000000, 1700086400], equity=[25000.0, 25104.0])
+    def get_clock(self):
+        return types.SimpleNamespace(is_open=True, timestamp=None, next_open=None, next_close=None)
+    def submit_order(self, req):
+        self.submitted.append(req)
+        return types.SimpleNamespace(id="test-order", symbol=req.symbol, qty=req.qty,
+                                     notional=getattr(req, "notional", None),
+                                     status=types.SimpleNamespace(value="accepted"))
 
 
 class _FakeDataClient:
     def __init__(self):
-        self.captured = []
+        self.bar_requests = []
+        self.snapshot_requests = []
     def get_stock_bars(self, req):
+        self.bar_requests.append(req)
         import pandas as pd
         n = 260
         closes = [100 + (i % 20) * 0.5 for i in range(n)]
+        highs = [c + 1.5 for c in closes]
+        lows = [c - 1.5 for c in closes]
         idx = pd.DatetimeIndex(pd.date_range("2025-01-01", periods=n, freq="D", tz="UTC"), name="timestamp")
-        df = pd.DataFrame({"close": closes, "open": closes, "high": closes, "low": closes,
+        df = pd.DataFrame({"close": closes, "open": closes, "high": highs, "low": lows,
                            "volume": [1000] * n, "trade_count": [10] * n, "vwap": closes}, index=idx)
         return types.SimpleNamespace(df=df)
-
-
-# yfinance fake
-class _FakeYfTicker:
-    def __init__(self, symbol):
-        self.symbol = symbol
-    @property
-    def info(self):
-        return {"trailingPE": 28.4, "forwardPE": 26.1, "revenueGrowth": 0.14,
-                "profitMargins": 0.27, "debtToEquity": 1.2, "returnOnEquity": 0.38}
+    def get_stock_snapshot(self, req):
+        self.snapshot_requests.append(req)
+        sym = req.symbol_or_symbols if isinstance(req.symbol_or_symbols, str) else list(req.symbol_or_symbols)[0]
+        return {sym: types.SimpleNamespace(
+            symbol=sym,
+            latest_trade=types.SimpleNamespace(price=101.25, size=10, timestamp=None),
+            latest_quote=types.SimpleNamespace(bid_price=100.5, ask_price=101.5, bid_size=2, ask_size=2, timestamp=None),
+            minute_bar=None, daily_bar=None, previous_daily_bar=None)}
 
 
 # ---------------------------------------------------------------------------
-# Install stubs, run TWO cycles with unchanged inputs
+# Install stubs
 # ---------------------------------------------------------------------------
-print("full pipeline (real agents, stubbed transports):")
-
-import groq as groq_module
-import openai as openai_module
-groq_module.Groq = _make_groq
-openai_module.OpenAI = _FakeOpenAI
+print("full pipeline (real agents/data layer, stubbed transports):")
 
 import config
 config.settings.GROQ_API_KEY = "dummy-groq"
 config.settings.GEMINI_API_KEY = "dummy-gemini"
 config.settings.OPENROUTER_API_KEY = "dummy-openrouter"
+config.settings.NVIDIA_API_KEY = ""
 config.settings.ALPACA_API_KEY = "dummy-alpaca"
 config.settings.ALPACA_SECRET_KEY = "dummy-alpaca-secret"
 config.settings.ALPACA_DATA_FEED = "IEX"
 config.settings.ENABLE_MEMORY = False
 config.settings.TRADE_UNIVERSE = UNIVERSE
+config.settings.FUNDAMENTALS_PROVIDER = "none"       # no provider by default
+config.settings.LLM_FALLBACK_PROVIDER = ""
+config.settings.LLM_FALLBACK_MODEL = ""
 
-from services import gemini_service, alpaca_service, llm_service
-gemini_service._client = _FakeGeminiClient()
-alpaca_service._trading_client = _FakeTradingClient()
-alpaca_service._data_client = _FakeDataClient()
-alpaca_service.execute_order = lambda symbol, side, notional_usd=None, qty=None: {
-    "success": True, "order_id": f"test-{symbol}", "symbol": symbol, "side": side,
-    "qty": qty, "notional_usd": notional_usd, "status": "filled", "error": None}
-
-# Provider-layer state: clean quotas/backoff/usage; verify the fake catalogs
-llm_service.reset_all_state()
-llm_service._verified_models["groq"] = {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}
-llm_service._verified_models["openrouter"] = {"openai/gpt-oss-20b:free"}
-llm_service._verified_models["gemini"] = {"gemini-3.6-flash"}
-
-fake_yf = types.ModuleType("yfinance")
-fake_yf.Ticker = _FakeYfTicker
-sys.modules["yfinance"] = fake_yf
-
+from services import gemini_service, alpaca_service, llm_service, market_data_service
 from agents import fundamentals_agent, news_agent
+
+GROQ_MODELS = ("openai/gpt-oss-20b", "openai/gpt-oss-120b")
+
+def _install_llm_stubs():
+    llm_service.reset_all_state()
+    gemini_service._client = _FakeGeminiClient()
+    llm_service._clients["groq"] = _llm_client(_groq_responder, GROQ_MODELS)
+    llm_service._verified_models["groq"] = set(GROQ_MODELS)
+    llm_service._verified_models["gemini"] = {"gemini-3.6-flash"}
+
+_install_llm_stubs()
+
+fake_trading = _FakeTradingClient()
+fake_data = _FakeDataClient()
+alpaca_service._trading_client = fake_trading
+alpaca_service._data_client = fake_data
+
+# Paper orders: use the real execute_order path via the fake trading client.
+alpaca_service.execute_order = alpaca_service.execute_order  # real function, fake client
+
+# News transport stub (Alpaca News API shape is covered by test_data_layer)
+market_data_service.get_news = lambda s, limit=10: {
+    "headlines": [f"{s} beats earnings expectations", f"{s} announces buyback"], "error": None}
+
 fundamentals_agent.reset_fundamentals_cache()
 news_agent.reset_news_analysis_cache()
-config.settings.FUNDAMENTALS_MIN_INTERVAL_SECONDS = 0
 
 import main
-main._placeholder_headlines = lambda s: [f"{s} beats earnings expectations", f"{s} announces buyback"]
 main._get_agent_weights = lambda: {}
-
 main.agent_logs.clear()
 main.cycle_history.clear()
 main._previous_positions.clear()
 
 
-def _groq_calls():
-    return sum(len(c.chat.completions.calls) for c in llm_service._clients.values()
-               if hasattr(c, "chat") and hasattr(c.chat, "completions"))
-
-
 async def _run(tag):
-    summary = await main.run_trading_cycle(triggered_by=tag)
+    await main.run_trading_cycle(triggered_by=tag)
     return main.cycle_history[0]
 
 
-record1 = asyncio.run(_run("test-cycle-1"))
-check("cycle 1: all 5 symbols processed", sorted(record1["symbols_processed"]) == sorted(UNIVERSE))
+def _ind_has(record, symbol):
+    """The deterministic evidence reached the agents (checked via the LLM
+    request payloads the stub captured)."""
+    groq_client = llm_service._clients.get("groq")
+    tech_calls = [c for c in groq_client.chat.completions.calls
+                  if c["model"] == "openai/gpt-oss-20b"
+                  and "technical analysis expert" in c["messages"][0]["content"]
+                  and symbol in c["messages"][1]["content"]]
+    if not tech_calls:
+        return False
+    evidence = tech_calls[-1]["messages"][1]["content"]
+    return all(k in evidence for k in (
+        "RSI(14)", "SMA(20)", "EMA(20)", "ATR(14)", "Annualized volatility",
+        "Max drawdown", "Rule-based signal"))
 
-# --- LLM usage accounting (the core call-count contract)
-u1 = record1["llm_usage"] or {}
-g1 = len(gemini_service._client.interactions.calls)
-check("cycle 1: exactly 10 Gemini requests (5 news + 5 fundamentals), 2/symbol",
-      u1.get("gemini", {}).get("requests") == 10 and g1 == 10)
-check("cycle 1: Gemini per-agent breakdown 5 news + 5 fundamentals",
-      u1["gemini"]["by_agent"]["news"]["requests"] == 5
-      and u1["gemini"]["by_agent"]["fundamentals"]["requests"] == 5)
-check("cycle 1: per-symbol Gemini usage 2 per symbol",
-      all(u1["gemini"]["by_symbol"][s]["requests"] == 2 for s in UNIVERSE))
-check("cycle 1: exactly 15 Groq requests (tech + debate + cio, 3/symbol)",
-      u1.get("groq", {}).get("requests") == 15)
-check("cycle 1: debate = ONE Groq call per symbol",
-      u1["groq"]["by_agent"]["debate"]["requests"] == 5)
-check("cycle 1: exactly 5 OpenRouter requests (risk, 1/symbol)",
-      u1.get("openrouter", {}).get("requests") == 5)
-check("cycle 1: all LLM requests OK",
-      u1["gemini"]["ok"] == 10 and u1["groq"]["ok"] == 15 and u1["openrouter"]["ok"] == 5)
 
-# --- per-agent provider/model/status in reports
+# ===========================================================================
+print("cycle A — everything healthy (exact call-count contract):")
+recordA = asyncio.run(_run("test-cycle-A"))
+
+uA = recordA["llm_usage"] or {}
+gA = len(gemini_service._client.interactions.calls)
+check("A: all 5 symbols processed", sorted(recordA["symbols_processed"]) == sorted(UNIVERSE))
+check("A: market data OK for all symbols (bars + snapshot price)",
+      all(recordA["agent_status"][s]["market_data"] == "OK" for s in UNIVERSE))
+check("A: snapshots used for prices (Alpaca primary)",
+      len(fake_data.snapshot_requests) >= len(UNIVERSE))
+check("A: deterministic analytics computed (RSI/SMA/EMA/ATR/vol/drawdown/returns/signal)",
+      all(_ind_has(recordA, s) for s in UNIVERSE))
+check("A: technical (Groq) OK for all", all(recordA["agent_status"][s]["technical"] == "OK" for s in UNIVERSE))
+check("A: news (Gemini) OK for all", all(recordA["agent_status"][s]["news"] == "OK" for s in UNIVERSE))
+check("A: fundamentals SKIPPED (no provider configured — visible, not an error)",
+      all(recordA["agent_status"][s]["fundamentals"] == "SKIPPED" for s in UNIVERSE))
+check("A: debate (Groq, ONE call/symbol) OK for all", all(recordA["agent_status"][s]["debate"] == "OK" for s in UNIVERSE))
+check("A: risk (deterministic gate + Groq reasoning) OK for all", all(recordA["agent_status"][s]["risk"] == "OK" for s in UNIVERSE))
+check("A: CIO (Groq) OK for all", all(recordA["agent_status"][s]["cio"] == "OK" for s in UNIVERSE))
+check("A: cycle status OK (SKIPPED fundamentals does not degrade)",
+      recordA["status"] == "OK" and recordA["errors"] == [])
+
+# --- exact LLM call-count contract (the BEFORE/AFTER measurement)
+check("A: exactly 20 Groq requests (tech+debate+risk+cio = 4/symbol)",
+      uA.get("groq", {}).get("requests") == 20 and uA["groq"]["ok"] == 20)
+check("A: exactly 5 Gemini requests (news only, 1/symbol)",
+      uA.get("gemini", {}).get("requests") == 5 and gA == 5)
+check("A: ZERO OpenRouter requests (optional, unrouted by default)",
+      "openrouter" not in uA and uA.get("openrouter", {}).get("requests", 0) == 0)
+check("A: ZERO NVIDIA requests (not configured)",
+      uA.get("nvidia", {}).get("requests", 0) == 0)
+check("A: per-agent breakdown correct",
+      uA["groq"]["by_agent"]["technical"]["requests"] == 5
+      and uA["groq"]["by_agent"]["debate"]["requests"] == 5
+      and uA["groq"]["by_agent"]["risk"]["requests"] == 5
+      and uA["groq"]["by_agent"]["cio"]["requests"] == 5
+      and uA["gemini"]["by_agent"]["news"]["requests"] == 5)
+
+# --- reports carry provider/model/status
 info_logs = [l for l in main.agent_logs if l.get("data") and l["agent"] in
-             ("technical", "news", "fundamentals", "debate", "risk", "cio")]
-check("every agent report carries provider/model/llm_status",
+             ("technical", "news", "debate", "risk", "cio")]
+check("A: every agent report carries provider/model/llm_status",
       all(all(k in l["data"] for k in ("provider", "model", "llm_status")) for l in info_logs))
-check("reports name the configured models",
+check("A: models reported per agent",
       {l["data"]["model"] for l in info_logs if l["agent"] == "technical"} == {"openai/gpt-oss-20b"}
       and {l["data"]["model"] for l in info_logs if l["agent"] == "cio"} == {"openai/gpt-oss-120b"}
-      and {l["data"]["model"] for l in info_logs if l["agent"] == "risk"} == {"openai/gpt-oss-20b:free"}
       and {l["data"]["model"] for l in info_logs if l["agent"] == "news"} == {"gemini-3.6-flash"})
-check("providers correct per agent",
-      {l["data"]["provider"] for l in info_logs if l["agent"] in ("technical", "debate", "cio")} == {"groq"}
-      and {l["data"]["provider"] for l in info_logs if l["agent"] in ("news", "fundamentals")} == {"gemini"}
-      and {l["data"]["provider"] for l in info_logs if l["agent"] == "risk"} == {"openrouter"})
 
-# --- pipeline stages
-check("market data OK for all symbols", all(record1["agent_status"][s]["market_data"] == "OK" for s in UNIVERSE))
-check("technical (Groq) OK for all symbols", all(record1["agent_status"][s]["technical"] == "OK" for s in UNIVERSE))
-check("news (Gemini) OK for all symbols", all(record1["agent_status"][s]["news"] == "OK" for s in UNIVERSE))
-check("fundamentals OK for all symbols", all(record1["agent_status"][s]["fundamentals"] == "OK" for s in UNIVERSE))
-check("debate (Groq) OK for all symbols", all(record1["agent_status"][s]["debate"] == "OK" for s in UNIVERSE))
-check("risk (OpenRouter) OK for all symbols", all(record1["agent_status"][s]["risk"] == "OK" for s in UNIVERSE))
-check("CIO (Groq) OK for all symbols", all(record1["agent_status"][s]["cio"] == "OK" for s in UNIVERSE))
-check("decisions produced for all symbols", len(record1["decisions"]) == len(UNIVERSE))
-check("risk verdict honored (approved BUYs only)",
-      all(d["decision"] in ("BUY", "HOLD") for d in record1["decisions"]))
-check("orders recorded", len(record1["orders"]) == len([d for d in record1["decisions"] if d["decision"] == "BUY"]))
-check("cycle 1 status OK", record1["status"] == "OK" and record1["errors"] == [])
+# --- decisions + validated paper execution
+check("A: decisions produced for all symbols", len(recordA["decisions"]) == len(UNIVERSE))
+buys = [d for d in recordA["decisions"] if d["decision"] == "BUY"]
+check("A: BUY decisions carry reasoning", all(d.get("reasoning") for d in recordA["decisions"]))
+check("A: orders recorded for BUYs", len(recordA["orders"]) == len(buys))
+check("A: notional clamped to deterministic cap (10% of 25104 = 2510.40)",
+      all(o["notional_usd"] <= 2510.41 for o in recordA["orders"] if o["notional_usd"]))
 
-# --- portfolio history (correct alpaca-py API)
-hist = alpaca_service.get_portfolio_history(period="1M")
-check("portfolio history returns real points", hist["points"] == [
-    {"timestamp": 1700000000, "equity": 25000.0}, {"timestamp": 1700086400, "equity": 25104.0}])
+# --- agent_results + provider_results
+ar = recordA["agent_results"]
+check("A: agent_results summary (technical 5/5, news 5/5, fundamentals 0/5 skipped)",
+      ar["technical"]["ok"] == 5 and ar["news"]["ok"] == 5
+      and ar["fundamentals"]["ok"] == 0 and ar["fundamentals"]["skipped"] == 5)
+pr = recordA["provider_results"]
+check("A: provider_results include market data (feed + symbols_ok)",
+      pr["market_data"]["feed"] == "IEX" and pr["market_data"]["symbols_ok"] == 5)
+check("A: provider_results include fundamentals provider none",
+      pr["fundamentals"]["provider"] == "none" and pr["fundamentals"]["symbols_unavailable"] == 5)
+check("A: provider_results include LLM states (groq READY)",
+      pr["llm_states"]["groq"]["state"] == "READY")
 
-# ---------------------------------------------------------------------------
-print("second cycle with unchanged inputs (Gemini call reuse):")
-record2 = asyncio.run(_run("test-cycle-2"))
-u2 = record2["llm_usage"] or {}
-g2 = len(gemini_service._client.interactions.calls)
-check("cycle 2: ZERO new Gemini requests (analyses reused)",
-      u2.get("gemini", {}).get("requests", 0) == 0 and g2 == 10)
-check("cycle 2: Gemini provider absent from usage (untouched)",
-      "gemini" not in u2)
-check("cycle 2: Groq still runs (15 requests — tech/debate/cio are per-cycle)",
-      u2.get("groq", {}).get("requests") == 15)
-check("cycle 2: OpenRouter still runs (5 risk requests)",
-      u2.get("openrouter", {}).get("requests") == 5)
-news_logs = [l for l in main.agent_logs if l["agent"] == "news" and l.get("data")]
-cached_news = [l for l in news_logs if l["data"].get("cached") is True]
-check("cycle 2: news analyses flagged cached", len(cached_news) >= len(UNIVERSE))
-check("cycle 2: all stages still OK (cache reuse is not an error)",
-      all(record2["agent_status"][s][st] == "OK" for s in UNIVERSE
-          for st in ("technical", "news", "fundamentals", "debate", "risk", "cio")))
-check("cycle 2 status OK", record2["status"] == "OK")
+# ===========================================================================
+print("cycle B — unchanged inputs (LLM call reduction):")
+recordB = asyncio.run(_run("test-cycle-B"))
+uB = recordB["llm_usage"] or {}
+gB = len(gemini_service._client.interactions.calls)
+check("B: ZERO new Gemini requests (news analysis cached)",
+      uB.get("gemini", {}).get("requests", 0) == 0 and gB == 5)
+check("B: Groq still runs (20 requests — reasoning is per-cycle)",
+      uB.get("groq", {}).get("requests") == 20)
+check("B: news analyses flagged cached",
+      all(l["data"].get("cached") is True for l in main.agent_logs
+          if l["agent"] == "news" and l.get("data") and l["timestamp"] > recordB["started_at"]))
+check("B: all stages still OK", recordB["status"] == "OK")
 
-# --- feed events recorded at correct levels
-info_events = [l for l in main.agent_logs if l["level"] == "INFO"]
-check("agent events in feed", len(info_events) >= len(UNIVERSE) * 6)
+# ===========================================================================
+print("cycle C — Gemini quota exhausted mid-cycle (circuit breaker + honest errors):")
+
+class _QuotaErr(Exception):
+    def __init__(self):
+        super().__init__("Quota exceeded for metric generate_content_free_tier_requests, "
+                         "limit: 20. You have exhausted your daily quota on this model.")
+        self.status_code = 429
+
+class _QuotaGeminiInteractions:
+    def __init__(self):
+        self.calls = []
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        raise _QuotaErr()
+
+class _QuotaGeminiClient:
+    def __init__(self):
+        self.interactions = _QuotaGeminiInteractions()
+        self.models = types.SimpleNamespace(list=lambda: _ModelsList(["gemini-3.6-flash"]))
+
+gemini_service._client = _QuotaGeminiClient()
+news_agent.reset_news_analysis_cache()
+recordC = asyncio.run(_run("test-cycle-C"))
+uC = recordC["llm_usage"] or {}
+
+check("C: exactly ONE real Gemini request before the circuit opens (no per-symbol storm)",
+      len(gemini_service._client.interactions.calls) == 1)
+check("C: all 5 news attempts recorded as QUOTA_EXCEEDED (1 real 429 + 4 short-circuited)",
+      uC.get("gemini", {}).get("errors", {}).get("PROVIDER_QUOTA_EXCEEDED") == 5
+      and uC["gemini"]["requests"] == 5 and uC["gemini"]["ok"] == 0)
+check("C: news UNAVAILABLE for all symbols",
+      all(recordC["agent_status"][s]["news"] == "UNAVAILABLE" for s in UNIVERSE))
+check("C: cycle status PARTIAL_ERROR (not OK, not silent)",
+      recordC["status"] == "PARTIAL_ERROR")
+news_errors = [e for e in recordC["errors"] if e["agent"] == "news"]
+check("C: structured errors for every symbol (provider=gemini, type=QUOTA_EXCEEDED)",
+      len(news_errors) == len(UNIVERSE)
+      and all(e["provider"] == "gemini" and e["type"] == "QUOTA_EXCEEDED" for e in news_errors))
+check("C: agent_results news 0/5", recordC["agent_results"]["news"]["ok"] == 0
+      and recordC["agent_results"]["news"]["unavailable"] == 5)
+check("C: provider_results show gemini circuit QUOTA_EXHAUSTED",
+      recordC["provider_results"]["llm_states"]["gemini"]["state"] == "QUOTA_EXHAUSTED")
+check("C: technical/debate/risk/cio still ran (Groq independent)",
+      recordC["agent_results"]["technical"]["ok"] == 5
+      and recordC["agent_results"]["debate"]["ok"] == 5
+      and recordC["agent_results"]["risk"]["ok"] == 5
+      and recordC["agent_results"]["cio"]["ok"] == 5)
+check("C: no fabricated news decisions — news reports carry the quota error",
+      all("QUOTA" in str(l["data"].get("error", "")) for l in main.agent_logs
+          if l["agent"] == "news" and l.get("data") and l["level"] == "ERROR"))
+
+# ===========================================================================
+print("yfinance is not required:")
+check("yfinance absent from sys.modules after full cycles", "yfinance" not in sys.modules)
+check("yfinance absent from requirements.txt",
+      "yfinance" not in open("requirements.txt").read())
 
 print()
 if FAILURES:
@@ -319,4 +400,4 @@ if FAILURES:
     for f in FAILURES:
         print("  -", f)
     sys.exit(1)
-print("FULL PIPELINE TEST PASSED — 2 cycles, all 5 symbols, call-count contract verified")
+print("FULL PIPELINE TEST PASSED — 3 cycles, call-count contract, quota circuit, honest errors")

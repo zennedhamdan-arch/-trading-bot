@@ -212,8 +212,9 @@ check("disabled -> fail-safe", r["summary"] == "Fundamentals agent disabled via 
 config.settings.ENABLE_FUNDAMENTALS_AGENT = True
 
 # fundamentals fetch error
-r = fundamentals_agent.analyze_fundamentals("AAPL", {"symbol": "AAPL", "error": "yfinance down"})
-check("data error -> fail-safe", r["signal"] == "NEUTRAL" and r["error"] == "yfinance down")
+r = fundamentals_agent.analyze_fundamentals("AAPL", {"symbol": "AAPL", "error": "provider down"})
+check("data error -> fail-safe", r["signal"] == "NEUTRAL"
+      and r["error"] == "DATA_UNAVAILABLE: provider down")
 
 # no key
 config.settings.GEMINI_API_KEY = ""

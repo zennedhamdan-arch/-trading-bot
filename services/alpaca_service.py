@@ -22,10 +22,11 @@ import pandas as pd
 
 try:
     from alpaca.trading.client import TradingClient
-    from alpaca.trading.requests import MarketOrderRequest, GetPortfolioHistoryRequest
-    from alpaca.trading.enums import OrderSide, TimeInForce
+    from alpaca.trading.requests import (MarketOrderRequest, GetPortfolioHistoryRequest,
+                                         GetCorporateAnnouncementsRequest)
+    from alpaca.trading.enums import OrderSide, TimeInForce, CorporateActionType
     from alpaca.data.historical import StockHistoricalDataClient
-    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.requests import StockBarsRequest, StockSnapshotRequest
     from alpaca.data.timeframe import TimeFrame
     from alpaca.data.enums import DataFeed
     ALPACA_SDK_AVAILABLE = True
@@ -65,6 +66,25 @@ def _resolve_feed() -> "DataFeed":
     if wanted != "IEX":
         logger.warning(f"Unknown ALPACA_DATA_FEED '{wanted}'; falling back to IEX.")
     return DataFeed.IEX
+
+
+def _map_data_error(exc: Exception, context: str) -> str:
+    """Maps Alpaca data errors to honest, structured reasons.
+
+    A feed-subscription failure (e.g. the free/paper account requesting SIP)
+    becomes DATA_UNAVAILABLE (SUBSCRIPTION_FEED_UNAVAILABLE) naming the
+    configured feed — the system NEVER silently switches feeds and NEVER
+    pretends limited data is full-market data.
+    """
+    message = str(exc)
+    if "subscription does not permit" in message.lower() or "not entitled" in message.lower():
+        return (
+            f"DATA_UNAVAILABLE (SUBSCRIPTION_FEED_UNAVAILABLE): the configured "
+            f"ALPACA_DATA_FEED={settings.ALPACA_DATA_FEED} is not permitted by this "
+            f"Alpaca subscription for {context}. Set ALPACA_DATA_FEED to a permitted "
+            f"feed (the free/paper subscription supports iex). Original: {message}"
+        )
+    return message
 
 
 def _get_trading_client():
@@ -220,8 +240,18 @@ def get_portfolio_history(period: str = "1M", timeframe: Optional[str] = None) -
 
 def get_indicators(symbol: str, lookback_days: int = 250) -> dict:
     """
-    Fetches daily bars for `symbol` and computes RSI(14), SMA50, SMA200,
-    and MACD. Returns the latest values plus recent close price history.
+    Fetches daily bars for `symbol` from the CONFIGURED feed and computes
+    ALL technical analytics deterministically in Python (never via an LLM):
+
+    RSI(14), SMA20/50/200, EMA20, MACD(+signal), ATR(14), annualized
+    volatility, max drawdown, 1d/5d/20d returns, plus a transparent
+    rule-based technical_signal summary. The AI reasoning layer receives
+    these numbers as evidence; it never computes them.
+
+    Feed honesty: the response carries the configured feed name. If the
+    configured feed is not permitted by the subscription, the error is
+    DATA_UNAVAILABLE (SUBSCRIPTION_FEED_UNAVAILABLE) — never a silent
+    feed switch, never fabricated bars.
     """
     if not TA_AVAILABLE:
         return {"error": "The 'ta' library is not installed.", "symbol": symbol}
@@ -251,13 +281,21 @@ def get_indicators(symbol: str, lookback_days: int = 250) -> dict:
 
         df = df.sort_index()
         closes = df["close"]
+        highs = df["high"] if "high" in df else closes
+        lows = df["low"] if "low" in df else closes
 
+        # --- deterministic indicators (ta + pandas) ---
         rsi = ta.momentum.RSIIndicator(close=closes, window=14).rsi()
+        sma20 = ta.trend.SMAIndicator(close=closes, window=20).sma_indicator()
         sma50 = ta.trend.SMAIndicator(close=closes, window=50).sma_indicator()
         sma200 = ta.trend.SMAIndicator(close=closes, window=200).sma_indicator()
+        ema20 = ta.trend.EMAIndicator(close=closes, window=20).ema_indicator()
         macd_ind = ta.trend.MACD(close=closes)
         macd_line = macd_ind.macd()
         macd_signal = macd_ind.macd_signal()
+        atr14 = ta.volatility.AverageTrueRange(
+            high=highs, low=lows, close=closes, window=14
+        ).average_true_range()
 
         latest_close = float(closes.iloc[-1])
 
@@ -265,20 +303,205 @@ def get_indicators(symbol: str, lookback_days: int = 250) -> dict:
             val = series.dropna()
             return float(val.iloc[-1]) if not val.empty else None
 
+        # Returns / volatility / drawdown (pure pandas)
+        daily_returns = closes.pct_change().dropna()
+        volatility_annual = (
+            float(daily_returns.std() * (252 ** 0.5)) if len(daily_returns) >= 2 else None
+        )
+
+        def _ret_over(n):
+            if len(closes) > n and closes.iloc[-1 - n] and closes.iloc[-1 - n] != 0:
+                return round(float(closes.iloc[-1] / closes.iloc[-1 - n] - 1.0), 6)
+            return None
+
+        running_max = closes.cummax()
+        drawdown = closes / running_max - 1.0
+        max_drawdown = round(float(drawdown.min()), 6) if len(drawdown) else None
+
+        # --- transparent rule-based signal (evidence for the AI, not a
+        # replacement for it; components are exposed for auditability) ---
+        rsi_v = _safe_last(rsi)
+        sma50_v = _safe_last(sma50)
+        sma200_v = _safe_last(sma200)
+        macd_v = _safe_last(macd_line)
+        macd_sig_v = _safe_last(macd_signal)
+
+        if sma50_v is not None and sma200_v is not None:
+            if latest_close > sma50_v > sma200_v:
+                trend = "BULLISH"
+            elif latest_close < sma50_v < sma200_v:
+                trend = "BEARISH"
+            else:
+                trend = "NEUTRAL"
+        else:
+            trend = "NEUTRAL"
+        if macd_v is not None and macd_sig_v is not None:
+            momentum = "BULLISH" if macd_v > macd_sig_v else "BEARISH"
+        else:
+            momentum = "NEUTRAL"
+        if rsi_v is not None:
+            rsi_flag = "OVERBOUGHT" if rsi_v > 70 else ("OVERSOLD" if rsi_v < 30 else "NEUTRAL")
+        else:
+            rsi_flag = "NEUTRAL"
+
+        if trend == "BULLISH" and momentum == "BULLISH" and rsi_flag != "OVERBOUGHT":
+            technical_signal = "BULLISH"
+        elif trend == "BEARISH" and momentum == "BEARISH" and rsi_flag != "OVERSOLD":
+            technical_signal = "BEARISH"
+        else:
+            technical_signal = "NEUTRAL"
+
         return {
             "symbol": symbol,
+            "feed": settings.ALPACA_DATA_FEED,
             "latest_close": latest_close,
             "rsi_14": _safe_last(rsi),
-            "sma_50": _safe_last(sma50),
-            "sma_200": _safe_last(sma200),
-            "macd": _safe_last(macd_line),
-            "macd_signal": _safe_last(macd_signal),
+            "sma_20": _safe_last(sma20),
+            "sma_50": sma50_v,
+            "sma_200": sma200_v,
+            "ema_20": _safe_last(ema20),
+            "macd": macd_v,
+            "macd_signal": macd_sig_v,
+            "atr_14": _safe_last(atr14),
+            "volatility_annualized": volatility_annual,
+            "max_drawdown": max_drawdown,
+            "return_1d": _ret_over(1),
+            "return_5d": _ret_over(5),
+            "return_20d": _ret_over(20),
+            "technical_signal": technical_signal,
+            "technical_components": {
+                "trend": trend, "momentum": momentum, "rsi_flag": rsi_flag,
+            },
             "recent_closes": [round(float(c), 2) for c in closes.tail(10).tolist()],
             "error": None,
         }
     except Exception as e:
         logger.error(f"get_indicators failed for {symbol}: {e}")
-        return {"error": str(e), "symbol": symbol}
+        return {"error": _map_data_error(e, f"bars for {symbol}"), "symbol": symbol}
+
+
+def get_snapshot(symbol: str) -> dict:
+    """
+    Latest trade, latest quote, and current minute/daily bars for `symbol`
+    from the CONFIGURED feed (Alpaca snapshot API). Fields the feed cannot
+    supply are null — never fabricated. Feed-subscription failures map to
+    DATA_UNAVAILABLE (SUBSCRIPTION_FEED_UNAVAILABLE).
+    """
+    try:
+        data_client = _get_data_client()
+        req = StockSnapshotRequest(symbol_or_symbols=symbol, feed=_resolve_feed())
+        snapshots = data_client.get_stock_snapshot(req)
+
+        if isinstance(snapshots, dict):
+            snap = snapshots.get(symbol)
+        else:
+            snap = snapshots
+        if snap is None:
+            return {"symbol": symbol, "error": f"No snapshot returned for {symbol}"}
+
+        def _trade(t):
+            return {
+                "price": float(t.price) if t and t.price is not None else None,
+                "size": int(t.size) if t and t.size is not None else None,
+                "timestamp": t.timestamp.isoformat() if t and t.timestamp else None,
+            } if t else None
+
+        def _quote(q):
+            return {
+                "bid_price": float(q.bid_price) if q and q.bid_price is not None else None,
+                "ask_price": float(q.ask_price) if q and q.ask_price is not None else None,
+                "bid_size": int(q.bid_size) if q and q.bid_size is not None else None,
+                "ask_size": int(q.ask_size) if q and q.ask_size is not None else None,
+                "timestamp": q.timestamp.isoformat() if q and q.timestamp else None,
+            } if q else None
+
+        def _bar(b):
+            return {
+                "open": float(b.open) if b and b.open is not None else None,
+                "high": float(b.high) if b and b.high is not None else None,
+                "low": float(b.low) if b and b.low is not None else None,
+                "close": float(b.close) if b and b.close is not None else None,
+                "volume": int(b.volume) if b and b.volume is not None else None,
+                "timestamp": b.timestamp.isoformat() if b and b.timestamp else None,
+            } if b else None
+
+        return {
+            "symbol": symbol,
+            "feed": settings.ALPACA_DATA_FEED,
+            "latest_trade": _trade(getattr(snap, "latest_trade", None)),
+            "latest_quote": _quote(getattr(snap, "latest_quote", None)),
+            "minute_bar": _bar(getattr(snap, "minute_bar", None)),
+            "daily_bar": _bar(getattr(snap, "daily_bar", None)),
+            "previous_daily_bar": _bar(getattr(snap, "previous_daily_bar", None)),
+            "error": None,
+        }
+    except Exception as e:
+        logger.error(f"get_snapshot failed for {symbol}: {e}")
+        return {"symbol": symbol, "error": _map_data_error(e, f"snapshot for {symbol}")}
+
+
+def get_clock() -> dict:
+    """Market clock: is the market open, and the next open/close times."""
+    try:
+        client = _get_trading_client()
+        clock = client.get_clock()
+        if isinstance(clock, dict):
+            return {
+                "is_open": bool(clock.get("is_open")),
+                "timestamp": str(clock.get("timestamp")),
+                "next_open": str(clock.get("next_open")),
+                "next_close": str(clock.get("next_close")),
+                "error": None,
+            }
+        return {
+            "is_open": bool(clock.is_open),
+            "timestamp": clock.timestamp.isoformat() if clock.timestamp else None,
+            "next_open": clock.next_open.isoformat() if clock.next_open else None,
+            "next_close": clock.next_close.isoformat() if clock.next_close else None,
+            "error": None,
+        }
+    except Exception as e:
+        logger.error(f"get_clock failed: {e}")
+        return {"is_open": None, "timestamp": None, "next_open": None,
+                "next_close": None, "error": str(e)}
+
+
+def get_corporate_actions(symbol: str, days_back: int = 90) -> dict:
+    """Recent corporate-action announcements (dividends, splits, mergers,
+    spinoffs) for `symbol` via the Alpaca Trading API. Available on demand
+    for the normalized data layer; not part of every cycle."""
+    try:
+        client = _get_trading_client()
+        # The SDK requires exact dates (midnight) for since/until.
+        until = datetime.utcnow().date()
+        since = until - timedelta(days=days_back)
+        req = GetCorporateAnnouncementsRequest(
+            ca_types=[
+                CorporateActionType.DIVIDEND,
+                CorporateActionType.MERGER,
+                CorporateActionType.SPINOFF,
+                CorporateActionType.SPLIT,
+            ],
+            since=since,
+            until=until,
+            symbol=symbol,
+        )
+        announcements = client.get_corporate_announcements(req)
+        items = []
+        for a in announcements or []:
+            items.append({
+                "id": str(a.id),
+                "type": str(a.ca_type.value if hasattr(a.ca_type, "value") else a.ca_type),
+                "sub_type": str(a.ca_sub_type) if a.ca_sub_type else None,
+                "target_symbol": a.target_symbol,
+                "declaration_date": a.declaration_date.isoformat() if a.declaration_date else None,
+                "ex_date": a.ex_date.isoformat() if a.ex_date else None,
+                "payable_date": a.payable_date.isoformat() if a.payable_date else None,
+            })
+        return {"symbol": symbol, "actions": items, "error": None}
+    except Exception as e:
+        logger.error(f"get_corporate_actions failed for {symbol}: {e}")
+        return {"symbol": symbol, "actions": [], "error": _map_data_error(e, f"corporate actions for {symbol}")}
 
 
 def execute_order(symbol: str, side: str, notional_usd: Optional[float] = None,

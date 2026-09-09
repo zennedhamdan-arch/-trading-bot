@@ -105,12 +105,6 @@ def run_debate(symbol: str, tech_report: dict, news_report: dict,
         base_result["bear_summary"] = "Debate disabled via config."
         return base_result
 
-    if not settings.GROQ_API_KEY:
-        base_result["error"] = "GROQ_API_KEY not configured."
-        base_result["bull_summary"] = "Debate disabled: missing GROQ_API_KEY."
-        base_result["bear_summary"] = "Debate disabled: missing GROQ_API_KEY."
-        return base_result
-
     context_text = _build_context(symbol, tech_report, news_report, fundamentals_report)
 
     result = llm_service.call_json(
@@ -129,8 +123,12 @@ def run_debate(symbol: str, tech_report: dict, news_report: dict,
     if not result.ok:
         logger.error(f"Debate failed for {symbol}: {result.error}")
         base_result["error"] = result.error
-        base_result["bull_summary"] = "Debate agent encountered an error."
-        base_result["bear_summary"] = "Debate agent encountered an error."
+        if result.status == "NOT_CONFIGURED":
+            base_result["bull_summary"] = "Debate disabled: missing API key."
+            base_result["bear_summary"] = "Debate disabled: missing API key."
+        else:
+            base_result["bull_summary"] = "Debate agent encountered an error."
+            base_result["bear_summary"] = "Debate agent encountered an error."
         return base_result
 
     parsed = result.parsed

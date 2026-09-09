@@ -109,8 +109,35 @@
 
     var banners = accountErrorBanner(acct) + botOfflineBanner();
 
-    // KPI strip — when the broker API is down, show honest "unavailable"
-    // tiles instead of $0.00 values that look like real zeros.
+    // Live market strip (Alpaca WebSockets), refreshed in place by
+    // App.updateLiveStrip on each realtime poll — ticks never trigger AI.
+    function liveStripHTML() {
+      var rt = store.data.realtime;
+      if (!rt || !rt.data || !Object.keys(rt.data).length) return "";
+      var tone = rt.status === "CONNECTED" ? "badge-ok" : rt.status === "DISCONNECTED" ? "badge-error" : "badge-neutral";
+      var cells = Object.keys(rt.data).map(function (s) {
+        var d = rt.data[s] || {};
+        var t = d.last_trade || {}, q = d.last_quote || {};
+        var px = t.price != null ? t.price : (q.bid_price != null && q.ask_price != null ? (q.bid_price + q.ask_price) / 2 : null);
+        return (
+          '<div class="card" style="padding:8px 12px;min-width:120px">' +
+            '<div class="row" style="justify-content:space-between"><span class="sym">' + U.esc(s) + '</span>' +
+            '<span style="font-size:12px;font-weight:650">' + (px != null ? U.fmtMoney(px) : "—") + "</span></div>" +
+            '<div class="t-faint" style="font-size:10.5px">' + (q.bid_price != null ? "bid " + U.fmtMoney(q.bid_price) + " · ask " + U.fmtMoney(q.ask_price) : "no quote yet") + "</div>" +
+          "</div>"
+        );
+      }).join("");
+      return (
+        '<div id="live-strip" style="margin-bottom:12px">' +
+          '<div class="row" style="justify-content:space-between;margin-bottom:6px">' +
+            '<span class="row" style="gap:7px">' + ICON("pulse") + '<span style="font-size:12px;font-weight:650;color:var(--ink-hi)">Live Market</span>' +
+            '<span class="badge ' + tone + '">' + U.esc(rt.status) + "</span></span>" +
+            '<span class="t-faint" style="font-size:10.5px">Alpaca WebSocket · feed ' + U.esc(rt.feed || "—") + " · ticks never trigger AI</span>" +
+          "</div>" +
+          '<div class="row" style="gap:8px;overflow-x:auto">' + cells + "</div>" +
+        "</div>"
+      );
+    }
     var down = !!acct.error;
     var dayPos = !down && acct.day_pl > 0;
     var val = function (v) { return down ? "—" : v; };
@@ -199,6 +226,7 @@
     return (
       (store.demo ? window.DemoBanner : "") +
       banners +
+      liveStripHTML() +
       '<div class="kpi-strip mb-12">' + kpis + "</div>" +
       '<div class="grid g-main mb-12">' +
         '<div class="span-main">' + chartCard + "</div>" +
@@ -889,43 +917,58 @@
     var agentErrs = {};
     logs().forEach(function (l) { if (l.level === "ERROR" && l.agent) agentErrs[l.agent] = (agentErrs[l.agent] || 0) + 1; });
 
-    var providerCards = (function () {
-      var routes = cfg.llm_routes || {};
-      var validation = cfg.llm_model_validation || { providers: {} };
-      var quota = cfg.llm_quota || {};
-      var provNames = { groq: "Groq", gemini: "Gemini", openrouter: "OpenRouter" };
-      function modelsFor(provider) {
-        var models = [];
-        Object.keys(routes).forEach(function (a) {
-          if (routes[a].provider === provider && routes[a].model && models.indexOf(routes[a].model) < 0) models.push(routes[a].model);
-        });
-        return models;
-      }
-      return ["groq", "gemini", "openrouter"].map(function (p) {
-        var entry = (validation.providers || {})[p] || {};
-        var q = quota[p] || {};
-        var missing = (entry.missing || []).length;
-        var models = modelsFor(p);
-        var tone = missing || (entry.error && ("" + entry.error).indexOf("not configured") < 0 && !entry.ok) ? "err" : (entry.error ? "warn" : "ok");
-        var sub;
-        if (entry.error && ("" + entry.error).indexOf("not configured") >= 0) {
-          sub = "API key not configured \u2014 agents on this provider are disabled";
-          tone = "warn";
-        } else if (missing) {
-          sub = U.esc((entry.missing || [])[0]) + (missing > 1 ? " +" + (missing - 1) + " more" : "") + " not in live catalog";
-        } else {
-          sub = models.map(function (m) { return U.esc(m); }).join(" \u00b7 ") || "no models routed";
-        }
-        var qTxt = "";
-        if (q.daily_request_limit > 0) {
-          qTxt = " \u00b7 " + (q.requests_last_24h || 0) + "/" + q.daily_request_limit + " req (24h)";
-          if (q.backoff_active) { qTxt += " \u00b7 QUOTA PAUSED " + Math.ceil((q.backoff_seconds_remaining || 0) / 60) + "m"; tone = "err"; }
-          else if ((q.requests_last_24h || 0) >= q.daily_request_limit) { tone = "err"; }
-        }
-        return healthCard((provNames[p] || p) + " Models", tone === "ok" ? "VERIFIED" : tone === "err" ? "PROBLEM" : "CHECK CFG", tone, "brain",
-          sub + qTxt);
-      }).join("");
-    })();
+    var health = store.data.health || {};
+    var startupRows = (health.startup && health.startup.rows) || [];
+
+    function statusBadge(status) {
+      var tone = status === "READY" ? "badge-ok"
+        : status === "NOT_CONFIGURED" || status === "DATA_UNAVAILABLE" ? "badge-neutral"
+        : "badge-error";
+      return '<span class="badge ' + tone + '">' + U.esc(status) + "</span>";
+    }
+
+    var startupTable = startupRows.length
+      ? ('<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Component</th><th>Status</th><th>Detail</th></tr></thead><tbody>' +
+          startupRows.map(function (r) {
+            return (
+              "<tr><td><span style=\"font-weight:650\">" + U.esc(r.component) + "</span></td>" +
+              "<td>" + statusBadge(r.status) + "</td>" +
+              '<td class="t-faint" style="font-size:11.5px">' + U.esc(r.detail || "") + "</td></tr>"
+            );
+          }).join("") + "</tbody></table></div>")
+      : "";
+
+    // Live circuit states (LLM router) + market clock + realtime + feed
+    var liveStates = (health.providers && Object.keys(health.providers).length)
+      ? health.providers
+      : (cfg.llm_provider_states || {});
+    var circuitRows = Object.keys(liveStates).map(function (p) {
+      var s = liveStates[p] || {};
+      var state = s.state || "READY";
+      var tone = state === "READY" ? "badge-ok"
+        : state === "NOT_CONFIGURED" ? "badge-neutral"
+        : state === "DEGRADED" ? "badge-warning" : "badge-error";
+      var budget = s.daily_request_limit > 0 ? " · " + (s.requests_last_24h || 0) + "/" + s.daily_request_limit + " req (24h)" : " · " + (s.requests_last_24h || 0) + " req (24h)";
+      return (
+        "<tr><td><span class='sym'>" + U.esc(p.toUpperCase()) + "</span></td>" +
+        '<td><span class="badge ' + tone + '">' + U.esc(state) + "</span></td>" +
+        '<td class="t-faint" style="font-size:11.5px">' + U.esc(s.detail || "") + U.esc(budget) + "</td></tr>"
+      );
+    }).join("");
+
+    var mkClock = health.market_clock || {};
+    var rtStatus = (health.realtime && health.realtime.status) || "UNKNOWN";
+
+    var providerCards =
+      healthCard("Market", mkClock.is_open === true ? "OPEN" : mkClock.is_open === false ? "CLOSED" : "UNKNOWN",
+        mkClock.is_open === true ? "ok" : mkClock.is_open === false ? "warn" : "err", "clock",
+        mkClock.error ? U.esc(mkClock.error) : (mkClock.is_open ? "Regular trading hours" : "Outside regular hours")) +
+      healthCard("Realtime Feed", rtStatus === "CONNECTED" ? "CONNECTED" : rtStatus === "DISABLED" || rtStatus === "NO_KEYS" ? "OFF" : rtStatus,
+        rtStatus === "CONNECTED" ? "ok" : rtStatus === "DISCONNECTED" ? "err" : "warn", "pulse",
+        rtStatus === "CONNECTED" ? "Alpaca WebSocket · feed " + U.esc((health.realtime && health.realtime.feed) || "—")
+          : rtStatus === "NO_KEYS" ? "Alpaca keys not configured" : rtStatus === "DISABLED" ? "Disabled via REALTIME_ENABLED=false" : U.esc(rtStatus)) +
+      healthCard("Data Feed", "IEX/SIP", (cfg.market_data && cfg.market_data.configured_feed) === "IEX" ? "warn" : "ok", "globe",
+        "Configured feed: " + U.esc((cfg.market_data && cfg.market_data.configured_feed) || "IEX") + " — IEX is the free/paper feed; never switched silently");
 
     var cards =
       healthCard("Bot Process", st.running ? "ONLINE" : "OFFLINE", st.running ? "ok" : "err", "power",
@@ -966,6 +1009,17 @@
       botOfflineBanner() +
       (acct.error ? C.bannerHTML("err", "Broker API unreachable.", U.esc(acct.error)) : "") +
       '<div class="grid g-3 mb-12">' + cards + "</div>" +
+      (startupTable
+        ? '<div class="mb-12">' + headCard("Startup Health Check", "shield",
+            startupTable,
+            '<span class="t-faint" style="font-size:11px">checked at ' + U.esc(U.fmtDateTime(health.checked_at)) + "</span>") + "</div>"
+        : "") +
+      (circuitRows
+        ? '<div class="mb-12">' + headCard("LLM Provider Circuits (live)", "brain",
+            '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Provider</th><th>State</th><th>Detail</th></tr></thead><tbody>' + circuitRows + "</tbody></table></div>" +
+            '<div class="note" style="margin-top:8px">' + ICON("info") + "<span>READY · DEGRADED · QUOTA_EXHAUSTED · MODEL_UNAVAILABLE · AUTH_ERROR · NETWORK_ERROR · NOT_CONFIGURED — a 429 opens the provider circuit, a 404 opens a per-model circuit, and neither is retried until it expires.</span></div>",
+            "") + "</div>"
+        : "") +
       '<div class="grid g-2">' +
         headCard("Recent Errors", "alert",
           errs.length

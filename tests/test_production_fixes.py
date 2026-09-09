@@ -60,6 +60,16 @@ from openai import _base_client as _obc
 _src = inspect.getsource(_obc)
 check("openai no longer passes proxies= to httpx", "proxies=proxies" not in _src)
 
+# yfinance must be gone from the dependency tree (no Yahoo scraping)
+_req = open("requirements.txt").read()
+check("yfinance removed from requirements.txt", "yfinance" not in _req)
+_app_sources = ""
+import glob as _glob
+for _p in _glob.glob("services/*.py") + _glob.glob("agents/*.py") + ["main.py", "config.py"]:
+    _app_sources += open(_p).read()
+check("no yfinance import anywhere in the app",
+      "import yfinance" not in _app_sources and "from yfinance" not in _app_sources)
+
 # ---------------------------------------------------------------------------
 # 2. Alpaca market data feed (IEX vs SIP)
 # ---------------------------------------------------------------------------
@@ -159,99 +169,100 @@ check("failures surface as structured error", hist3["error"] == "boom" and hist3
 alpaca_service._trading_client = None
 
 # ---------------------------------------------------------------------------
-# 4. Fundamentals: cache, pacing, 429 handling
 # ---------------------------------------------------------------------------
-print("4. yfinance fundamentals layer:")
-from agents import fundamentals_agent as fa
+# 4. Fundamentals provider abstraction (yfinance is gone)
+# ---------------------------------------------------------------------------
+print("4. fundamentals provider layer:")
+from services import fundamentals_service as fs
 
-fa.reset_fundamentals_cache()
+fs.reset_cache()
 
-# 4a. success path with a stubbed yfinance
-class _FakeInfoTicker:
+# 4a. default "none" provider -> honest DATA_UNAVAILABLE, nothing fabricated
+config.settings.FUNDAMENTALS_PROVIDER = "none"
+config.settings.FUNDAMENTALS_FALLBACK_PROVIDER = ""
+r = fs.get_fundamentals("AAPL")
+check("none provider -> DATA_UNAVAILABLE", r["status"] == "DATA_UNAVAILABLE")
+check("none provider reason is NO_PROVIDER_CONFIGURED", r.get("reason") == "NO_PROVIDER_CONFIGURED")
+check("normalized shape (symbol/provider/timestamp)", r["symbol"] == "AAPL" and r["provider"] == "none" and "timestamp" in r)
+check("no fabricated metrics", all(r[f] is None for f in
+      ("market_cap", "pe_ratio", "eps", "revenue", "profit_margin", "roe", "debt_to_equity")))
+
+# 4b. pluggable provider: registered, returns normalized data, unavailable fields null
+class _FakeProvider(fs.FundamentalsProvider):
+    name = "fakevendor"
     calls = 0
-    @property
-    def info(self):
-        _FakeInfoTicker.calls += 1
-        return {"trailingPE": 30.1, "forwardPE": 28.0, "revenueGrowth": 0.12,
-                "profitMargins": 0.25, "debtToEquity": 1.3, "returnOnEquity": 0.4}
+    def get_fundamentals(self, symbol):
+        _FakeProvider.calls += 1
+        return fs._normalized(symbol, self.name, "OK",
+                              pe_ratio=30.1, profit_margin=0.25, roe=0.4)
 
-class _FakeYF:
-    def __init__(self, symbol):
-        self.symbol = symbol
-    Ticker = staticmethod(lambda s: _FakeInfoTicker())
+fs._PROVIDER_CLASSES["fakevendor"] = _FakeProvider
+config.settings.FUNDAMENTALS_PROVIDER = "fakevendor"
+fs.reset_cache()
+r1 = fs.get_fundamentals("AAPL")
+check("fake provider returns normalized OK", r1["status"] == "OK" and r1["provider"] == "fakevendor")
+check("available fields carried through", r1["pe_ratio"] == 30.1 and r1["roe"] == 0.4)
+check("unavailable fields are null, never fabricated",
+      r1["market_cap"] is None and r1["eps"] is None and r1["debt_to_equity"] is None)
+calls_after_first = _FakeProvider.calls
+r2 = fs.get_fundamentals("AAPL")
+check("result cache: second call does not re-request", _FakeProvider.calls == calls_after_first)
 
-import types as _types
-fake_yf_module = _types.ModuleType("yfinance")
-fake_yf_module.Ticker = lambda s: _FakeInfoTicker()
-sys.modules["yfinance"] = fake_yf_module
+# 4c. fallback provider: used when the primary fails
+class _FailingProvider(fs.FundamentalsProvider):
+    name = "failing"
+    def get_fundamentals(self, symbol):
+        return fs._normalized(symbol, self.name, "DATA_UNAVAILABLE", reason="vendor down")
 
-config.settings.FUNDAMENTALS_MIN_INTERVAL_SECONDS = 0  # don't slow the tests
-fa.reset_fundamentals_cache()
-r1 = fa.get_fundamentals("AAPL")
-check("success path returns real fields", r1["pe_ratio"] == 30.1 and r1["error"] is None)
-calls_after_first = _FakeInfoTicker.calls
-r2 = fa.get_fundamentals("AAPL")
-check("cached: second call does not re-request", _FakeInfoTicker.calls == calls_after_first and r2["pe_ratio"] == 30.1)
+fs._PROVIDER_CLASSES["failing"] = _FailingProvider
+config.settings.FUNDAMENTALS_PROVIDER = "failing"
+config.settings.FUNDAMENTALS_FALLBACK_PROVIDER = "fakevendor"
+fs.reset_cache()
+rf = fs.get_fundamentals("MSFT")
+check("fallback used when primary unavailable", rf["status"] == "OK" and rf["provider"] == "fakevendor")
 
-# 4b. 429 -> DATA_UNAVAILABLE + global backoff
-class _RateLimitedTicker:
-    calls = 0
-    @property
-    def info(self):
-        _RateLimitedTicker.calls += 1
-        raise Exception("429 Client Error: Too Many Requests for url: https://query2.finance.yahoo.com/v10/finance/quoteSummary/AAPL")
+# primary OK -> fallback never called
+config.settings.FUNDAMENTALS_PROVIDER = "fakevendor"
+fs.reset_cache()
+rf2 = fs.get_fundamentals("NVDA")
+check("primary OK -> fallback untouched", rf2["provider"] == "fakevendor")
 
-fake_yf_module.Ticker = lambda s: _RateLimitedTicker()
-fa.reset_fundamentals_cache()
-r429 = fa.get_fundamentals("MSFT")
-check("429 -> DATA_UNAVAILABLE", r429["error"] is not None and r429["error"].startswith("DATA_UNAVAILABLE"))
-check("429 message identifies rate limit", "429" in r429["error"])
-check("no fake values on 429", "pe_ratio" not in r429)
-r429b = fa.get_fundamentals("NVDA")  # different symbol, backoff must apply process-wide
-check("backoff: other symbols short-circuit without hitting Yahoo", _RateLimitedTicker.calls == 1)
-check("backoff result is DATA_UNAVAILABLE", r429b["error"] is not None and r429b["error"].startswith("DATA_UNAVAILABLE"))
-check("429 error is classified as rate limit", fa._is_rate_limit_error(Exception("429 Client Error: Too Many Requests")))
-
-# 4c. the JSONDecodeError symptom ("Expecting value: line 1 column 1")
-json_err = ValueError("Expecting value: line 1 column 1 (char 0)")
-check("JSONDecodeError symptom classified as rate limit", fa._is_rate_limit_error(json_err))
-class _JsonErrTicker:
-    @property
-    def info(self):
-        raise json_err
-fake_yf_module.Ticker = lambda s: _JsonErrTicker()
-fa.reset_fundamentals_cache()
-rjson = fa.get_fundamentals("TSLA")
-check("JSON garbage from provider -> DATA_UNAVAILABLE (not a crash)", rjson["error"].startswith("DATA_UNAVAILABLE"))
-
-# 4d. other provider failures
-class _SslTicker:
-    @property
-    def info(self):
+# 4d. provider raising -> structured ERROR, never a crash
+class _RaisingProvider(fs.FundamentalsProvider):
+    name = "raising"
+    def get_fundamentals(self, symbol):
         raise RuntimeError("SSLError: connection closed")
-fake_yf_module.Ticker = lambda s: _SslTicker()
-fa.reset_fundamentals_cache()
-rssl = fa.get_fundamentals("SPY")
-check("other provider failure -> DATA_UNAVAILABLE with reason", rssl["error"] == "DATA_UNAVAILABLE: SSLError: connection closed")
 
-# 4e. analyze_fundamentals stays graceful on unavailable data
-config.settings.GEMINI_API_KEY = "dummy"
-af = fa.analyze_fundamentals("SPY", rssl)
-check("analyze_fundamentals degrades gracefully (no crash, NEUTRAL)",
-      af["signal"] == "NEUTRAL" and af["error"] is not None)
+fs._PROVIDER_CLASSES["raising"] = _RaisingProvider
+config.settings.FUNDAMENTALS_PROVIDER = "raising"
+config.settings.FUNDAMENTALS_FALLBACK_PROVIDER = ""
+fs.reset_cache()
+rr = fs.get_fundamentals("TSLA")
+check("raising provider -> DATA_UNAVAILABLE/ERROR with reason, no crash",
+      rr["status"] in ("DATA_UNAVAILABLE", "ERROR") and "SSLError" in rr.get("reason", ""))
 
-# 4f. min-interval pacing is applied between live calls
-config.settings.FUNDAMENTALS_MIN_INTERVAL_SECONDS = 0.4
-fa.reset_fundamentals_cache()
-t0 = time.monotonic()
-fa.get_fundamentals("AAPL")
-fa.get_fundamentals("MSFT")  # different symbol, cache miss -> must respect pacing
-elapsed = time.monotonic() - t0
-check("pacing enforced between live calls (>=0.4s)", elapsed >= 0.35)
-config.settings.FUNDAMENTALS_MIN_INTERVAL_SECONDS = 2.0
+# 4e. unknown provider name -> honest DATA_UNAVAILABLE
+config.settings.FUNDAMENTALS_PROVIDER = "doesnotexist"
+fs.reset_cache()
+ru = fs.get_fundamentals("SPY")
+check("unknown provider -> DATA_UNAVAILABLE with reason",
+      ru["status"] == "DATA_UNAVAILABLE" and "UNKNOWN_PROVIDER" in ru.get("reason", ""))
 
-del sys.modules["yfinance"]
+# 4f. analyze_fundamentals degrades gracefully on unavailable data
+from agents import fundamentals_agent as fa
 fa.reset_fundamentals_cache()
+config.settings.FUNDAMENTALS_PROVIDER = "none"
+af = fa.analyze_fundamentals("SPY", fs.get_fundamentals("SPY"))
+check("analyze_fundamentals degrades gracefully (no crash, NEUTRAL, DATA_UNAVAILABLE)",
+      af["signal"] == "NEUTRAL" and af["error"] is not None
+      and af["error"].startswith("DATA_UNAVAILABLE"))
+
+# 4g. provider health check
+health = fs.health_check()
+check("health check reports none-provider DATA_UNAVAILABLE",
+      health["provider"] == "none" and health["status"] == "DATA_UNAVAILABLE")
+
+fs.reset_cache()
 
 # ---------------------------------------------------------------------------
 # 5. Cycle integrity — per-symbol/per-agent status + honest cycle status
@@ -261,11 +272,16 @@ import main
 from agents import tech_agent, news_agent, risk_agent, cio_agent, debate_agent
 
 def _stub_everything():
-    main.alpaca_service.get_account_summary = lambda: {"cash": 1000.0, "equity": 10000.0, "error": None}
+    main.alpaca_service.get_account_summary = lambda: {"cash": 1000.0, "equity": 10000.0, "buying_power": 1000.0, "error": None}
     main.alpaca_service.get_open_positions = lambda: {"positions": [], "error": None}
-    main.alpaca_service.get_indicators = lambda s: {"symbol": s, "latest_close": 100.0, "rsi_14": 55.0, "sma_50": 99.0, "sma_200": 95.0, "macd": 1.0, "macd_signal": 0.5, "recent_closes": [100.0], "error": None}
+    main.alpaca_service.get_indicators = lambda s, lookback_days=250: {"symbol": s, "latest_close": 100.0, "rsi_14": 55.0, "sma_20": 98.0, "sma_50": 99.0, "sma_200": 95.0, "ema_20": 99.5, "macd": 1.0, "macd_signal": 0.5, "volatility_annualized": 0.25, "max_drawdown": -0.1, "technical_signal": "BULLISH", "recent_closes": [100.0], "error": None}
+    main.alpaca_service.get_snapshot = lambda s: {"symbol": s, "error": "snapshots not exercised in this section"}
+    main.market_data_service.get_news = lambda s, limit=10: {"headlines": ["headline"], "error": None}
+    main.fundamentals_service.get_fundamentals = lambda s: {
+        "status": "OK", "symbol": s, "provider": "fake", "pe_ratio": 10.0, "eps": 2.0,
+        "market_cap": None, "revenue": None, "profit_margin": 0.2, "roe": 0.15,
+        "debt_to_equity": None, "timestamp": 0.0}
     main.alpaca_service.execute_order = lambda *a, **k: {"success": False, "error": "not in tests"}
-    main._placeholder_headlines = lambda s: ["headline"]
     main._get_agent_weights = lambda: {}
 
 def _ok_report(agent, symbol):
@@ -286,7 +302,7 @@ main.news_agent.analyze_news = lambda s, h: _ok_report("news", s)
 main.fundamentals_agent.get_fundamentals = lambda s: {"symbol": s, "pe_ratio": 10.0, "error": None}
 main.fundamentals_agent.analyze_fundamentals = lambda s, f: _ok_report("fundamentals", s)
 main.debate_agent.run_debate = lambda s, t, n, f=None: {"agent": "debate", "symbol": s, "bull_strength": 0.7, "bull_summary": "b", "bear_strength": 0.3, "bear_summary": "r", "edge": 0.4, "error": None}
-main.risk_agent.assess_risk = lambda s, side, acct, pos: {"agent": "risk", "symbol": s, "approved": True, "max_notional_usd": 500.0, "risk_level": "LOW", "reasoning": "ok", "error": None}
+main.risk_agent.assess_risk = lambda s, side, acct, pos, indicators=None: {"agent": "risk", "symbol": s, "approved": True, "max_notional_usd": 500.0, "risk_level": "LOW", "reasoning": "ok", "error": None, "llm_status": "OK"}
 main.cio_agent.make_decision = lambda *a, **k: {"agent": "cio", "symbol": "X", "decision": "HOLD", "confidence": 0.5, "notional_usd": 0.0, "reasoning": "hold", "error": None}
 config.settings.ENABLE_MEMORY = False
 
@@ -310,23 +326,76 @@ check("failing agent marked ERROR per symbol", rec["agent_status"]["NVDA"]["tech
 check("healthy agents still OK", rec["agent_status"]["NVDA"]["news"] == "OK")
 err_events = [l for l in main.agent_logs if l["level"] == "ERROR" and l["agent"] == "technical"]
 check("agent failure visible in feed at ERROR level", len(err_events) == len(config.settings.TRADE_UNIVERSE))
+check("agent_results show technical 0/5", rec["agent_results"]["technical"]["ok"] == 0
+      and rec["agent_results"]["technical"]["total"] == len(config.settings.TRADE_UNIVERSE))
+tech_errors = [e for e in rec["errors"] if e["agent"] == "technical"]
+check("structured errors present (no more PARTIAL_ERROR with Errors=[])",
+      len(tech_errors) == len(config.settings.TRADE_UNIVERSE)
+      and all(set(e) >= {"provider", "type", "agent", "symbol"} for e in tech_errors))
 main.tech_agent.analyze_technicals = lambda s, i: _ok_report("technical", s)
 
-# 5c. fundamentals data unavailable -> UNAVAILABLE + PARTIAL_ERROR
-main.fundamentals_agent.get_fundamentals = lambda s: {"symbol": s, "error": "DATA_UNAVAILABLE: Yahoo Finance rate-limited (HTTP 429)."}
+# 5c. fundamentals provider failure -> UNAVAILABLE + PARTIAL_ERROR + structured errors
+main.fundamentals_service.get_fundamentals = lambda s: {
+    "status": "DATA_UNAVAILABLE", "symbol": s, "provider": "fakevendor",
+    "reason": "vendor down", "timestamp": 0.0}
 res = _run_cycle()
 rec = main.cycle_history[0]
 check("provider unavailability -> UNAVAILABLE (distinct from ERROR)", rec["agent_status"]["NVDA"]["fundamentals"] == "UNAVAILABLE")
 check("unavailable data still degrades cycle to PARTIAL_ERROR", rec["status"] == "PARTIAL_ERROR")
-main.fundamentals_agent.get_fundamentals = lambda s: {"symbol": s, "pe_ratio": 10.0, "error": None}
+fund_errors = [e for e in rec["errors"] if e["agent"] == "fundamentals"]
+check("fundamentals data failure in structured errors",
+      len(fund_errors) == len(config.settings.TRADE_UNIVERSE)
+      and fund_errors[0]["type"] == "DATA_UNAVAILABLE"
+      and fund_errors[0]["provider"] == "fundamentals:fakevendor")
+main.fundamentals_service.get_fundamentals = lambda s: {
+    "status": "OK", "symbol": s, "provider": "fake", "pe_ratio": 10.0, "eps": 2.0,
+    "market_cap": None, "revenue": None, "profit_margin": 0.2, "roe": 0.15,
+    "debt_to_equity": None, "timestamp": 0.0}
 
-# 5d. market data failure -> market_data ERROR + PARTIAL_ERROR
-main.alpaca_service.get_indicators = lambda s: {"symbol": s, "error": "subscription does not permit querying recent SIP data"}
+# 5c-2. news data source down -> news UNAVAILABLE (recorded, cycle continues)
+main.market_data_service.get_news = lambda s, limit=10: {"headlines": [], "error": "news API down"}
+res = _run_cycle()
+rec = main.cycle_history[0]
+check("news data source down -> news UNAVAILABLE", rec["agent_status"]["NVDA"]["news"] == "UNAVAILABLE")
+check("news data failure in structured errors",
+      any(e["agent"] == "news" and e["type"] == "DATA_UNAVAILABLE" for e in rec["errors"]))
+main.market_data_service.get_news = lambda s, limit=10: {"headlines": ["headline"], "error": None}
+
+# 5c-3. fundamentals with NO provider configured -> SKIPPED (visible, not an error)
+main.fundamentals_service.get_fundamentals = lambda s: {
+    "status": "DATA_UNAVAILABLE", "symbol": s, "provider": "none",
+    "reason": "NO_PROVIDER_CONFIGURED", "timestamp": 0.0}
+res = _run_cycle()
+rec = main.cycle_history[0]
+check("no fundamentals provider -> stage SKIPPED", rec["agent_status"]["NVDA"]["fundamentals"] == "SKIPPED")
+check("no-provider fundamentals does NOT degrade the cycle", rec["status"] == "OK")
+check("provider_results report fundamentals provider none + unavailable count",
+      rec["provider_results"]["fundamentals"]["provider"] == "none"
+      and rec["provider_results"]["fundamentals"]["symbols_unavailable"] == len(config.settings.TRADE_UNIVERSE))
+main.fundamentals_service.get_fundamentals = lambda s: {
+    "status": "OK", "symbol": s, "provider": "fake", "pe_ratio": 10.0, "eps": 2.0,
+    "market_cap": None, "revenue": None, "profit_margin": 0.2, "roe": 0.15,
+    "debt_to_equity": None, "timestamp": 0.0}
+
+# 5d. market data failure -> market_data ERROR + PARTIAL_ERROR; subscription
+#     feed failures specifically -> UNAVAILABLE with SUBSCRIPTION_FEED_UNAVAILABLE
+main.alpaca_service.get_indicators = lambda s, lookback_days=250: {"symbol": s, "error": "boom: data API down"}
 res = _run_cycle()
 rec = main.cycle_history[0]
 check("market-data failure marked per symbol", rec["agent_status"]["NVDA"]["market_data"] == "ERROR")
 check("market-data failure -> PARTIAL_ERROR", rec["status"] == "PARTIAL_ERROR")
-main.alpaca_service.get_indicators = lambda s: {"symbol": s, "latest_close": 100.0, "error": None}
+check("market-data failure in structured errors",
+      any(e["agent"] == "market_data" and e["provider"] == "alpaca" for e in rec["errors"]))
+
+main.alpaca_service.get_indicators = lambda s, lookback_days=250: {"symbol": s, "error": "DATA_UNAVAILABLE (SUBSCRIPTION_FEED_UNAVAILABLE): the configured ALPACA_DATA_FEED=SIP is not permitted by this Alpaca subscription for bars for " + s}
+res = _run_cycle()
+rec = main.cycle_history[0]
+check("subscription feed failure -> UNAVAILABLE (not a crash, not silent)",
+      rec["agent_status"]["NVDA"]["market_data"] == "UNAVAILABLE")
+check("subscription failure typed SUBSCRIPTION_FEED_UNAVAILABLE",
+      any(e["type"] == "SUBSCRIPTION_FEED_UNAVAILABLE" and e["provider"] == "alpaca"
+          for e in rec["errors"]))
+main.alpaca_service.get_indicators = lambda s, lookback_days=250: {"symbol": s, "latest_close": 100.0, "error": None}
 
 # 5e. broker unreachable -> cycle ERROR
 main.alpaca_service.get_account_summary = lambda: {"cash": 0.0, "equity": 0.0, "error": "Alpaca API keys are not configured."}
@@ -381,7 +450,12 @@ m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 routes = {r.path for r in m.app.routes if hasattr(r, "path")}
 check("all API routes present", {"/api/portfolio", "/api/logs", "/api/cycles", "/api/orders", "/api/history", "/api/config", "/api/agent-accuracy"} <= routes)
+check("bot control endpoints present", {"/api/bot/start", "/api/bot/stop", "/api/bot/run-now"} <= routes)
+check("health + realtime endpoints present", {"/api/health", "/api/realtime"} <= routes)
 check("agent-accuracy untouched", hasattr(m, "_get_agent_weights"))
+_main_src = open("main.py").read()
+check("cycle record carries agent_results/provider_results/llm_usage",
+      all(f'"{k}"' in _main_src for k in ("agent_results", "provider_results", "llm_usage")))
 
 print()
 if FAILURES:

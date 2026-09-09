@@ -107,11 +107,6 @@ def make_decision(symbol: str, news_report: dict, tech_report: dict, risk_report
         "latency_ms": None,
     }
 
-    if not settings.GROQ_API_KEY:
-        base_result["error"] = "GROQ_API_KEY not configured."
-        base_result["reasoning"] = "CIO agent disabled: missing API key. Defaulting to HOLD."
-        return base_result
-
     context_parts = [
         f"Symbol: {symbol}\n",
         f"--- News/Sentiment Agent Report ---\n{json.dumps(news_report, indent=2)}\n",
@@ -158,7 +153,11 @@ def make_decision(symbol: str, news_report: dict, tech_report: dict, risk_report
     if not result.ok:
         logger.error(f"CIO agent failed for {symbol}: {result.error}")
         base_result["error"] = result.error
-        base_result["reasoning"] = "CIO agent encountered an error; defaulting to HOLD (fail-safe)."
+        base_result["reasoning"] = (
+            "CIO agent disabled: missing API key. Defaulting to HOLD."
+            if result.status == "NOT_CONFIGURED"
+            else "CIO agent encountered an error; defaulting to HOLD (fail-safe)."
+        )
         return base_result
 
     parsed = result.parsed
