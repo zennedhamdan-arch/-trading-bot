@@ -27,6 +27,7 @@ Dashboard: http://localhost:8000
 """
 
 import logging
+import time
 from collections import deque
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
@@ -56,6 +57,13 @@ logger = logging.getLogger("main")
 MAX_LOG_ENTRIES = 200
 agent_logs = deque(maxlen=MAX_LOG_ENTRIES)
 
+# Real cycle history (in-memory, most recent first) so the dashboard can show
+# what every autonomous cycle actually did. Cleared on restart, same as logs.
+MAX_CYCLE_ENTRIES = 100
+cycle_history = deque(maxlen=MAX_CYCLE_ENTRIES)
+_cycle_counter = {"n": 0}
+_active_cycle = None  # set while a cycle is running; used to tally warnings
+
 bot_state = {
     "running": False,
     "started_at": None,
@@ -73,6 +81,8 @@ _previous_positions: dict = {}
 
 def _log_event(entry: dict):
     entry["timestamp"] = datetime.now(timezone.utc).isoformat()
+    if _active_cycle is not None and entry.get("level") == "WARNING":
+        _active_cycle["warnings"] += 1
     agent_logs.appendleft(entry)
 
 
@@ -139,8 +149,36 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
     universe. This is the core loop used by both the scheduled job and
     the manual '/api/bot/run-now' endpoint.
     """
+    global _active_cycle
     cycle_summary = {"triggered_by": triggered_by, "symbols_processed": [], "errors": []}
     logger.info(f"Starting trading cycle (triggered by: {triggered_by})")
+
+    # Real cycle record for the dashboard's cycle monitor.
+    _cycle_counter["n"] += 1
+    _active_cycle = {"warnings": 0}
+    cycle_record = {
+        "id": _cycle_counter["n"],
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": None,
+        "duration_s": None,
+        "triggered_by": triggered_by,
+        "status": None,
+        "symbols_processed": [],
+        "decisions": [],
+        "orders": [],
+        "warnings": 0,
+        "errors": [],
+    }
+    _t0 = time.monotonic()
+
+    def _finish_cycle_record(status: str):
+        cycle_record["finished_at"] = datetime.now(timezone.utc).isoformat()
+        cycle_record["duration_s"] = round(time.monotonic() - _t0, 1)
+        cycle_record["status"] = status
+        cycle_record["symbols_processed"] = cycle_summary["symbols_processed"]
+        cycle_record["errors"] = cycle_summary["errors"]
+        cycle_record["warnings"] = _active_cycle["warnings"] if _active_cycle else 0
+        cycle_history.appendleft(cycle_record)
 
     account_summary = alpaca_service.get_account_summary()
     if account_summary.get("error"):
@@ -150,6 +188,7 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
         cycle_summary["errors"].append(msg)
         bot_state["last_cycle_status"] = "ERROR"
         bot_state["last_cycle_at"] = datetime.now(timezone.utc).isoformat()
+        _finish_cycle_record("ERROR")
         return cycle_summary
 
     positions_data = alpaca_service.get_open_positions()
@@ -213,6 +252,13 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
                         "message": f"{decision_report['decision']}: {decision_report['reasoning']}",
                         "data": decision_report})
 
+            cycle_record["decisions"].append({
+                "symbol": symbol,
+                "decision": decision_report["decision"],
+                "confidence": decision_report.get("confidence"),
+                "notional_usd": decision_report.get("notional_usd"),
+            })
+
             # 7. Execute if actionable
             trade_result = None
             decision = decision_report["decision"]
@@ -236,6 +282,16 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
                     ),
                     "data": trade_result,
                 })
+                cycle_record["orders"].append({
+                    "symbol": symbol,
+                    "side": decision.lower(),
+                    "order_id": trade_result.get("order_id"),
+                    "status": trade_result.get("status"),
+                    "success": bool(trade_result.get("success")),
+                    "notional_usd": trade_result.get("notional_usd"),
+                    "qty": trade_result.get("qty"),
+                    "error": trade_result.get("error"),
+                })
 
             # 8. Record this decision to persistent memory for future learning
             if settings.ENABLE_MEMORY and decision == "BUY" and trade_result and trade_result.get("success"):
@@ -257,6 +313,7 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
 
     bot_state["last_cycle_at"] = datetime.now(timezone.utc).isoformat()
     bot_state["last_cycle_status"] = "OK" if not cycle_summary["errors"] else "PARTIAL_ERROR"
+    _finish_cycle_record(bot_state["last_cycle_status"])
     logger.info(f"Cycle complete. Processed: {cycle_summary['symbols_processed']}")
     return cycle_summary
 
@@ -331,6 +388,27 @@ async def api_agent_accuracy():
     return JSONResponse({"enabled": True, "agents": _get_agent_weights()})
 
 
+@app.get("/api/cycles")
+async def api_cycles():
+    """Recent autonomous cycle executions (real records, most recent first).
+    In-memory only: cleared on server restart, same as the live log feed."""
+    return JSONResponse({"cycles": list(cycle_history)})
+
+
+@app.get("/api/orders")
+async def api_orders(limit: int = 50):
+    """Recent broker orders with a caller-controlled limit (paper account)."""
+    orders = alpaca_service.get_recent_orders(limit=max(1, min(limit, 500)))
+    return JSONResponse({"orders": orders["orders"], "error": orders["error"]})
+
+
+@app.get("/api/history")
+async def api_history(period: str = "1M"):
+    """Portfolio equity history for the chart, with a period passthrough."""
+    history = alpaca_service.get_portfolio_history(period=period)
+    return JSONResponse({"points": history["points"], "period": period, "error": history["error"]})
+
+
 @app.post("/api/bot/start")
 async def api_bot_start():
     if not bot_state["running"]:
@@ -366,6 +444,9 @@ async def api_config():
         "enable_fundamentals_agent": settings.ENABLE_FUNDAMENTALS_AGENT,
         "enable_debate": settings.ENABLE_DEBATE,
         "enable_memory": settings.ENABLE_MEMORY,
+        "trading_mode": "PAPER",  # this application is hardcoded to paper trading
+        "memory_db_path": settings.MEMORY_DB_PATH,
+        "agent_accuracy_lookback": settings.AGENT_ACCURACY_LOOKBACK,
         "warnings": warnings,
     })
 

@@ -161,7 +161,10 @@ def get_portfolio_history(period: str = "1M", timeframe: str = "1D") -> dict:
     """Returns historical equity curve data points for charting."""
     try:
         client = _get_trading_client()
-        history = client.get_portfolio_history(history_filter=None)
+        kwargs = {"history_filter": None}
+        if period:
+            kwargs["period"] = period
+        history = client.get_portfolio_history(**kwargs)
         timestamps = history.timestamp or []
         equity = history.equity or []
         points = [
@@ -270,6 +273,8 @@ def execute_order(symbol: str, side: str, notional_usd: Optional[float] = None,
             "order_id": str(order.id),
             "symbol": order.symbol,
             "side": side,
+            "qty": float(order.qty) if order.qty else None,
+            "notional_usd": round(notional_usd, 2) if notional_usd else None,
             "status": order.status.value if hasattr(order.status, "value") else str(order.status),
             "error": None,
         }
