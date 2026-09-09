@@ -487,9 +487,9 @@ select.sel:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0
   position: fixed; inset: 0; z-index: 90;
   background: rgba(5, 8, 12, 0.62);
   backdrop-filter: blur(2px);
-  opacity: 0; transition: opacity 0.18s var(--ease);
+  opacity: 0; pointer-events: none; transition: opacity 0.18s var(--ease);
 }
-.drawer-veil.on { opacity: 1; }
+.drawer-veil.on { opacity: 1; pointer-events: auto; }
 .drawer {
   position: fixed; top: 0; right: 0; bottom: 0; z-index: 95;
   width: min(560px, 94vw);
@@ -565,9 +565,9 @@ select.sel:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0
   background: rgba(5, 8, 12, 0.66); backdrop-filter: blur(3px);
   display: flex; align-items: center; justify-content: center;
   padding: 20px;
-  opacity: 0; transition: opacity 0.16s var(--ease);
+  opacity: 0; pointer-events: none; transition: opacity 0.16s var(--ease);
 }
-.modal-veil.on { opacity: 1; }
+.modal-veil.on { opacity: 1; pointer-events: auto; }
 .modal {
   width: min(440px, 100%);
   background: var(--bg-1); border: 1px solid var(--line-2);
@@ -714,9 +714,9 @@ select.sel:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0
   background: rgba(5, 8, 12, 0.6); backdrop-filter: blur(2px);
   display: flex; align-items: flex-start; justify-content: center;
   padding: 12vh 16px 16px;
-  opacity: 0; transition: opacity 0.14s var(--ease);
+  opacity: 0; pointer-events: none; transition: opacity 0.14s var(--ease);
 }
-.palette-veil.on { opacity: 1; }
+.palette-veil.on { opacity: 1; pointer-events: auto; }
 .palette {
   width: min(560px, 100%);
   background: var(--bg-1); border: 1px solid var(--line-2);
