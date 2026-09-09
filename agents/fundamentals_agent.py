@@ -3,15 +3,15 @@ agents/fundamentals_agent.py
 
 Fundamentals Analyst -- adapted from TradingAgents' fundamentals analyst
 role. Pulls basic company financials via yfinance (free, no API key)
-and has an LLM (Gemini, same free tier already used by news_agent)
-interpret them into a directional signal for the CIO.
+and has an LLM (Gemini, GEMINI_MODEL, via the Interactions API -- same
+free tier already used by news_agent) interpret them into a directional
+signal for the CIO.
 """
 
-import json
 import logging
-import re
 
 from config import settings
+from services import gemini_service
 
 logger = logging.getLogger("fundamentals_agent")
 
@@ -34,13 +34,9 @@ Respond ONLY with a single valid JSON object, no markdown fences, no preamble:
 
 
 def _extract_json(text: str) -> dict:
-    text = text.strip()
-    text = re.sub(r"^```(json)?", "", text).strip()
-    text = re.sub(r"```$", "", text).strip()
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if not match:
-        raise ValueError("No JSON object found in model response.")
-    return json.loads(match.group(0))
+    """Tolerant JSON extraction — kept for local use/testing; the live path
+    parses through services.gemini_service (same logic)."""
+    return gemini_service._extract_json(text)
 
 
 def get_fundamentals(symbol: str) -> dict:
@@ -106,10 +102,6 @@ def analyze_fundamentals(symbol: str, fundamentals: dict) -> dict:
         return base_result
 
     try:
-        from google import genai
-
-        client = genai.Client(api_key=settings.GEMINI_API_KEY)
-
         metrics_text = (
             f"Symbol: {symbol}\n"
             f"P/E ratio: {fundamentals.get('pe_ratio')}\n"
@@ -119,15 +111,11 @@ def analyze_fundamentals(symbol: str, fundamentals: dict) -> dict:
             f"Debt-to-equity: {fundamentals.get('debt_to_equity')}\n"
             f"Return on equity: {fundamentals.get('return_on_equity')}\n"
         )
-        prompt = f"{SYSTEM_INSTRUCTIONS}\n\n{metrics_text}"
 
-        response = client.models.generate_content(
-            model=settings.GEMINI_MODEL,
-            contents=prompt,
+        parsed = gemini_service.generate_json(
+            system_instructions=SYSTEM_INSTRUCTIONS,
+            input_text=metrics_text,
         )
-
-        raw_text = response.text or ""
-        parsed = _extract_json(raw_text)
 
         base_result["signal"] = str(parsed.get("signal", "NEUTRAL")).upper()
         base_result["confidence"] = float(parsed.get("confidence", 0.0))

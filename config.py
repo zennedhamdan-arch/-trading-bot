@@ -53,7 +53,10 @@ class Settings:
     OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
 
     # --- Model identifiers ---
-    GEMINI_MODEL: str = "gemini-2.5-flash"
+    # Current default: Gemini 3.6 Flash via the Interactions API.
+    # Override with the GEMINI_MODEL environment variable ("models/..." prefix
+    # is tolerated and stripped).
+    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
     GROQ_TECH_MODEL: str = "llama-3.1-8b-instant"
     GROQ_CIO_MODEL: str = "llama-3.3-70b-versatile"
     OPENROUTER_RISK_MODEL: str = "deepseek/deepseek-r1:free"
