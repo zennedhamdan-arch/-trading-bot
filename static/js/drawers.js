@@ -111,7 +111,8 @@
 
     App.openDrawer(
       '<span class="sym" style="font-size:16px">' + U.esc(sym) + "</span>" +
-        (pl >= 0 ? '<span class="badge badge-buy">LONG</span>' : '<span class="badge badge-hold">LONG</span>'),
+        '<span class="badge">LONG</span>' +
+        '<span class="' + (pl >= 0 ? "pos" : "neg") + '" style="font-size:14px;font-weight:600;font-family:var(--font-mono)">' + U.fmtSigned(pl) + "</span>",
       "Position detail · Paper account",
       body,
       '<button class="btn btn-sm" data-action="goto" data-page="activity" data-sym="' + U.esc(sym) + '">' + ICON("activity") + "Symbol activity</button>" +
