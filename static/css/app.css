@@ -113,6 +113,10 @@
 .mt-8 { margin-top: 8px; }
 .mt-12 { margin-top: 12px; }
 
+/* KPI strip — desktop grid (6 tiles default, 4 on risk/cycles pages) */
+.kpi-strip { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; }
+.kpi-strip-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+
 /* == Mobile top bar & bottom nav ==================================================== */
 
 .mtop {
@@ -190,9 +194,11 @@
   .span-side { grid-column: 1; }
 
   /* KPI strip → horizontal scroll */
-  .kpi-strip {
+  .kpi-strip,
+  .kpi-strip.kpi-strip-4 {
     display: grid; grid-auto-flow: column;
     grid-auto-columns: minmax(148px, 44vw);
+    grid-template-columns: none;
     overflow-x: auto; gap: 8px;
     margin: 0 -12px; padding: 0 12px 4px;
     scroll-snap-type: x proximity;
@@ -254,6 +260,7 @@
 
 @media (min-width: 1024px) and (max-width: 1180px) {
   .kpi-strip { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .kpi-strip.kpi-strip-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 @media (max-width: 620px) {

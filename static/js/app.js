@@ -1033,6 +1033,7 @@
   });
 
   document.addEventListener("keydown", function (e) {
+    if (e.key === "Tab") trapFocus(e);
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openPalette(); }
     else if (e.key === "Escape") {
       if (qs("#palette-root").innerHTML) closePalette();
@@ -1042,6 +1043,19 @@
     }
     else if (e.key === "/" && !/input|textarea|select/i.test((e.target.tagName || ""))) { e.preventDefault(); openPalette(); }
   });
+
+  /* Focus trap: keeps Tab cycling inside the open dialog (WCAG). */
+  function trapFocus(e) {
+    var root = qs("#drawer-root .drawer") || qs("#modal-root .modal") || qs("#palette-root .palette");
+    if (!root) return;
+    var focusables = qsa('a[href], button:not([disabled]), input:not([disabled]), select, textarea, [tabindex]:not([tabindex="-1"])', root)
+      .filter(function (el) { return el.offsetParent !== null || el === document.activeElement; });
+    if (!focusables.length) return;
+    var first = focusables[0], last = focusables[focusables.length - 1];
+    if (!root.contains(document.activeElement)) { e.preventDefault(); first.focus(); }
+    else if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  }
 
   window.addEventListener("hashchange", renderRoute);
   var resizeT;

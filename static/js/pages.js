@@ -262,22 +262,25 @@
     }
 
     var acct = account();
-    var last = pts.length ? pts[pts.length - 1].v : (acct.portfolio_value || acct.equity);
+    var brokerDown = !!acct.error && !pts.length;
+    var last = pts.length ? pts[pts.length - 1].v : (brokerDown ? null : (acct.portfolio_value || acct.equity));
     var first = pts.length ? pts[0].v : null;
-    var delta = first != null ? last - first : null;
-    var deltaPct = first ? (delta / first) * 100 : null;
+    var delta = first != null && last != null ? last - first : null;
+    var deltaPct = first && last ? (delta / first) * 100 : null;
 
     var head =
       '<div class="chart-head">' +
         "<div>" +
           '<div class="lbl" style="margin-bottom:3px">Portfolio value</div>' +
-          '<span class="chart-big">' + U.fmtMoney(last) + "</span>" +
+          '<span class="chart-big">' + (last != null ? U.fmtMoney(last) : "—") + "</span>" +
           '<div class="chart-delta">' +
             (delta != null
               ? '<span class="' + U.classFor(delta) + '">' + U.fmtSigned(delta) + "</span>" +
                 '<span class="' + U.classFor(delta) + '">' + U.fmtPct(deltaPct) + "</span>" +
                 '<span class="t-faint" style="font-family:var(--font-ui);font-size:11px">· ' + cur + " range</span>"
-              : '<span class="t-faint">No history for this range</span>') +
+              : brokerDown
+                ? '<span class="t-faint">Broker API unreachable — no account data</span>'
+                : '<span class="t-faint">No history for this range</span>') +
           "</div>" +
         "</div>" +
         '<div class="spacer"></div>' +
@@ -758,7 +761,7 @@
     return (
       (store.demo ? window.DemoBanner : "") +
       accountErrorBanner(acct) +
-      '<div class="kpi-strip mb-12" style="grid-template-columns:repeat(4,minmax(0,1fr))">' +
+      '<div class="kpi-strip kpi-strip-4 mb-12">' +
         kpiTile("Portfolio Exposure", equity ? (invested / equity * 100).toFixed(1) + "%" : "—", '<span>' + U.fmtMoney(invested, { dec: 0 }) + " invested</span>") +
         kpiTile("Cash Exposure", cashPct != null ? cashPct.toFixed(1) + "%" : "—", '<span>' + U.fmtMoney(acct.cash || 0, { dec: 0 }) + " unallocated</span>") +
         kpiTile("Largest Position", maxPos ? U.esc(maxPos.symbol) : "—", maxPos ? U.fmtMoney(maxPos.market_value, { dec: 0 }) : '<span class="t-faint">Flat</span>') +
@@ -844,7 +847,7 @@
     return (
       (store.demo ? window.DemoBanner : "") +
       botOfflineBanner() +
-      '<div class="kpi-strip mb-12" style="grid-template-columns:repeat(4,minmax(0,1fr))">' +
+      '<div class="kpi-strip kpi-strip-4 mb-12">' +
         kpiTile("Last Cycle", cs[0] ? "#" + cs[0].id : "—", cs[0] ? '<span data-ago="' + U.esc(cs[0].started_at) + '">' + U.ago(cs[0].started_at) + "</span> · " + U.esc(String(cs[0].status).replace("_", " ")) : '<span class="t-faint">Never run</span>') +
         kpiTile("Next Scheduled", nextC, '<span>interval ' + iv + "m</span>") +
         kpiTile("Cycle Interval", iv + "m", '<span>scheduler ' + (st.running ? "running" : "paused") + "</span>") +
@@ -1262,6 +1265,4 @@
   App.PAGE_ICONS = PAGE_ICONS;
   App.PAGE_DESCS = PAGE_DESCS;
 
-  // expose demo history generator for app.js demo mode
-  App._demoHistoryRef = function () {};
 })();

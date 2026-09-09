@@ -261,7 +261,6 @@
           '<div class="pipe-sub">' + (sub || (log ? U.esc(log.message) : "")) + "</div>" +
           (meta.length ? '<div class="pipe-meta">' + meta.join("") + "</div>" : "") +
         "</div>" +
-        '<div class="feed-side"></div>' +
       "</div>"
     );
   }
