@@ -4,6 +4,7 @@ services/alpaca_service.py
 Wraps the alpaca-py SDK to provide:
   - Account / portfolio metrics
   - Open positions and recent orders
+  - Portfolio equity history (dashboard performance chart)
   - Historical candle data + technical indicators (RSI, SMA50, SMA200)
   - Market order execution (buy/sell)
 
@@ -21,14 +22,16 @@ import pandas as pd
 
 try:
     from alpaca.trading.client import TradingClient
-    from alpaca.trading.requests import MarketOrderRequest
+    from alpaca.trading.requests import MarketOrderRequest, GetPortfolioHistoryRequest
     from alpaca.trading.enums import OrderSide, TimeInForce
     from alpaca.data.historical import StockHistoricalDataClient
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame
+    from alpaca.data.enums import DataFeed
     ALPACA_SDK_AVAILABLE = True
 except ImportError:  # pragma: no cover - only hit if dependency missing
     ALPACA_SDK_AVAILABLE = False
+
 
 try:
     import ta
@@ -44,11 +47,33 @@ _trading_client: Optional["TradingClient"] = None
 _data_client: Optional["StockHistoricalDataClient"] = None
 
 
+def _resolve_feed() -> "DataFeed":
+    """Resolves the market-data feed from configuration.
+
+    The default is IEX: the free/paper Alpaca subscription does not permit
+    the SIP feed, and requesting it fails with
+    "subscription does not permit querying recent SIP data". Paid accounts
+    can set ALPACA_DATA_FEED=SIP.
+    """
+    if not ALPACA_SDK_AVAILABLE:
+        return None
+    wanted = (settings.ALPACA_DATA_FEED or "IEX").upper()
+    if wanted == "SIP":
+        return DataFeed.SIP
+    if wanted == "OTC":
+        return DataFeed.OTC
+    if wanted != "IEX":
+        logger.warning(f"Unknown ALPACA_DATA_FEED '{wanted}'; falling back to IEX.")
+    return DataFeed.IEX
+
+
 def _get_trading_client():
     """Lazily instantiate and cache the Alpaca trading client."""
     global _trading_client
     if not ALPACA_SDK_AVAILABLE:
         raise RuntimeError("alpaca-py SDK is not installed.")
+    if _trading_client is not None:
+        return _trading_client
     if not settings.ALPACA_API_KEY or not settings.ALPACA_SECRET_KEY:
         raise RuntimeError("Alpaca API keys are not configured.")
     if _trading_client is None:
@@ -65,6 +90,8 @@ def _get_data_client():
     global _data_client
     if not ALPACA_SDK_AVAILABLE:
         raise RuntimeError("alpaca-py SDK is not installed.")
+    if _data_client is not None:
+        return _data_client
     if not settings.ALPACA_API_KEY or not settings.ALPACA_SECRET_KEY:
         raise RuntimeError("Alpaca API keys are not configured.")
     if _data_client is None:
@@ -157,16 +184,29 @@ def get_recent_orders(limit: int = 20) -> dict:
         return {"orders": [], "error": str(e)}
 
 
-def get_portfolio_history(period: str = "1M", timeframe: str = "1D") -> dict:
-    """Returns historical equity curve data points for charting."""
+def get_portfolio_history(period: str = "1M", timeframe: Optional[str] = None) -> dict:
+    """Returns historical equity curve data points for charting.
+
+    Uses TradingClient.get_portfolio_history() with a GetPortfolioHistoryRequest
+    (the correct alpaca-py API — this service previously called a method that
+    does not exist on the installed SDK and always failed). Equity values the
+    API reports as null are filtered out; nothing is interpolated or fabricated.
+    """
     try:
         client = _get_trading_client()
-        kwargs = {"history_filter": None}
-        if period:
-            kwargs["period"] = period
-        history = client.get_portfolio_history(**kwargs)
-        timestamps = history.timestamp or []
-        equity = history.equity or []
+        if timeframe is None:
+            # Intraday bars make the 1D chart meaningful; daily for longer ranges.
+            timeframe = "5Min" if period == "1D" else "1D"
+        history = client.get_portfolio_history(
+            history_filter=GetPortfolioHistoryRequest(period=period, timeframe=timeframe)
+        )
+
+        if isinstance(history, dict):
+            timestamps = history.get("timestamp") or []
+            equity = history.get("equity") or []
+        else:
+            timestamps = getattr(history, "timestamp", None) or []
+            equity = getattr(history, "equity", None) or []
         points = [
             {"timestamp": ts, "equity": eq}
             for ts, eq in zip(timestamps, equity)
@@ -196,6 +236,7 @@ def get_indicators(symbol: str, lookback_days: int = 250) -> dict:
             timeframe=TimeFrame.Day,
             start=start,
             end=end,
+            feed=_resolve_feed(),
         )
         bars = data_client.get_stock_bars(req)
         df = bars.df

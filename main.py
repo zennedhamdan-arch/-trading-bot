@@ -143,11 +143,52 @@ def _get_agent_weights() -> dict:
     return weights
 
 
+PIPELINE_STAGES = ("market_data", "technical", "news", "fundamentals", "debate", "risk", "cio", "execution", "memory")
+
+
+def _new_symbol_status() -> dict:
+    """Per-symbol, per-agent execution status for one cycle.
+    Values: OK | ERROR | UNAVAILABLE | SKIPPED."""
+    return {stage: "SKIPPED" for stage in PIPELINE_STAGES}
+
+
+def _report_level(report: dict) -> str:
+    """Agent reports are logged to the dashboard feed at ERROR level when the
+    agent itself reported an error — failures must be visible, not hidden
+    behind INFO entries."""
+    return "ERROR" if report and report.get("error") else "INFO"
+
+
+def _compute_cycle_status(cycle_record: dict, cycle_summary: dict) -> str:
+    """Honest cycle status.
+
+    ERROR        - the cycle aborted (e.g. broker unreachable) or every
+                   symbol failed outright.
+    PARTIAL_ERROR- any pipeline stage across any symbol errored or its data
+                   source was unavailable. The scheduler's "job executed
+                   successfully" NEVER implies cycle OK.
+    OK           - every enabled stage ran cleanly for every symbol.
+    """
+    if not cycle_summary["symbols_processed"] and cycle_summary["errors"]:
+        return "ERROR"
+    agent_status = cycle_record.get("agent_status") or {}
+    for symbol_status in agent_status.values():
+        for stage, status in symbol_status.items():
+            if status in ("ERROR", "UNAVAILABLE"):
+                return "PARTIAL_ERROR"
+    return "OK"
+
+
 async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
     """
     Executes one full agent decision cycle across the entire trade
     universe. This is the core loop used by both the scheduled job and
     the manual '/api/bot/run-now' endpoint.
+
+    Every stage for every symbol is tracked in cycle_record["agent_status"]
+    (OK / ERROR / UNAVAILABLE / SKIPPED) and the final cycle status is
+    computed from those — a cycle is only OK when every enabled stage
+    actually succeeded.
     """
     global _active_cycle
     cycle_summary = {"triggered_by": triggered_by, "symbols_processed": [], "errors": []}
@@ -166,6 +207,7 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
         "symbols_processed": [],
         "decisions": [],
         "orders": [],
+        "agent_status": {},
         "warnings": 0,
         "errors": [],
     }
@@ -199,44 +241,66 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
     agent_weights = _get_agent_weights()
 
     for symbol in settings.TRADE_UNIVERSE:
+        status = _new_symbol_status()
+        cycle_record["agent_status"][symbol] = status
+        current_stage = "market_data"
         try:
-            # 1. Technical analysis
+            # 1. Market data (bars + indicators)
             indicators = alpaca_service.get_indicators(symbol)
+            status["market_data"] = "ERROR" if indicators.get("error") else "OK"
+
+            # 2. Technical analysis
+            current_stage = "technical"
             tech_report = tech_agent.analyze_technicals(symbol, indicators)
-            _log_event({"agent": "technical", "symbol": symbol, "level": "INFO",
+            status["technical"] = "ERROR" if tech_report.get("error") else "OK"
+            _log_event({"agent": "technical", "symbol": symbol, "level": _report_level(tech_report),
                         "message": tech_report["summary"], "data": tech_report})
 
-            # 2. News/sentiment analysis
+            # 3. News/sentiment analysis
+            current_stage = "news"
             headlines = _placeholder_headlines(symbol)
             news_report = news_agent.analyze_news(symbol, headlines)
-            _log_event({"agent": "news", "symbol": symbol, "level": "INFO",
+            status["news"] = "ERROR" if news_report.get("error") else "OK"
+            _log_event({"agent": "news", "symbol": symbol, "level": _report_level(news_report),
                         "message": news_report["summary"], "data": news_report})
 
-            # 3. Fundamentals analysis (new -- free via yfinance)
+            # 4. Fundamentals analysis (free via yfinance)
+            current_stage = "fundamentals"
             fundamentals_report = None
             if settings.ENABLE_FUNDAMENTALS_AGENT:
                 fundamentals_data = fundamentals_agent.get_fundamentals(symbol)
                 fundamentals_report = fundamentals_agent.analyze_fundamentals(symbol, fundamentals_data)
-                _log_event({"agent": "fundamentals", "symbol": symbol, "level": "INFO",
+                # Distinguish provider unavailability (Yahoo 429 etc.) from an
+                # agent/LLM failure — both are recorded honestly.
+                if fundamentals_data.get("error"):
+                    status["fundamentals"] = "UNAVAILABLE"
+                else:
+                    status["fundamentals"] = "ERROR" if fundamentals_report.get("error") else "OK"
+                _log_event({"agent": "fundamentals", "symbol": symbol, "level": _report_level(fundamentals_report),
                             "message": fundamentals_report["summary"], "data": fundamentals_report})
 
-            # 4. Bull vs Bear debate (new)
+            # 5. Bull vs Bear debate
+            current_stage = "debate"
             debate_report = None
             if settings.ENABLE_DEBATE:
                 debate_report = debate_agent.run_debate(symbol, tech_report, news_report, fundamentals_report)
-                _log_event({"agent": "debate", "symbol": symbol, "level": "INFO",
+                status["debate"] = "ERROR" if debate_report.get("error") else "OK"
+                _log_event({"agent": "debate", "symbol": symbol, "level": _report_level(debate_report),
                             "message": f"Bull({debate_report['bull_strength']}) vs "
                                        f"Bear({debate_report['bear_strength']}), edge={debate_report['edge']}",
                             "data": debate_report})
 
-            # 5. Risk assessment (only meaningful ahead of a potential BUY,
+            # 6. Risk assessment (only meaningful ahead of a potential BUY,
             # but we compute it every cycle so the CIO always has it)
+            current_stage = "risk"
             existing_position = positions_by_symbol.get(symbol)
             risk_report = risk_agent.assess_risk(symbol, "buy", account_summary, existing_position)
-            _log_event({"agent": "risk", "symbol": symbol, "level": "INFO",
+            status["risk"] = "ERROR" if risk_report.get("error") else "OK"
+            _log_event({"agent": "risk", "symbol": symbol, "level": _report_level(risk_report),
                         "message": risk_report["reasoning"], "data": risk_report})
 
-            # 6. Executive decision, now with fundamentals + debate + memory context
+            # 7. Executive decision, with fundamentals + debate + memory context
+            current_stage = "cio"
             memory_summary = (
                 memory_service.get_recent_outcomes_summary(symbol=symbol, lookback=10)
                 if settings.ENABLE_MEMORY else ""
@@ -248,7 +312,8 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
                 agent_weights=agent_weights,
                 memory_summary=memory_summary,
             )
-            _log_event({"agent": "cio", "symbol": symbol, "level": "INFO",
+            status["cio"] = "ERROR" if decision_report.get("error") else "OK"
+            _log_event({"agent": "cio", "symbol": symbol, "level": _report_level(decision_report),
                         "message": f"{decision_report['decision']}: {decision_report['reasoning']}",
                         "data": decision_report})
 
@@ -259,19 +324,24 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
                 "notional_usd": decision_report.get("notional_usd"),
             })
 
-            # 7. Execute if actionable
+            # 8. Execute if actionable
+            current_stage = "execution"
             trade_result = None
             decision = decision_report["decision"]
+            order_attempted = False
             if decision == "BUY" and decision_report["notional_usd"] > 0:
+                order_attempted = True
                 trade_result = alpaca_service.execute_order(
                     symbol, "buy", notional_usd=decision_report["notional_usd"]
                 )
             elif decision == "SELL" and existing_position:
+                order_attempted = True
                 trade_result = alpaca_service.execute_order(
                     symbol, "sell", qty=existing_position["qty"]
                 )
 
-            if trade_result:
+            if order_attempted:
+                status["execution"] = "OK" if trade_result.get("success") else "ERROR"
                 level = "INFO" if trade_result.get("success") else "ERROR"
                 _log_event({
                     "agent": "execution", "symbol": symbol, "level": level,
@@ -292,29 +362,38 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
                     "qty": trade_result.get("qty"),
                     "error": trade_result.get("error"),
                 })
+            # else: no order required (HOLD / no position to sell) -> stays SKIPPED
 
-            # 8. Record this decision to persistent memory for future learning
+            # 9. Record this decision to persistent memory for future learning
+            current_stage = "memory"
             if settings.ENABLE_MEMORY and decision == "BUY" and trade_result and trade_result.get("success"):
                 entry_price = indicators.get("latest_close")
                 memory_service.record_decision(
                     symbol, decision_report, tech_report, news_report,
                     fundamentals_report or {}, debate_report or {}, entry_price,
                 )
+                status["memory"] = "OK"
 
             cycle_summary["symbols_processed"].append(symbol)
 
         except Exception as e:
-            logger.error(f"Cycle error for {symbol}: {e}")
-            _log_event({"agent": "system", "symbol": symbol, "level": "ERROR", "message": str(e)})
-            cycle_summary["errors"].append(f"{symbol}: {e}")
+            logger.error(f"Cycle error for {symbol} at stage '{current_stage}': {e}")
+            status[current_stage] = "ERROR"
+            _log_event({"agent": "system", "symbol": symbol, "level": "ERROR",
+                        "message": f"Pipeline aborted at stage '{current_stage}': {e}"})
+            cycle_summary["errors"].append(f"{symbol} ({current_stage}): {e}")
 
     _previous_positions.clear()
     _previous_positions.update(positions_by_symbol)
 
+    cycle_status = _compute_cycle_status(cycle_record, cycle_summary)
     bot_state["last_cycle_at"] = datetime.now(timezone.utc).isoformat()
-    bot_state["last_cycle_status"] = "OK" if not cycle_summary["errors"] else "PARTIAL_ERROR"
-    _finish_cycle_record(bot_state["last_cycle_status"])
-    logger.info(f"Cycle complete. Processed: {cycle_summary['symbols_processed']}")
+    bot_state["last_cycle_status"] = cycle_status
+    _finish_cycle_record(cycle_status)
+    logger.info(
+        f"Cycle complete. Status: {cycle_status}. "
+        f"Processed: {cycle_summary['symbols_processed']}. Errors: {cycle_summary['errors']}"
+    )
     return cycle_summary
 
 
@@ -445,6 +524,7 @@ async def api_config():
         "enable_debate": settings.ENABLE_DEBATE,
         "enable_memory": settings.ENABLE_MEMORY,
         "trading_mode": "PAPER",  # this application is hardcoded to paper trading
+        "alpaca_data_feed": settings.ALPACA_DATA_FEED,
         "memory_db_path": settings.MEMORY_DB_PATH,
         "agent_accuracy_lookback": settings.AGENT_ACCURACY_LOOKBACK,
         "warnings": warnings,

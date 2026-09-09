@@ -41,6 +41,29 @@ per-cycle execution records (Cycles), risk verdicts (Risk), agent accuracy
 sample data (hatched amber banner on every screen) — useful for evaluating the
 design without a running bot. It never mixes with live data.
 
+## Operational notes
+
+- **Market data**: defaults to the **IEX** feed (`ALPACA_DATA_FEED=IEX`) because
+  the free Alpaca paper subscription cannot query SIP. Set `ALPACA_DATA_FEED=SIP`
+  only on a paid subscription.
+- **Fundamentals**: yfinance responses are cached per symbol (60 min default),
+  live calls are paced, and HTTP 429s trigger a global backoff — during
+  unavailability the agent reports `DATA_UNAVAILABLE` and the cycle is honestly
+  marked `PARTIAL_ERROR`, never faked.
+- **Cycle integrity**: every cycle records per-symbol, per-agent status
+  (`OK` / `ERROR` / `UNAVAILABLE` / `SKIPPED`) for all 9 stages. The cycle
+  status is computed from those records — the scheduler completing a job never
+  implies the trading cycle was healthy. See the cycle drawer's
+  "Agent Execution" matrix.
+
+## Running the tests
+
+```bash
+.venv/bin/python tests/test_gemini_migration.py   # Gemini 3.6 / Interactions API
+.venv/bin/python tests/test_production_fixes.py   # httpx/proxies, IEX, history, 429, cycle integrity
+.venv/bin/python tests/test_full_pipeline.py      # full cycle, real agents, stubbed transports
+```
+
 ## Repository layout
 
 ```
