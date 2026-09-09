@@ -244,6 +244,8 @@
     orders: function (limit) { return get("/api/orders?limit=" + (limit || 100)); },
     history: function (period) { return get("/api/history?period=" + encodeURIComponent(period || "1M")); },
     config: function () { return get("/api/config"); },
+    health: function () { return get("/api/health"); },
+    realtime: function () { return get("/api/realtime"); },
     botStart: function () { return post("/api/bot/start"); },
     botStop: function () { return post("/api/bot/stop"); },
     runNow: function () { return post("/api/bot/run-now"); },

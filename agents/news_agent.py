@@ -98,11 +98,6 @@ def analyze_news(symbol: str, headlines: list) -> dict:
         "cached": False,
     }
 
-    if not settings.GEMINI_API_KEY:
-        base_result["error"] = "GEMINI_API_KEY not configured."
-        base_result["summary"] = "News agent disabled: missing API key."
-        return base_result
-
     if not headlines:
         base_result["llm_status"] = "SKIPPED_NO_DATA"
         base_result["summary"] = "No recent headlines available for this symbol."
@@ -139,7 +134,11 @@ def analyze_news(symbol: str, headlines: list) -> dict:
     if not result.ok:
         logger.error(f"News agent failed for {symbol}: {result.error}")
         base_result["error"] = result.error
-        base_result["summary"] = "News agent encountered an error; defaulting to NEUTRAL."
+        base_result["summary"] = (
+            "News agent disabled: missing API key."
+            if result.status == "NOT_CONFIGURED"
+            else "News agent encountered an error; defaulting to NEUTRAL."
+        )
         return base_result
 
     parsed = result.parsed

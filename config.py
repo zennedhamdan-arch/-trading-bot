@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-def _get_bool(name: str, default: bool = False) -> bool:
+def _get_bool(name: str, default: bool) -> bool:
     val = os.getenv(name)
     if val is None:
         return default
@@ -47,75 +47,122 @@ def _get_str(name: str, default: str = "") -> str:
 
 
 class Settings:
-    # --- Alpaca ---
+    # --- Alpaca (primary market data + paper execution) ---
     ALPACA_API_KEY: str = os.getenv("ALPACA_API_KEY", "")
     ALPACA_SECRET_KEY: str = os.getenv("ALPACA_SECRET_KEY", "")
     ALPACA_BASE_URL: str = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
     # This app is hardcoded to paper trading. Do not point it at a live endpoint.
     ALPACA_PAPER: bool = True
+    # Market-data feed. The free/paper subscription only permits IEX;
+    # requesting SIP fails with "subscription does not permit querying
+    # recent SIP data". The feed is NEVER switched silently: if a
+    # configured feed is not permitted, data calls fail honestly with
+    # DATA_UNAVAILABLE (SUBSCRIPTION_FEED_UNAVAILABLE).
+    ALPACA_DATA_FEED: str = os.getenv("ALPACA_DATA_FEED", "IEX").strip().upper() or "IEX"
 
-    # --- LLM Providers ---
+    # --- LLM provider credentials ---
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
     OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
+    NVIDIA_API_KEY: str = os.getenv("NVIDIA_API_KEY", "")
 
-    # --- Model identifiers (all env-configurable) ---
-    # Defaults are verified against the providers' CURRENT catalogs
-    # (September 2026). Groq shut down llama-3.1-8b-instant and
-    # llama-3.3-70b-versatile on 2026-08-16 (they are Enterprise-only now);
-    # Groq's recommended replacements are the GPT-OSS models below.
-    # https://console.groq.com/docs/deprecations
-    # OpenRouter's deepseek/deepseek-r1:free free variant is no longer
-    # usable; openai/gpt-oss-20b:free is verified free today.
-    # Model ids are validated against each provider's live /models endpoint
-    # at startup (services/llm_service.validate_models).
-    GEMINI_MODEL: str = _get_str("GEMINI_MODEL", "gemini-3.6-flash")
+    # --- LLM routing (provider per task; resolved at call time) ---
+    # Any task can be pointed at any configured provider. Defaults keep
+    # every reasoning task on Groq (verified models) except news/fundamentals
+    # interpretation, which stays on Gemini. OpenRouter became optional after
+    # its free risk model was withdrawn (404 MODEL_NOT_FOUND in production).
+    LLM_TECH_PROVIDER: str = _get_str("LLM_TECH_PROVIDER", "groq").lower()
+    LLM_DEBATE_PROVIDER: str = _get_str("LLM_DEBATE_PROVIDER", "groq").lower()
+    LLM_RISK_PROVIDER: str = _get_str("LLM_RISK_PROVIDER", "groq").lower()
+    LLM_CIO_PROVIDER: str = _get_str("LLM_CIO_PROVIDER", "groq").lower()
+    LLM_NEWS_PROVIDER: str = _get_str("LLM_NEWS_PROVIDER", "gemini").lower()
+    LLM_FUNDAMENTALS_PROVIDER: str = _get_str("LLM_FUNDAMENTALS_PROVIDER", "gemini").lower()
+
+    # --- Model identifiers (all env-configurable; defaults verified against
+    # the providers' live catalogs in September 2026) ---
+    # Groq shut down llama-3.1-8b-instant / llama-3.3-70b-versatile on
+    # 2026-08-16 (Enterprise-only). The defaults below are Groq's recommended
+    # replacements (https://console.groq.com/docs/deprecations) and are
+    # re-verified against the live /models catalog at startup.
     GROQ_TECH_MODEL: str = _get_str("GROQ_TECH_MODEL", "openai/gpt-oss-20b")
     GROQ_DEBATE_MODEL: str = _get_str("GROQ_DEBATE_MODEL", "openai/gpt-oss-20b")
+    GROQ_RISK_MODEL: str = _get_str("GROQ_RISK_MODEL", "openai/gpt-oss-20b")
     GROQ_CIO_MODEL: str = _get_str("GROQ_CIO_MODEL", "openai/gpt-oss-120b")
-    OPENROUTER_RISK_MODEL: str = _get_str("OPENROUTER_RISK_MODEL", "openai/gpt-oss-20b:free")
+    # OpenRouter: OPTIONAL. Only used when a model is EXPLICITLY configured
+    # and verified available for the account. Empty default = not routed.
+    # (OPENROUTER_RISK_MODEL is read as a legacy fallback.)
+    OPENROUTER_MODEL: str = _get_str("OPENROUTER_MODEL", "") or _get_str("OPENROUTER_RISK_MODEL", "")
     OPENROUTER_BASE_URL: str = _get_str("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+    # NVIDIA: OPTIONAL secondary provider (OpenAI-compatible NIM endpoint;
+    # base URL overridable). Usable as fallback/alternative/selected tasks.
+    NVIDIA_MODEL: str = _get_str("NVIDIA_MODEL", "")
+    NVIDIA_BASE_URL: str = _get_str("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
+    # Gemini (news/fundamentals interpretation; NOT the high-frequency
+    # backbone — its free tier allows 20 requests/day, protected below).
+    GEMINI_MODEL: str = _get_str("GEMINI_MODEL", "gemini-3.6-flash")
 
-    # Optional explicit fallback models. Empty (default) = NO fallback: an
-    # agent whose model fails is marked failed/unavailable, never silently
-    # rerouted. A configured fallback is used ONLY after startup validation
-    # confirms it exists on the same provider, and never for quota errors
-    # (a fallback on the same provider shares the account's quota).
-    GROQ_TECH_FALLBACK_MODEL: str = _get_str("GROQ_TECH_FALLBACK_MODEL", "")
-    GROQ_DEBATE_FALLBACK_MODEL: str = _get_str("GROQ_DEBATE_FALLBACK_MODEL", "")
-    GROQ_CIO_FALLBACK_MODEL: str = _get_str("GROQ_CIO_FALLBACK_MODEL", "")
-    OPENROUTER_RISK_FALLBACK_MODEL: str = _get_str("OPENROUTER_RISK_FALLBACK_MODEL", "")
-    GEMINI_FALLBACK_MODEL: str = _get_str("GEMINI_FALLBACK_MODEL", "")
+    # --- Global LLM fallback route (optional, explicit, verified) ---
+    # Used when a task's primary route fails with MODEL_NOT_FOUND /
+    # PROVIDER_ERROR / AUTH_ERROR / NETWORK_ERROR — never for quota errors
+    # (quota exhaustion is reported honestly, not routed around) and never
+    # as a silent switch. Both values must be set; the fallback model is
+    # verified against the fallback provider's live catalog at startup.
+    LLM_FALLBACK_PROVIDER: str = _get_str("LLM_FALLBACK_PROVIDER", "").lower()
+    LLM_FALLBACK_MODEL: str = _get_str("LLM_FALLBACK_MODEL", "")
 
     # --- LLM quota protection (free-tier friendly) ---
-    # Local rolling-24h request budgets per provider. When the budget is
-    # reached, further requests short-circuit with PROVIDER_QUOTA_EXCEEDED
-    # instead of hammering the provider into 429s. 0 disables the local cap.
-    # The observed Gemini free tier allows 20 requests/day for
-    # gemini-3.6-flash (quota metric GenerateContentFreeTierRequests),
-    # hence the default of 20.
+    # Local rolling-24h request budgets per provider. 0 disables the local
+    # cap. The observed Gemini free tier limit for gemini-3.6-flash is
+    # 20 requests/day (quota metric GenerateContentFreeTierRequests).
     GEMINI_DAILY_REQUEST_LIMIT: int = _get_int("GEMINI_DAILY_REQUEST_LIMIT", 20)
     GROQ_DAILY_REQUEST_LIMIT: int = _get_int("GROQ_DAILY_REQUEST_LIMIT", 0)
     OPENROUTER_DAILY_REQUEST_LIMIT: int = _get_int("OPENROUTER_DAILY_REQUEST_LIMIT", 0)
-    # How long to stop calling a provider after a server-side quota-exhausted
+    NVIDIA_DAILY_REQUEST_LIMIT: int = _get_int("NVIDIA_DAILY_REQUEST_LIMIT", 0)
+    # Minutes to stop calling a provider after a server-side quota-exhausted
     # (429) error that carries no usable retry delay.
     GEMINI_QUOTA_BACKOFF_MINUTES: float = _get_float("GEMINI_QUOTA_BACKOFF_MINUTES", 60)
     GROQ_QUOTA_BACKOFF_MINUTES: float = _get_float("GROQ_QUOTA_BACKOFF_MINUTES", 10)
     OPENROUTER_QUOTA_BACKOFF_MINUTES: float = _get_float("OPENROUTER_QUOTA_BACKOFF_MINUTES", 60)
-    # Retries are ONLY for transient rate limits (429 with a short retry
-    # delay). Quota exhaustion is never retried. Default: at most 1 retry,
-    # and never wait longer than 30s for it.
+    NVIDIA_QUOTA_BACKOFF_MINUTES: float = _get_float("NVIDIA_QUOTA_BACKOFF_MINUTES", 60)
+    # Retries ONLY for transient rate limits (429 with a short explicit
+    # retry delay); quota exhaustion is never retried.
     LLM_RATE_LIMIT_MAX_RETRIES: int = _get_int("LLM_RATE_LIMIT_MAX_RETRIES", 1)
     LLM_RATE_LIMIT_MAX_WAIT_SECONDS: float = _get_float("LLM_RATE_LIMIT_MAX_WAIT_SECONDS", 30)
 
+    # --- LLM circuit breakers ---
+    # After a 404 MODEL_NOT_FOUND, the (provider, model) pair is short-
+    # circuited for this long — no repeated requests to a dead model.
+    MODEL_UNAVAILABLE_COOLDOWN_MINUTES: float = _get_float("MODEL_UNAVAILABLE_COOLDOWN_MINUTES", 30)
+    # After an authentication failure (401/403), the provider is short-
+    # circuited for this long — no repeated auth failures.
+    AUTH_COOLDOWN_MINUTES: float = _get_float("AUTH_COOLDOWN_MINUTES", 60)
+
     # --- LLM analysis reuse (avoid re-sending identical context) ---
     # The news and fundamentals agents cache their LLM analysis keyed by the
-    # exact input (headlines / metrics). While the input is unchanged, the
-    # cached analysis is reused and NO new request is sent. These TTLs bound
-    # how long an unchanged-input analysis stays valid. This is what keeps a
-    # 15-minute cycle cadence inside the Gemini free tier's 20 requests/day.
+    # exact input. While the input is unchanged, the cached analysis is
+    # reused and NO new request is sent. This is what keeps a 15-minute
+    # cycle cadence inside the Gemini free tier's 20 requests/day.
     NEWS_ANALYSIS_CACHE_TTL_MINUTES: float = _get_float("NEWS_ANALYSIS_CACHE_TTL_MINUTES", 240)
     FUNDAMENTALS_ANALYSIS_CACHE_TTL_MINUTES: float = _get_float("FUNDAMENTALS_ANALYSIS_CACHE_TTL_MINUTES", 480)
+
+    # --- Fundamentals data providers ---
+    # "none" (default): no fundamentals provider configured — the fundamentals
+    # agent reports DATA_UNAVAILABLE and the cycle continues on price data,
+    # technicals, news and risk. Providers are pluggable (implement
+    # services/fundamentals_service.FundamentalsProvider); nothing scrapes
+    # Yahoo Finance or relies on Yahoo cookies/crumbs. yfinance is GONE.
+    FUNDAMENTALS_PROVIDER: str = _get_str("FUNDAMENTALS_PROVIDER", "none").lower()
+    FUNDAMENTALS_FALLBACK_PROVIDER: str = _get_str("FUNDAMENTALS_FALLBACK_PROVIDER", "").lower()
+    # Seconds a fundamentals result (success or unavailability) is cached per
+    # symbol so one cycle never asks twice.
+    FUNDAMENTALS_RESULT_CACHE_TTL_SECONDS: float = _get_float("FUNDAMENTALS_RESULT_CACHE_TTL_SECONDS", 60)
+
+    # --- Real-time market data (Alpaca WebSockets; optional) ---
+    # Trades + quotes + minute bars + news stream for the trade universe.
+    # Purely a dashboard/observability layer: ticks NEVER trigger LLM calls;
+    # the AI cycle stays on its scheduled interval.
+    REALTIME_ENABLED: bool = _get_bool("REALTIME_ENABLED", True)
+    REALTIME_RECONNECT_SECONDS: float = _get_float("REALTIME_RECONNECT_SECONDS", 30)
 
     # --- Bot behavior ---
     TRADE_UNIVERSE: list = [
@@ -126,23 +173,7 @@ class Settings:
     CYCLE_INTERVAL_MINUTES: int = _get_int("CYCLE_INTERVAL_MINUTES", 15)
     MAX_POSITION_PCT: float = _get_float("MAX_POSITION_PCT", 0.10)
 
-    # --- Market data ---
-    # The free Alpaca paper-trading subscription only permits the IEX feed;
-    # requesting the SIP feed fails with "subscription does not permit
-    # querying recent SIP data". Default to IEX; set ALPACA_DATA_FEED=SIP on
-    # a paid subscription.
-    ALPACA_DATA_FEED: str = os.getenv("ALPACA_DATA_FEED", "IEX").strip().upper() or "IEX"
-
-    # --- Fundamentals data layer (yfinance rate-limit protection) ---
-    # How long a successful fundamentals fetch is cached per symbol.
-    FUNDAMENTALS_CACHE_TTL_MINUTES: int = _get_int("FUNDAMENTALS_CACHE_TTL_MINUTES", 60)
-    # Minimum spacing between two live yfinance calls (they share one
-    # rate-limit budget across symbols).
-    FUNDAMENTALS_MIN_INTERVAL_SECONDS: float = _get_float("FUNDAMENTALS_MIN_INTERVAL_SECONDS", 2.0)
-    # After an HTTP 429, back off from yfinance entirely for this long.
-    FUNDAMENTALS_RATE_LIMIT_BACKOFF_MINUTES: float = _get_float("FUNDAMENTALS_RATE_LIMIT_BACKOFF_MINUTES", 10)
-
-    # --- New feature toggles (all free to run) ---
+    # --- Feature toggles ---
     ENABLE_FUNDAMENTALS_AGENT: bool = _get_bool("ENABLE_FUNDAMENTALS_AGENT", True)
     ENABLE_DEBATE: bool = _get_bool("ENABLE_DEBATE", True)
     ENABLE_MEMORY: bool = _get_bool("ENABLE_MEMORY", True)
@@ -157,11 +188,17 @@ class Settings:
         if not self.ALPACA_API_KEY or not self.ALPACA_SECRET_KEY:
             warnings.append("Alpaca API keys are not set. Trading functions will fail.")
         if not self.GEMINI_API_KEY:
-            warnings.append("GEMINI_API_KEY is not set. News/Sentiment agent will be disabled.")
+            warnings.append("GEMINI_API_KEY is not set. News sentiment interpretation will be unavailable.")
         if not self.GROQ_API_KEY:
-            warnings.append("GROQ_API_KEY is not set. Technical + CIO agents will be disabled.")
+            warnings.append("GROQ_API_KEY is not set. Technical/Debate/Risk/CIO agents will be unavailable.")
         if not self.OPENROUTER_API_KEY:
-            warnings.append("OPENROUTER_API_KEY is not set. Risk agent will be disabled.")
+            warnings.append("OPENROUTER_API_KEY is not set. OpenRouter will be unavailable (optional provider).")
+        if self.OPENROUTER_API_KEY and not self.OPENROUTER_MODEL:
+            warnings.append("OPENROUTER_API_KEY is set but OPENROUTER_MODEL is not; OpenRouter is not routed to any task.")
+        if not self.NVIDIA_API_KEY:
+            warnings.append("NVIDIA_API_KEY is not set. NVIDIA LLM provider is not configured (optional).")
+        if self.FUNDAMENTALS_PROVIDER == "none":
+            warnings.append("No fundamentals provider configured (FUNDAMENTALS_PROVIDER=none); fundamentals analysis will report DATA_UNAVAILABLE.")
         return warnings
 
 

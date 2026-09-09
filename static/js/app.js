@@ -157,8 +157,20 @@
     await Promise.all([
       fetchEndpoint("orders", function () { return API.orders(100); }),
       fetchEndpoint("config", API.config),
+      fetchEndpoint("health", API.health),
     ]);
     afterDataTick();
+  }
+
+  async function pollRealtime() {
+    if (store.demo) return;
+    await fetchEndpoint("realtime", API.realtime);
+    // Real-time ticks only refresh the live strip, never a full re-render
+    // (and NEVER an LLM call — the AI cycle stays on its scheduler).
+    var el = document.getElementById("live-strip");
+    if (el && typeof window.App.updateLiveStrip === "function") {
+      try { window.App.updateLiveStrip(el); } catch (e) { /* strip optional */ }
+    }
   }
 
   function afterDataTick() {
@@ -199,9 +211,10 @@
 
   function startPolling() {
     if (store.demo) { recomputeDerived(); return; }
-    pollLight(); pollSlow();
+    pollLight(); pollSlow(); pollRealtime();
     setInterval(function () { pollLight(); }, POLL_FAST_MS);
     setInterval(function () { pollSlow(); }, POLL_SLOW_MS);
+    setInterval(function () { pollRealtime(); }, 10000);
     setInterval(tickAgo, 1000);
   }
 
@@ -906,6 +919,27 @@
                   by_agent: { risk: { requests: 5, ok: 5, errors: {} } },
                   by_symbol: {} },
         },
+        agent_results: {
+          market_data: { ok: 5, unavailable: 0, error: 0, skipped: 0, total: 5 },
+          technical: { ok: 5, unavailable: 0, error: 0, skipped: 0, total: 5 },
+          news: c.status === "PARTIAL_ERROR" ? { ok: 4, unavailable: 1, error: 0, skipped: 0, total: 5 } : { ok: 5, unavailable: 0, error: 0, skipped: 0, total: 5 },
+          fundamentals: { ok: 0, unavailable: 0, error: 0, skipped: 5, total: 5 },
+          debate: { ok: 5, unavailable: 0, error: 0, skipped: 0, total: 5 },
+          risk: { ok: 5, unavailable: 0, error: 0, skipped: 0, total: 5 },
+          cio: { ok: 5, unavailable: 0, error: 0, skipped: 0, total: 5 },
+          execution: c.id === 1842 ? { ok: 1, unavailable: 0, error: 0, skipped: 4, total: 5 } : { ok: 0, unavailable: 0, error: 0, skipped: 5, total: 5 },
+          memory: { ok: 0, unavailable: 0, error: 0, skipped: 5, total: 5 },
+        },
+        provider_results: {
+          llm_states: {
+            groq: { state: "READY", detail: "20 requests in last 24h" },
+            gemini: { state: "READY", detail: "5 requests in last 24h" },
+            nvidia: { state: "NOT_CONFIGURED", detail: "NVIDIA_API_KEY not set" },
+            openrouter: { state: "NOT_CONFIGURED", detail: "OPENROUTER_MODEL not set" },
+          },
+          market_data: { feed: "IEX", symbols_ok: 5, symbols_unavailable: 0 },
+          fundamentals: { provider: "none", symbols_ok: 0, symbols_unavailable: 5 },
+        },
         warnings: c.status === "PARTIAL_ERROR" ? 1 : 0,
         errors: c.status === "PARTIAL_ERROR" ? ["TSLA: News fetch failed: Alpaca News API rate limit (429)"] : [],
       });
@@ -942,27 +976,72 @@
         memory_db_path: "data/memory.db",
         agent_accuracy_lookback: 20,
         llm_routes: {
-          cio: { provider: "groq", model: "openai/gpt-oss-120b", fallback: "" },
-          debate: { provider: "groq", model: "openai/gpt-oss-20b", fallback: "" },
-          fundamentals: { provider: "gemini", model: "gemini-3.6-flash", fallback: "" },
-          news: { provider: "gemini", model: "gemini-3.6-flash", fallback: "" },
-          risk: { provider: "openrouter", model: "openai/gpt-oss-20b:free", fallback: "" },
-          technical: { provider: "groq", model: "openai/gpt-oss-20b", fallback: "" },
+          cio: { provider: "groq", model: "openai/gpt-oss-120b", fallback_provider: "", fallback_model: "" },
+          debate: { provider: "groq", model: "openai/gpt-oss-20b", fallback_provider: "", fallback_model: "" },
+          fundamentals: { provider: "gemini", model: "gemini-3.6-flash", fallback_provider: "", fallback_model: "" },
+          news: { provider: "gemini", model: "gemini-3.6-flash", fallback_provider: "", fallback_model: "" },
+          risk: { provider: "groq", model: "openai/gpt-oss-20b", fallback_provider: "", fallback_model: "" },
+          technical: { provider: "groq", model: "openai/gpt-oss-20b", fallback_provider: "", fallback_model: "" },
         },
         llm_model_validation: {
           providers: {
-            groq: { ok: true, models_found: 12, checked: { "technical.model": true, "debate.model": true, "cio.model": true }, missing: [], error: null },
+            groq: { ok: true, models_found: 12, checked: { "technical.model": true, "debate.model": true, "risk.model": true, "cio.model": true }, missing: [], error: null },
             gemini: { ok: true, models_found: 21, checked: { "news.model": true, "fundamentals.model": true }, missing: [], error: null },
-            openrouter: { ok: true, models_found: 430, checked: { "risk.model": true }, missing: [], error: null },
+            nvidia: { ok: false, models_found: 0, checked: {}, missing: [], error: "NVIDIA_API_KEY not configured — catalog not fetched" },
+            openrouter: { ok: false, models_found: 0, checked: {}, missing: [], error: "OPENROUTER_MODEL not set — provider not routed" },
           },
           routes: {},
         },
         llm_quota: {
-          groq: { daily_request_limit: 0, requests_last_24h: 15, backoff_active: false, backoff_seconds_remaining: 0 },
-          gemini: { daily_request_limit: 20, requests_last_24h: 7, backoff_active: false, backoff_seconds_remaining: 0 },
-          openrouter: { daily_request_limit: 0, requests_last_24h: 5, backoff_active: false, backoff_seconds_remaining: 0 },
+          groq: { daily_request_limit: 0, requests_last_24h: 20, backoff_active: false, backoff_seconds_remaining: 0 },
+          gemini: { daily_request_limit: 20, requests_last_24h: 5, backoff_active: false, backoff_seconds_remaining: 0 },
+          openrouter: { daily_request_limit: 0, requests_last_24h: 0, backoff_active: false, backoff_seconds_remaining: 0 },
         },
+        llm_provider_states: {
+          groq: { state: "READY", detail: "20 requests in last 24h", requests_last_24h: 20, daily_request_limit: 0, quota_cooldown_remaining_s: 0, auth_cooldown_remaining_s: 0 },
+          gemini: { state: "READY", detail: "5 requests in last 24h", requests_last_24h: 5, daily_request_limit: 20, quota_cooldown_remaining_s: 0, auth_cooldown_remaining_s: 0 },
+          nvidia: { state: "NOT_CONFIGURED", detail: "NVIDIA_API_KEY not set", requests_last_24h: 0, daily_request_limit: 0, quota_cooldown_remaining_s: 0, auth_cooldown_remaining_s: 0 },
+          openrouter: { state: "NOT_CONFIGURED", detail: "OPENROUTER_MODEL not set", requests_last_24h: 0, daily_request_limit: 0, quota_cooldown_remaining_s: 0, auth_cooldown_remaining_s: 0 },
+        },
+        fundamentals: { primary: "none", fallback: null, available: ["none"] },
+        market_data: { configured_feed: "IEX", note: "IEX is the free/paper-subscription feed" },
+        realtime_enabled: true,
         warnings: [],
+      },
+      health: {
+        checked_at: "2026-09-09T18:00:00Z",
+        startup: {
+          rows: [
+            { component: "ALPACA", status: "READY", detail: "paper account OK (equity $25,104.00, status ACTIVE)" },
+            { component: "MARKET DATA", status: "READY", detail: "bars OK for SPY on feed=IEX" },
+            { component: "FUNDAMENTALS", status: "DATA_UNAVAILABLE", detail: "FUNDAMENTALS_PROVIDER=none — no fundamentals source configured; the bot runs on price/technical/news/risk evidence" },
+            { component: "GROQ", status: "READY", detail: "4 model id(s) verified against the live catalog" },
+            { component: "NVIDIA", status: "NOT_CONFIGURED", detail: "NVIDIA_API_KEY not set" },
+            { component: "GEMINI", status: "READY", detail: "2 model id(s) verified against the live catalog" },
+            { component: "OPENROUTER", status: "NOT_CONFIGURED", detail: "OPENROUTER_MODEL not set" },
+          ],
+        },
+        providers: {},
+        market_clock: { is_open: true, timestamp: null, next_open: null, next_close: null, error: null },
+        realtime: { status: "DISABLED", feed: null, symbols: [], data: {}, news: [], last_event_at: null, last_error: null, reconnects: 0 },
+        fundamentals: { primary: "none", fallback: null, available: ["none"] },
+        configured_feed: "IEX",
+      },
+      realtime: {
+        status: "CONNECTED",
+        feed: "iex",
+        symbols: ["AAPL", "MSFT", "NVDA", "TSLA", "SPY"],
+        data: {
+          AAPL: { last_trade: { price: 175.25, size: 3, timestamp: null }, last_quote: { bid_price: 175.1, ask_price: 175.3, bid_size: 2, ask_size: 2, timestamp: null }, minute_bar: null, updated_at: 1757433600 },
+          MSFT: { last_trade: { price: 421.5, size: 2, timestamp: null }, last_quote: { bid_price: 421.4, ask_price: 421.6, bid_size: 1, ask_size: 3, timestamp: null }, minute_bar: null, updated_at: 1757433600 },
+          NVDA: { last_trade: { price: 132.8, size: 5, timestamp: null }, last_quote: { bid_price: 132.75, ask_price: 132.85, bid_size: 4, ask_size: 4, timestamp: null }, minute_bar: null, updated_at: 1757433600 },
+          TSLA: { last_trade: { price: 248.4, size: 1, timestamp: null }, last_quote: { bid_price: 248.3, ask_price: 248.5, bid_size: 2, ask_size: 1, timestamp: null }, minute_bar: null, updated_at: 1757433600 },
+          SPY: { last_trade: { price: 548.9, size: 12, timestamp: null }, last_quote: { bid_price: 548.85, ask_price: 548.95, bid_size: 8, ask_size: 8, timestamp: null }, minute_bar: null, updated_at: 1757433600 },
+        },
+        news: [{ headline: "Chip demand keeps accelerating into Q4", summary: "", source: "api", symbols: ["NVDA"], created_at: null }],
+        last_event_at: 1757433600,
+        last_error: null,
+        reconnects: 0,
       },
     };
     Object.keys(store.data).forEach(function (k) { store.ts[k] = Date.now(); });
@@ -1122,6 +1201,33 @@
     positionsWithContext: positionsWithContext,
     matchOrdersToCycles: matchOrdersToCycles,
     loadDemo: loadDemo,
+
+    /* Live market strip (Alpaca WebSockets via /api/realtime). Ticks only
+       refresh this strip — they never trigger LLM calls. */
+    updateLiveStrip: function (el) {
+      var rt = store.data.realtime;
+      if (!rt || !rt.data || !Object.keys(rt.data).length) { el.innerHTML = ""; return; }
+      var tone = rt.status === "CONNECTED" ? "badge-ok" : rt.status === "DISCONNECTED" ? "badge-error" : "badge-neutral";
+      var cells = Object.keys(rt.data).map(function (s) {
+        var d = rt.data[s] || {};
+        var t = d.last_trade || {}, q = d.last_quote || {};
+        var px = t.price != null ? t.price : (q.bid_price != null && q.ask_price != null ? (q.bid_price + q.ask_price) / 2 : null);
+        return (
+          '<div class="card" style="padding:8px 12px;min-width:120px">' +
+            '<div class="row" style="justify-content:space-between"><span class="sym">' + U.esc(s) + '</span>' +
+            '<span style="font-size:12px;font-weight:650">' + (px != null ? U.fmtMoney(px) : "—") + "</span></div>" +
+            '<div class="t-faint" style="font-size:10.5px">' + (q.bid_price != null ? "bid " + U.fmtMoney(q.bid_price) + " · ask " + U.fmtMoney(q.ask_price) : "no quote yet") + "</div>" +
+          "</div>"
+        );
+      }).join("");
+      el.innerHTML =
+        '<div class="row" style="justify-content:space-between;margin-bottom:6px">' +
+          '<span class="row" style="gap:7px">' + ICON("pulse") + '<span style="font-size:12px;font-weight:650;color:var(--ink-hi)">Live Market</span>' +
+          '<span class="badge ' + tone + '">' + U.esc(rt.status) + "</span></span>" +
+          '<span class="t-faint" style="font-size:10.5px">Alpaca WebSocket · feed ' + U.esc(rt.feed || "—") + " · ticks never trigger AI</span>" +
+        "</div>" +
+        '<div class="row" style="gap:8px;overflow-x:auto">' + cells + "</div>";
+    },
     PAGES: null, PAGE_TITLES: null, PAGE_ICONS: null,
   };
 })();

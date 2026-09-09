@@ -294,6 +294,29 @@
       );
     }
 
+    function agentResultsLine(c) {
+      var ar = c.agent_results;
+      if (!ar) return "";
+      var names = {
+        market_data: "Market Data", technical: "Technical", news: "News",
+        fundamentals: "Fundamentals", debate: "Debate", risk: "Risk",
+        cio: "CIO", execution: "Execution", memory: "Memory",
+      };
+      var chips = Object.keys(names).map(function (k) {
+        var d = ar[k];
+        if (!d) return "";
+        var cls = d.ok === d.total ? "badge-ok"
+          : d.ok > 0 ? "badge-warning" : (d.skipped === d.total ? "badge-neutral" : "badge-error");
+        return '<span class="badge ' + cls + '">' + names[k] + " " + d.ok + "/" + d.total + "</span>";
+      }).join(" ");
+      if (!chips) return "";
+      return (
+        '<div class="dsec">' + C.sectionTitle("gauge", "Agent Results (ok / attempted)") +
+          '<div class="row" style="gap:6px;flex-wrap:wrap">' + chips + "</div>" +
+        "</div>"
+      );
+    }
+
     function llmUsageSection(c) {
       var u = c.llm_usage;
       if (!u || !Object.keys(u).length) return "";
@@ -321,7 +344,14 @@
       return (
         '<div class="dsec">' + C.sectionTitle("cpu", "LLM Calls (per provider)") +
           '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Provider</th><th class="r">Requests</th><th class="r">OK</th><th class="r">Failed</th><th>Agents (ok/req)</th><th>Errors</th></tr></thead><tbody>' + rows + "</tbody></table></div>" +
-          '<div class="note" style="margin-top:8px">' + ICON("info") + "<span>Live LLM requests this cycle. Re-used analyses (unchanged headlines/fundamentals) and quota-blocked requests are not sent, so they do not appear here \u2014 check the provider's daily budget on the Health page.</span>" +
+          (c.provider_results && c.provider_results.llm_states
+            ? '<div class="row" style="gap:6px;flex-wrap:wrap;margin-top:8px">' + Object.keys(c.provider_results.llm_states).map(function (p) {
+                var s = c.provider_results.llm_states[p] || {};
+                var cls = s.state === "READY" ? "badge-ok" : s.state === "NOT_CONFIGURED" ? "badge-neutral" : s.state === "DEGRADED" ? "badge-warning" : "badge-error";
+                return '<span class="badge ' + cls + '">' + p + ": " + U.esc(s.state) + "</span>";
+              }).join(" ") + "</div>"
+            : "") +
+          '<div class="note" style="margin-top:8px">' + ICON("info") + "<span>Live LLM requests this cycle. Re-used analyses (unchanged headlines/fundamentals) are not re-sent; quota-blocked requests appear as errors. Provider circuits are shown below the table.</span>" +
         "</div></div>"
       );
     }
@@ -403,6 +433,7 @@
         }).join("") +
       "</div>" +
       agentStatusMatrix(c) +
+      agentResultsLine(c) +
       llmUsageSection(c) +
       (decisionRows
         ? '<div class="dsec">' + C.sectionTitle("gavel", "Decisions") +

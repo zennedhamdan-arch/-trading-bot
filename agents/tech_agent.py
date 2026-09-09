@@ -1,14 +1,16 @@
 """
 agents/tech_agent.py
 
-Technical Agent. Interprets RSI, moving averages, and MACD for a given
-symbol and returns a structured technical read used by the CIO agent.
+Technical Agent. Interprets the DETERMINISTIC analytics computed by
+services/alpaca_service.get_indicators() (RSI, SMAs, EMA, MACD, ATR,
+volatility, drawdown, returns, rule-based signal) into a structured
+technical read used by the CIO agent. All financial math happens in
+Python; the LLM only reasons over pre-computed evidence.
 
-Provider/model: configured centrally via services/llm_service.py
-(default Groq — see GROQ_TECH_MODEL in config.py; no model id lives in
-this file). The report carries provider/model/llm_status/latency_ms so
-every cycle record says exactly which model produced it and how the
-request fared.
+Provider/model: routed via services/llm_service.py (LLM_TECH_PROVIDER,
+default Groq / GROQ_TECH_MODEL; no model id lives in this file). The
+report carries provider/model/llm_status/latency_ms so every cycle
+record says exactly which model produced it and how the request fared.
 """
 
 import logging
@@ -64,25 +66,32 @@ def analyze_technicals(symbol: str, indicators: dict) -> dict:
         "latency_ms": None,
     }
 
-    if not settings.GROQ_API_KEY:
-        base_result["error"] = "GROQ_API_KEY not configured."
-        base_result["summary"] = "Technical agent disabled: missing API key."
-        return base_result
-
     if indicators.get("error"):
         base_result["llm_status"] = "SKIPPED_NO_DATA"
         base_result["error"] = indicators["error"]
         base_result["summary"] = "No usable indicator data available."
         return base_result
 
+    # Deterministic evidence (computed in Python, NOT by the LLM): the model
+    # interprets these numbers; it never calculates them.
     indicator_text = (
         f"Symbol: {symbol}\n"
+        f"Data feed: {indicators.get('feed', 'iex')}\n"
         f"Latest close: {indicators.get('latest_close')}\n"
         f"RSI(14): {indicators.get('rsi_14')}\n"
+        f"SMA(20): {indicators.get('sma_20')}\n"
         f"SMA(50): {indicators.get('sma_50')}\n"
         f"SMA(200): {indicators.get('sma_200')}\n"
+        f"EMA(20): {indicators.get('ema_20')}\n"
         f"MACD: {indicators.get('macd')}\n"
         f"MACD Signal: {indicators.get('macd_signal')}\n"
+        f"ATR(14): {indicators.get('atr_14')}\n"
+        f"Annualized volatility: {indicators.get('volatility_annualized')}\n"
+        f"Max drawdown: {indicators.get('max_drawdown')}\n"
+        f"Return 1d/5d/20d: {indicators.get('return_1d')} / "
+        f"{indicators.get('return_5d')} / {indicators.get('return_20d')}\n"
+        f"Rule-based signal (deterministic): {indicators.get('technical_signal')} "
+        f"components={indicators.get('technical_components')}\n"
         f"Recent closes (oldest to newest): {indicators.get('recent_closes')}\n"
     )
 
