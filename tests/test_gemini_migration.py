@@ -10,8 +10,13 @@ Exits non-zero on any failure. No external test dependencies.
 
 import os
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Isolated SQLite for this run (news intelligence shares the memory DB).
+os.environ["MEMORY_DB_PATH"] = os.path.join(
+    tempfile.mkdtemp(prefix="gemmig-"), "test-memory.db")
 
 FAILURES = []
 
@@ -162,48 +167,67 @@ except RuntimeError as e:
 restore(saved)
 
 # ---------------------------------------------------------------------------
-# 3. news_agent: prompts, mapping, and fail-safes preserved
+# 3. news intelligence V2: Gemini-routed batch analysis + cache reader agent
 # ---------------------------------------------------------------------------
-print("news_agent:")
+print("news_agent (V2 cache reader + worker):")
 from agents import news_agent
+from services import llm_service, news_intelligence
+import json
 
 saved = reset()
-# no key -> legacy fail-safe
-config.settings.GEMINI_API_KEY = ""
-r = news_agent.analyze_news("AAPL", ["Apple beats earnings"])
-check("no key -> null stance + UNAVAILABLE evidence (never a fake NEUTRAL)",
-      r["sentiment"] is None and r["confidence"] is None and r["evidence_status"] == "UNAVAILABLE"
-      and r["error"] == "GEMINI_API_KEY not configured.")
-check("no key -> disabled summary", r["summary"] == "News agent disabled: missing API key — no news verdict.")
 
-# no headlines -> NEUTRAL, no LLM call
+# no cached intelligence -> no LLM call, null stance + UNAVAILABLE evidence
 config.settings.GEMINI_API_KEY = "test-key"
+config.settings.LLM_NEWS_PROVIDER = "gemini"
+llm_service.reset_all_state()
 gemini_service._client = None
-r = news_agent.analyze_news("AAPL", [])
-check("no headlines -> null stance + UNAVAILABLE evidence, no LLM call",
-      r["sentiment"] is None and r["evidence_status"] == "UNAVAILABLE"
-      and r["summary"] == "No recent headlines available — no news verdict."
+r = news_agent.analyze_news("ZZZZ")
+check("no cached intelligence -> null stance + UNAVAILABLE, no LLM call",
+      r["sentiment"] is None and r["confidence"] is None
+      and r["evidence_status"] == "UNAVAILABLE"
       and r["llm_status"] == "SKIPPED_NO_DATA")
 
-# happy path via stubbed Interactions client
-fake = install_fake_client(FakeInteractions(FakeInteraction(
-    '{"sentiment": "BULLISH", "confidence": 0.74, "summary": "Positive earnings coverage.", "key_headline": "Apple beats"}')))
-r = news_agent.analyze_news("NVDA", ["NVDA beats", "NVDA rallies", "x", "y", "z"])
-check("happy path maps fields", r["sentiment"] == "BULLISH" and abs(r["confidence"] - 0.74) < 1e-9
-      and r["key_headline"] == "Apple beats" and r["error"] is None
-      and r["evidence_status"] == "AVAILABLE")
+# worker path via stubbed Interactions client (V2 batch analysis shape)
+BATCH = json.dumps({
+    "articles": [{"index": 0, "sentiment": "BULLISH", "confidence": 0.74,
+                  "importance": "HIGH", "impact_horizon": "SHORT_TERM"}],
+    "overall_sentiment": "BULLISH", "overall_confidence": 0.74,
+    "summary": "Positive earnings coverage.",
+})
+fake = install_fake_client(FakeInteractions(FakeInteraction(BATCH)))
+ARTS = [{"id": "gm-1", "headline": "NVDA beats earnings expectations",
+         "summary": "", "source": "Reuters", "published_at": "2026-09-10T10:00:00Z"}]
+news_intelligence.refresh_symbol("NVDA", fetch_articles=lambda s: ARTS)
+check("batch prompt routed through Gemini (one interactions call)",
+      len(fake.calls) == 1)
 call = fake.calls[0]
-check("system prompt sent as system_instruction", call["system_instruction"] == news_agent.SYSTEM_INSTRUCTIONS)
-check("ticker+headlines sent as input", "Ticker: NVDA" in call["input"] and "- NVDA beats" in call["input"])
-check("headlines capped at 15", call["input"].count("\n- ") <= 15)
+check("system prompt sent as system_instruction",
+      call["system_instruction"] == news_intelligence._ANALYSIS_INSTRUCTIONS)
+check("ticker + articles sent as input",
+      "Ticker: NVDA" in call["input"] and "NVDA beats earnings" in call["input"])
+r = news_agent.analyze_news("NVDA")
+check("agent maps the cached intelligence (sentiment/confidence/provider)",
+      r["sentiment"] == "BULLISH" and abs(r["confidence"] - 0.74) < 1e-9
+      and r["error"] is None and r["evidence_status"] == "AVAILABLE"
+      and r["provider"] == "gemini" and r["cached"] is True)
 
-# LLM failure -> graceful fail-safe
+# same articles again -> duplicate detection, NO new Gemini call
+news_intelligence.refresh_symbol("NVDA", fetch_articles=lambda s: ARTS)
+check("duplicate articles -> no second Gemini call",
+      len(fake.calls) == 1)
+
+# LLM failure in the worker -> honest deterministic fallback, never fake AI
 install_fake_client(FakeInteractions(None, raise_exc=RuntimeError("quota exceeded")))
-r = news_agent.analyze_news("AAPL", ["h1"])
-check("LLM error -> null stance + ERROR evidence (never a fake NEUTRAL)",
-      r["sentiment"] is None and r["confidence"] is None and r["evidence_status"] == "ERROR"
-      and "quota exceeded" in r["error"]
-      and r["summary"] == "News agent encountered an error — no news verdict.")
+NEW_ARTS = [{"id": "gm-2", "headline": "NVDA faces lawsuit investigation",
+             "summary": "", "source": "Bloomberg", "published_at": "2026-09-10T11:00:00Z"}]
+news_intelligence.refresh_symbol("NVDA", fetch_articles=lambda s: NEW_ARTS)
+r = news_agent.analyze_news("NVDA")
+check("LLM failure -> deterministic fallback labeled (mixed history honest)",
+      r["evidence_status"] == "AVAILABLE" and r["llm_status"] == "DETERMINISTIC_FALLBACK"
+      and "deterministic_fallback" in (r["provider"] or ""))
+arts = {a["article_id"]: a for a in news_intelligence.get_recent_articles("NVDA")}
+check("fallback article verdict honestly sourced (deterministic_fallback)",
+      arts["gm-2"]["analysis"]["source"] == "deterministic_fallback")
 restore(saved)
 
 # ---------------------------------------------------------------------------
@@ -211,6 +235,10 @@ restore(saved)
 # ---------------------------------------------------------------------------
 print("fundamentals_agent:")
 from agents import fundamentals_agent
+
+# This suite exercises the GEMINI transport; route fundamentals to it
+# explicitly (the V2 default route is the UnoRouter chain).
+config.settings.LLM_FUNDAMENTALS_PROVIDER = "gemini"
 
 saved = reset()
 # disabled via config

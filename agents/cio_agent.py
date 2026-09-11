@@ -80,6 +80,17 @@ def _extract_json(text: str) -> dict:
     return llm_service.extract_json(text)
 
 
+def _stable_view(report):
+    """A prompt-stable view of an agent report: identical decisions must
+    produce identical prompts so the LLM response cache can serve them.
+    Drops display-only volatile fields (latency/cache age); the full report
+    still goes to logs/API unchanged."""
+    if not isinstance(report, dict):
+        return report
+    return {k: v for k, v in report.items()
+            if k not in ("latency_ms", "cache_age_minutes")}
+
+
 def make_decision(symbol: str, news_report: dict, tech_report: dict, risk_report: dict,
                    fundamentals_report: dict = None, debate_report: dict = None,
                    agent_weights: dict = None, memory_summary: str = "",
@@ -127,12 +138,12 @@ def make_decision(symbol: str, news_report: dict, tech_report: dict, risk_report
 
     context_parts = [
         f"Symbol: {symbol}\n",
-        f"--- News/Sentiment Agent Report ---\n{json.dumps(news_report, indent=2)}\n",
-        f"--- Technical Agent Report ---\n{json.dumps(tech_report, indent=2)}\n",
+        f"--- News/Sentiment Agent Report ---\n{json.dumps(_stable_view(news_report), indent=2)}\n",
+        f"--- Technical Agent Report ---\n{json.dumps(_stable_view(tech_report), indent=2)}\n",
     ]
     if fundamentals_report:
         context_parts.append(
-            f"--- Fundamentals Agent Report ---\n{json.dumps(fundamentals_report, indent=2)}\n"
+            f"--- Fundamentals Agent Report ---\n{json.dumps(_stable_view(fundamentals_report), indent=2)}\n"
         )
     if debate_report:
         context_parts.append(
@@ -142,7 +153,7 @@ def make_decision(symbol: str, news_report: dict, tech_report: dict, risk_report
             f"Net edge (bull - bear): {debate_report.get('edge')}\n"
         )
     context_parts.append(
-        f"--- Risk Agent Report ---\n{json.dumps(risk_report, indent=2)}\n"
+        f"--- Risk Agent Report ---\n{json.dumps(_stable_view(risk_report), indent=2)}\n"
     )
     if evidence:
         from services import evidence as evidence_service

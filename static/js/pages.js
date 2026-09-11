@@ -670,6 +670,49 @@
         hero = hero + evidenceCard;
       }
 
+      // News Intelligence card (persistent cache; the worker analyzes news
+      // on its own schedule — this is a cache read, never an LLM trigger).
+      var ns = store.data.newsStatus;
+      if (ns && !store.demo) {
+        var evSym = sym || (store.data.portfolio && store.data.portfolio.trade_universe && store.data.portfolio.trade_universe[0]) || "AAPL";
+        var intel = (ns.intelligence && ns.intelligence[evSym]) || null;
+        var staleBadge = intel && intel.is_stale
+          ? '<span class="badge badge-warning">STALE</span>' : intel ? '<span class="badge badge-ok">FRESH</span>' : "";
+        var srcBadge = intel && intel.source
+          ? '<span class="badge badge-neutral">' + U.esc(intel.source === "deterministic_fallback" ? "deterministic fallback" : intel.source) + "</span>" : "";
+        var sentimentBadge = intel && intel.sentiment
+          ? '<span class="' + (intel.sentiment === "BULLISH" ? "pos" : intel.sentiment === "BEARISH" ? "neg" : "t-faint") + '">' + U.esc(intel.sentiment) + "</span>"
+          : '<span class="t-faint">no verdict yet</span>';
+        var eventBadge = intel && intel.event_risk
+          ? '<span class="badge badge-error">' + U.esc(intel.event_type || "EVENT") + " RISK</span>" : "";
+        var intelRows = "";
+        Object.keys(ns.intelligence || {}).forEach(function (s) {
+          var q = ns.intelligence[s] || {};
+          var st = q.sentiment
+            ? '<span class="' + (q.sentiment === "BULLISH" ? "pos" : q.sentiment === "BEARISH" ? "neg" : "t-faint") + '">' + U.esc(q.sentiment) + "</span>"
+            : '<span class="t-faint">—</span>';
+          intelRows +=
+            "<tr><td><span style=\"font-weight:650\">" + U.esc(s) + "</span></td>" +
+            "<td>" + st + "</td>" +
+            "<td>" + (q.confidence != null ? U.esc(Number(q.confidence).toFixed(2)) : '<span class="t-faint">—</span>') + "</td>" +
+            "<td>" + (q.importance ? U.esc(q.importance) : '<span class="t-faint">—</span>') + "</td>" +
+            "<td>" + (q.event_risk ? '<span class="neg">' + U.esc(q.event_type || "EVENT") + "</span>" : '<span class="t-faint">no</span>') + "</td>" +
+            "<td>" + (q.is_stale ? '<span style="color:var(--amber)">stale ' + (q.cache_age_minutes != null ? Math.round(q.cache_age_minutes) + "m" : "") + "</span>" : '<span class="pos">fresh</span>') + "</td>" +
+            '<td class="t-faint">' + (q.headline_count != null ? q.headline_count + " heads" : "—") + "</td></tr>";
+        });
+        hero = hero +
+          '<section class="card mb-12">' +
+            '<div class="card-hd">' + ICON("news") + '<span class="card-title">News Intelligence</span>' +
+              staleBadge + srcBadge + eventBadge +
+              '<span class="spacer"></span><span class="aux">' +
+                (ns.last_refresh ? "refreshed " + U.fmtTime(ns.last_refresh) : "worker warming up") +
+                " · every " + Math.round(ns.refresh_minutes || 30) + "m</span></div>" +
+            '<div class="card-bd-flush"><div class="tbl-wrap"><table class="tbl"><thead><tr><th>Symbol</th><th>Sentiment</th><th>Conf</th><th>Importance</th><th>Event risk</th><th>Cache</th><th>Articles</th></tr></thead><tbody>' + intelRows + "</tbody></table></div>" +
+            '<div class="tbl-note">' + ICON("info") + "<span>Persistent, deduplicated news analysis maintained by the independent news worker — the same article is never analyzed twice. Trading cycles read this cache and never wait on news or LLM providers." +
+              (ns.last_refresh ? " Last pass: " + (ns.articles_analyzed || 0) + " new articles analyzed, " + (ns.duplicates_ignored || 0) + " duplicates ignored." : "") + "</span></div>" +
+          "</section>";
+      }
+
       // debate
       var debateCard =
         '<section class="card">' +

@@ -36,14 +36,28 @@ _client = None  # cached genai.Client
 
 
 def _get_client():
-    """Lazily instantiate and cache the Gemini client."""
+    """Lazily instantiate and cache the Gemini client.
+
+    Hard timeout and a single HTTP attempt: long SDK-internal retries are
+    disabled so an unreachable/slow Gemini never blocks a trading cycle —
+    the router's own fallback chain handles failures instead of waiting.
+    """
     global _client
     if _client is None:
         from google import genai
+        from google.genai import types as genai_types
 
         if not settings.GEMINI_API_KEY:
             raise RuntimeError("GEMINI_API_KEY not configured.")
-        _client = genai.Client(api_key=settings.GEMINI_API_KEY)
+        _client = genai.Client(
+            api_key=settings.GEMINI_API_KEY,
+            http_options=genai_types.HttpOptions(
+                timeout=max(1.0, float(settings.LLM_REQUEST_TIMEOUT_SECONDS)),
+                retry_options=genai_types.HttpRetryOptions(
+                    attempts=1 + max(0, int(settings.LLM_MAX_RETRIES)),
+                ),
+            ),
+        )
     return _client
 
 

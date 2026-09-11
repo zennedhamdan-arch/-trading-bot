@@ -158,6 +158,7 @@
       fetchEndpoint("orders", function () { return API.orders(100); }),
       fetchEndpoint("config", API.config),
       fetchEndpoint("health", API.health),
+      fetchEndpoint("newsStatus", API.newsStatus),  // cache read only; never triggers LLM
     ]);
     afterDataTick();
   }

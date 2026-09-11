@@ -30,10 +30,16 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import types
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Isolated SQLite for this run (news intelligence shares the memory DB; a
+# shared DB would poison duplicate-detection across runs).
+os.environ["MEMORY_DB_PATH"] = os.path.join(
+    tempfile.mkdtemp(prefix="provlayer-"), "test-memory.db")
 
 FAILURES = []
 
@@ -505,9 +511,15 @@ check("primary OK -> fallback never touched",
 client = _fresh(lambda kw: _ErrWithCode("daily quota exhausted", 429))
 llm_service._verified_models["nvidia"] = set(NVIDIA_MODELS)
 r = llm_service.call("technical", "SYS", "USER")
-check("quota error -> NO fallback (reported honestly)",
-      r.status == "PROVIDER_QUOTA_EXCEEDED"
-      and len(llm_service._clients["nvidia"].chat.completions.calls) == 0)
+# V2 semantics: quota exhaustion is never RETIED on the same provider (its
+# circuit opens), but the chain DOES advance to the next configured member.
+check("quota error -> provider circuit opens, chain advances (no same-provider retry)",
+      r.ok and r.provider == "nvidia" and r.fallback_used is True
+      and llm_service.provider_states()["groq"]["state"] == "QUOTA_EXHAUSTED"
+      and len(llm_service._clients["groq"].chat.completions.calls) == 1)
+r2 = llm_service.call("technical", "SYS", "USER2")
+check("quota circuit short-circuits the SAME provider (no second groq request)",
+      len(llm_service._clients["groq"].chat.completions.calls) == 1)
 config.settings.LLM_FALLBACK_PROVIDER = ""
 config.settings.LLM_FALLBACK_MODEL = ""
 
@@ -559,8 +571,10 @@ config.settings.LLM_FALLBACK_PROVIDER = ""
 config.settings.LLM_FALLBACK_MODEL = ""
 
 states = llm_service.provider_states()
-check("provider_states covers all four providers",
-      set(states) == {"groq", "nvidia", "gemini", "openrouter"})
+check("provider_states covers all five providers (unorouter added)",
+      set(states) == {"unorouter", "groq", "nvidia", "gemini", "openrouter"})
+check("unorouter NOT_CONFIGURED without a key (honest, not hidden)",
+      states["unorouter"]["state"] == "NOT_CONFIGURED")
 check("healthy providers report READY",
       states["groq"]["state"] == "READY" and states["gemini"]["state"] == "READY")
 
@@ -572,7 +586,25 @@ llm_service.reset_cycle_usage()
 fundamentals_agent.reset_fundamentals_cache()
 news_agent.reset_news_analysis_cache()
 
-# tech agent
+# tech agent — V2: deterministic by default, LLM interpretation opt-in
+config.settings.TECH_LLM_INTERPRETATION_ENABLED = False
+client = _fresh()
+tr = tech_agent.analyze_technicals("AAPL", {"rsi_14": 55, "sma_50": 100, "sma_200": 90,
+                                            "macd": 1, "macd_signal": 0.5, "sma_20": 99,
+                                            "volatility_annualized": 0.3, "max_drawdown": -0.1,
+                                            "technical_signal": "BULLISH",
+                                            "technical_components": {"trend": "BULLISH",
+                                                                     "momentum": "BULLISH",
+                                                                     "rsi_flag": "NEUTRAL"},
+                                            "latest_close": 101, "recent_closes": [100],
+                                            "feed": "iex", "error": None})
+check("tech (deterministic mode): rule-engine verdict, ZERO LLM calls",
+      tr["signal"] == "BULLISH" and tr["evidence_status"] == "AVAILABLE"
+      and tr["llm_status"] == "SKIPPED_DETERMINISTIC"
+      and tr["provider"] == "deterministic"
+      and len(client.chat.completions.calls) == 0)
+
+config.settings.TECH_LLM_INTERPRETATION_ENABLED = True
 client = _fresh()
 tr = tech_agent.analyze_technicals("AAPL", {"rsi_14": 55, "sma_50": 100, "sma_200": 90,
                                             "macd": 1, "macd_signal": 0.5, "sma_20": 99,
@@ -591,23 +623,47 @@ tr = tech_agent.analyze_technicals("AAPL", {"error": "DATA_UNAVAILABLE: no bars"
 check("tech: no data -> SKIPPED_NO_DATA, no LLM call",
       tr["llm_status"] == "SKIPPED_NO_DATA" and tr["error"] == "DATA_UNAVAILABLE: no bars"
       and len(client.chat.completions.calls) == 1)
+config.settings.TECH_LLM_INTERPRETATION_ENABLED = False  # restore V2 default
 
-# news agent + Gemini call reuse
-gemini_service._client = _FakeGeminiClient(lambda kw: NEWS_JSON)
-headlines = ["AAPL beats earnings", "AAPL announces buyback"]
-n1 = news_agent.analyze_news("AAPL", headlines)
+# news agent V2: the agent reads the persistent intelligence cache; the
+# LLM work happens in news_intelligence (driven by the worker). The stub
+# returns the V2 BATCH analysis shape the worker's prompt asks for.
+from services import news_intelligence  # noqa: E402
+config.settings.LLM_NEWS_PROVIDER = "gemini"
+llm_service.reset_all_state()
+NEWS_BATCH_JSON = json.dumps({
+    "articles": [{"index": 0, "sentiment": "BULLISH", "confidence": 0.7,
+                  "importance": "HIGH", "impact_horizon": "SHORT_TERM"},
+                 {"index": 1, "sentiment": "BULLISH", "confidence": 0.6,
+                  "importance": "MEDIUM", "impact_horizon": "SHORT_TERM"}],
+    "overall_sentiment": "BULLISH", "overall_confidence": 0.65,
+    "summary": "Coverage is positive.",
+})
+gemini_service._client = _FakeGeminiClient(lambda kw: NEWS_BATCH_JSON)
+
+ARTICLES_A = [
+    {"id": "pl-a1", "headline": "AAPL beats earnings", "summary": "",
+     "source": "Reuters", "published_at": "2026-09-10T10:00:00Z"},
+    {"id": "pl-a2", "headline": "AAPL announces buyback", "summary": "",
+     "source": "CNBC", "published_at": "2026-09-10T09:00:00Z"},
+]
+news_intelligence.refresh_symbol("AAPL", fetch_articles=lambda s: ARTICLES_A)
 calls_after_first = len(gemini_service._client.interactions.calls)
-check("news: fields mapped", n1["sentiment"] == "BULLISH" and n1["llm_status"] == "OK"
-      and n1["cached"] is False)
-n2 = news_agent.analyze_news("AAPL", list(headlines))
-check("news: unchanged headlines -> cached analysis, NO new Gemini call",
+n1 = news_agent.analyze_news("AAPL")
+check("news: fields mapped from the intelligence cache",
+      n1["sentiment"] == "BULLISH" and n1["llm_status"] == "OK"
+      and n1["cached"] is True and n1["headline_count"] == 2)
+n2 = news_agent.analyze_news("AAPL")
+check("news: repeated reads -> still cached, NO new Gemini call",
       n2["cached"] is True and n2["llm_status"] == "OK"
       and len(gemini_service._client.interactions.calls) == calls_after_first)
-n3 = news_agent.analyze_news("AAPL", headlines + ["Fresh headline changes everything"])
-check("news: changed headlines -> new Gemini call",
-      n3["cached"] is False and len(gemini_service._client.interactions.calls) == calls_after_first + 1)
-n4 = news_agent.analyze_news("MSFT", [])
-check("news: no headlines -> no LLM call, null stance + UNAVAILABLE evidence",
+news_intelligence.refresh_symbol("AAPL", fetch_articles=lambda s: ARTICLES_A + [
+    {"id": "pl-a3", "headline": "AAPL fresh headline changes everything",
+     "summary": "", "source": "Bloomberg", "published_at": "2026-09-10T11:00:00Z"}])
+check("news: NEW important article -> one new Gemini call (worker path)",
+      len(gemini_service._client.interactions.calls) == calls_after_first + 1)
+n4 = news_agent.analyze_news("ZZZZ")
+check("news: no intelligence -> no LLM call, null stance + UNAVAILABLE evidence",
       n4["llm_status"] == "SKIPPED_NO_DATA" and n4["sentiment"] is None
       and n4["evidence_status"] == "UNAVAILABLE"
       and len(gemini_service._client.interactions.calls) == calls_after_first + 1)
@@ -703,16 +759,25 @@ llm_service.reset_cycle_usage()
 fundamentals_agent.reset_fundamentals_cache()
 news_agent.reset_news_analysis_cache()
 client = _fresh()
-gemini_service._client = _FakeGeminiClient(lambda kw: NEWS_JSON)
+gemini_service._client = _FakeGeminiClient(lambda kw: NEWS_BATCH_JSON)
 
 symbols = ["AAPL", "MSFT", "NVDA", "TSLA", "SPY"]
+# V2: the tech agent's default path is deterministic (no LLM); enable the
+# optional interpretation to exercise usage accounting on the LLM path.
+config.settings.TECH_LLM_INTERPRETATION_ENABLED = True
 for sym in symbols:
-    tech_agent.analyze_technicals(sym, {"rsi_14": 50, "error": None})
-    news_agent.analyze_news(sym, [f"{sym} headline one", f"{sym} headline two"])
+    tech_agent.analyze_technicals(sym, {"rsi_14": 50, "error": None,
+                                        "technical_signal": "BULLISH",
+                                        "technical_components": {}, "latest_close": 100.0,
+                                        "sma_50": 99.0, "sma_200": 95.0})
+    arts = [{"id": f"pl8-{sym}", "headline": f"{sym} beats earnings expectations",
+             "summary": "", "source": "Reuters", "published_at": "2026-09-10T10:00:00Z"}]
+    news_intelligence.refresh_symbol(sym, fetch_articles=lambda _s, _a=arts: _a)
+config.settings.TECH_LLM_INTERPRETATION_ENABLED = False
 
 usage = llm_service.cycle_usage()
 check("groq: 1 tech call/symbol = 5", usage["groq"]["requests"] == 5)
-check("gemini: 1 news call/symbol = 5",
+check("gemini: 1 news call/symbol = 5 (via the news worker path)",
       usage["gemini"]["requests"] == 5 and usage["gemini"]["by_agent"]["news"]["requests"] == 5)
 
 import main

@@ -79,6 +79,27 @@ def analyze_technicals(symbol: str, indicators: dict) -> dict:
         base_result["summary"] = "No usable indicator data available — no technical verdict."
         return base_result
 
+    # DETERMINISTIC ENGINE FIRST (V2 default): the rule-based signal and its
+    # components ARE the technical verdict — computed in Python from real
+    # bars, no LLM involved, no confidence invented. The LLM interpretation
+    # below is an opt-in enrichment (TECH_LLM_INTERPRETATION_ENABLED).
+    if not settings.TECH_LLM_INTERPRETATION_ENABLED:
+        components = indicators.get("technical_components") or {}
+        signal = str(indicators.get("technical_signal") or "NEUTRAL").upper()
+        base_result["llm_status"] = "SKIPPED_DETERMINISTIC"
+        base_result["evidence_status"] = "AVAILABLE"   # real data, really analyzed
+        base_result["provider"] = "deterministic"
+        base_result["model"] = "rule-engine"
+        base_result["signal"] = signal
+        base_result["summary"] = (
+            f"Deterministic technical engine: signal {signal} "
+            f"(trend {components.get('trend')}, momentum {components.get('momentum')}, "
+            f"RSI {indicators.get('rsi_14')} -> {components.get('rsi_flag')}). "
+            f"Close {indicators.get('latest_close')} vs SMA50 {indicators.get('sma_50')} / "
+            f"SMA200 {indicators.get('sma_200')}."
+        )
+        return base_result
+
     # Deterministic evidence (computed in Python, NOT by the LLM): the model
     # interprets these numbers; it never calculates them.
     indicator_text = (
