@@ -111,6 +111,16 @@ def get_news(symbol: str, limit: int = 10) -> dict:
     """Recent news headlines for a symbol via Alpaca's News API.
     Returns {"headlines": [...], "error": None} — an empty list on failure,
     never fabricated headlines."""
+    result = get_news_articles(symbol, limit=limit)
+    return {"headlines": [a["headline"] for a in result["articles"]],
+            "error": result["error"]}
+
+
+def get_news_articles(symbol: str, limit: int = 20) -> dict:
+    """Full article objects for a symbol via Alpaca's News API — the raw
+    material of the News Intelligence system (id, headline, summary,
+    source, url, published_at, symbols). Returns {"articles": [...],
+    "error": None}; an empty list on failure, never fabricated articles."""
     try:
         from alpaca.data.historical.news import NewsClient
         from alpaca.data.requests import NewsRequest
@@ -118,13 +128,29 @@ def get_news(symbol: str, limit: int = 10) -> dict:
         client = NewsClient(api_key=settings.ALPACA_API_KEY, secret_key=settings.ALPACA_SECRET_KEY)
         req = NewsRequest(symbols=symbol, limit=limit)
         news_set = client.get_news(req)
-        headlines = [item.headline for item in news_set.data.get("news", [])] if hasattr(news_set, "data") else []
-        if not headlines and hasattr(news_set, "news"):
-            headlines = [item.headline for item in news_set.news]
-        return {"headlines": headlines, "error": None}
+        raw = []
+        if hasattr(news_set, "data"):
+            raw = news_set.data.get("news", []) if isinstance(news_set.data, dict) else []
+        if not raw and hasattr(news_set, "news"):
+            raw = news_set.news
+        articles = []
+        for item in raw:
+            articles.append({
+                "id": str(getattr(item, "id", "") or ""),
+                "headline": str(getattr(item, "headline", "") or ""),
+                "summary": str(getattr(item, "summary", "") or ""),
+                "source": (getattr(getattr(item, "source", None), "name", None)
+                           if not isinstance(getattr(item, "source", None), str)
+                           else getattr(item, "source", "")) or "",
+                "url": str(getattr(item, "url", "") or ""),
+                "author": str(getattr(item, "author", "") or ""),
+                "published_at": str(getattr(item, "created_at", "") or ""),
+                "symbols": [str(s) for s in (getattr(item, "symbols", None) or [])],
+            })
+        return {"articles": articles, "error": None}
     except Exception as exc:  # noqa: BLE001 — news failure never crashes a cycle
         logger.warning(f"Could not fetch news for {symbol}: {exc}")
-        return {"headlines": [], "error": str(exc)}
+        return {"articles": [], "error": str(exc)}
 
 
 def get_fundamentals(symbol: str) -> dict:
@@ -168,9 +194,6 @@ def get_symbol_data(symbol: str) -> dict:
         else:
             price_error = snapshot.get("error") or indicators.get("error") or "no price source available"
 
-    news = get_news(symbol)
-    news_ok = not news.get("error")
-
     fundamentals = get_fundamentals(symbol)
     fundamentals_status = fundamentals.get("status", "DATA_UNAVAILABLE")
 
@@ -181,20 +204,21 @@ def get_symbol_data(symbol: str) -> dict:
         "quote": (snapshot.get("latest_quote") if not snapshot.get("error") else None),
         "snapshot_error": snapshot.get("error"),
         "indicators": indicators,
-        "news": news.get("headlines", []),
+        # News is OWNED by the independent news worker (services/news_worker.py)
+        # — a trading cycle never waits on the News API. The cycle reads the
+        # persistent intelligence cache instead (agents/news_agent.py).
+        "news": [],
         "fundamentals": fundamentals,
         "data_quality": {
             "price": "OK" if price is not None else "DATA_UNAVAILABLE",
             "bars": "OK" if bars_ok else "DATA_UNAVAILABLE",
-            "news": "OK" if news_ok else "DATA_UNAVAILABLE",
+            "news": "DELEGATED_TO_WORKER",
             "fundamentals": fundamentals_status,
         },
         "feed": settings.ALPACA_DATA_FEED,
     }
     if price_error:
         bundle["price_error"] = price_error
-    if not news_ok:
-        bundle["news_error"] = news["error"]
     if not bars_ok:
         bundle["bars_error"] = indicators["error"]
     return bundle

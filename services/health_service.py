@@ -284,11 +284,33 @@ def run_startup_checks() -> dict:
         "detail": fundamentals.get("detail", ""),
     }})
 
+    # --- News Intelligence (worker state; the cache survives restarts) ------
+    try:
+        from services import news_worker
+        news_stats = news_worker.stats()
+        if not settings.NEWS_ENABLED:
+            news_row = {"status": "NOT_CONFIGURED", "detail": "NEWS_ENABLED=false"}
+        elif news_stats.get("last_refresh"):
+            news_row = {
+                "status": "READY",
+                "detail": (
+                    f"last refresh {news_stats['last_refresh'][:19]} — "
+                    f"{news_stats.get('articles_analyzed', 0)} analyzed, "
+                    f"{news_stats.get('duplicates_ignored', 0)} duplicates ignored, "
+                    f"{news_stats.get('symbols_with_intelligence', 0)} symbol(s) cached"
+                ),
+            }
+        else:
+            news_row = {"status": "PENDING", "detail": "worker has not completed a refresh yet"}
+    except Exception as exc:  # noqa: BLE001 — health rows never crash boot
+        news_row = {"status": "ERROR", "detail": str(exc)[:200]}
+    rows.append({"component": "NEWS INTELLIGENCE", **news_row})
+
     # --- LLM providers ---------------------------------------------------------
     validation = llm_service.validate_models()
     states = llm_service.provider_states()
     llm_providers = {}
-    for provider in ("groq", "nvidia", "gemini", "openrouter"):
+    for provider in ("unorouter", "groq", "nvidia", "gemini", "openrouter"):
         state = states.get(provider, {})
         entry = validation.get("providers", {}).get(provider, {})
         missing = entry.get("missing") or []

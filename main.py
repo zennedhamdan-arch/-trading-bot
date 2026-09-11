@@ -25,16 +25,33 @@ Architecture (reliability-focused; AI never does basic financial math):
         |
     ALPACA PAPER EXECUTION (paper trading only, always)
 
-Per symbol, per cycle: market data bundle -> technical -> news ->
-fundamentals (DATA_UNAVAILABLE when no provider is configured) ->
-debate -> risk (deterministic gate + optional LLM reasoning) -> CIO
-decision -> validated paper execution -> memory feedback.
+V2 pipeline (Intelligence Infrastructure) — LLM calls are the exception,
+not the rule:
+
+    MARKET DATA (Alpaca) -> TECHNICAL ENGINE (deterministic Python)
+      -> SETUP EXISTS?  no  -> HOLD (no LLM calls at all for this symbol)
+                       yes -> NEWS CONTEXT (persistent intelligence cache;
+                              the worker analyzes news on its own schedule)
+                            -> HARD RISK ENGINE (deterministic; Part 15)
+                              -> rejected -> HOLD (no AI review)
+                              -> approved -> OPTIONAL AI REVIEW
+                                            (technical LLM interpretation
+                                             [opt-in], debate [opt-in],
+                                             CIO) -> FINAL DECISION
+                                            -> validated PAPER execution
+
+Per symbol, per cycle: market data bundle -> deterministic technical engine
+(and optional LLM interpretation) -> news intelligence cache read ->
+fundamentals (SKIPPED when no provider is configured) -> hard risk engine ->
+risk agent (optional LLM reasoning) -> debate (opt-in) -> CIO decision ->
+validated paper execution -> memory feedback.
 
 Run with:  python main.py
 Dashboard: http://localhost:8000
 """
 
 import asyncio
+import json
 import logging
 import time
 from collections import deque
@@ -49,8 +66,9 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from config import settings
 from services import (alpaca_service, memory_service, llm_service,
-                      market_data_service, risk_gate, health_service,
-                      realtime_service, fundamentals_service, evidence as evidence_service)
+                      market_data_service, risk_gate, risk_engine, health_service,
+                      realtime_service, fundamentals_service, evidence as evidence_service,
+                      news_intelligence, news_worker)
 from agents import news_agent, tech_agent, risk_agent, cio_agent, fundamentals_agent, debate_agent
 
 logging.basicConfig(
@@ -180,6 +198,42 @@ def _llm_error_type(llm_status) -> str:
     return str(llm_status or "ERROR")
 
 
+def _setup_exists(indicators: dict) -> bool:
+    """The deterministic setup gate: the rule-based technical signal (trend
+    + momentum + RSI, computed in Python from real bars) must be BULLISH or
+    BEARISH. NEUTRAL means no tradeable setup -> HOLD without any LLM call.
+    """
+    if not indicators or indicators.get("error"):
+        return False
+    return str(indicators.get("technical_signal") or "").upper() in ("BULLISH", "BEARISH")
+
+
+def _debate_eligible(tech_report: dict, news_report: dict) -> tuple:
+    """(eligible, reason). Debate (opt-in, default OFF) only runs when:
+    a valid setup exists, the technical read is high-confidence, the
+    evidence genuinely conflicts, and the debate route has a healthy,
+    non-quota-exhausted provider."""
+    if not settings.ENABLE_DEBATE:
+        return False, "disabled (DEBATE_AGENT_ENABLED=false)"
+    conf = tech_report.get("confidence") if tech_report else None
+    if conf is not None and float(conf) < float(settings.DEBATE_MIN_TECH_CONFIDENCE):
+        return False, f"technical confidence {conf} < {settings.DEBATE_MIN_TECH_CONFIDENCE}"
+    if settings.DEBATE_REQUIRE_CONFLICT:
+        tech_signal = str((tech_report or {}).get("signal") or "").upper()
+        news_sent = str((news_report or {}).get("sentiment") or "").upper()
+        conflict = {tech_signal, news_sent} >= {"BULLISH", "BEARISH"}
+        if not conflict:
+            return False, "no conflicting evidence (technical and news agree)"
+    chain, _ = llm_service._candidate_chain("debate")
+    states = llm_service.provider_states()
+    healthy = any(
+        states.get(p, {}).get("state") == "READY" for p, _ in chain
+    )
+    if not healthy:
+        return False, "no healthy provider for the debate route"
+    return True, "eligible"
+
+
 def _compute_cycle_status(cycle_record: dict, cycle_summary: dict) -> str:
     """Honest cycle status.
 
@@ -270,6 +324,11 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
         cycle_record["llm_usage"] = llm_service.cycle_usage()
         cycle_record["agent_results"] = _compute_agent_results(cycle_record)
         cycle_record["provider_results"] = _compute_provider_results(cycle_record)
+        cycle_record["llm_failures"] = _llm_failure_count(cycle_record)
+        cycle_record["status_label"] = (
+            "DEGRADED" if status == "PARTIAL_ERROR" and cycle_record["llm_failures"] > 0
+            else STATUS_LABELS.get(status, status)
+        )
         cycle_history.appendleft(cycle_record)
 
     account_summary = alpaca_service.get_account_summary()
@@ -299,6 +358,19 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
     fundamentals_provider_results = {"symbols_ok": 0, "symbols_unavailable": 0}
     market_data_results = {"symbols_ok": 0, "symbols_unavailable": 0, "feed": settings.ALPACA_DATA_FEED}
 
+    # Orders snapshot ONCE per cycle: the risk engine's pending-order check
+    # needs today's broker orders; trading itself never blocks on news or
+    # LLM providers.
+    recent_orders_data = alpaca_service.get_recent_orders(limit=50)
+    if recent_orders_data.get("error"):
+        _add_error("alpaca", "PROVIDER_ERROR", "system", None,
+                   f"Could not fetch recent orders: {recent_orders_data['error']}")
+    recent_orders = recent_orders_data.get("orders", [])
+
+    market_clock = alpaca_service.get_clock()
+
+    risk_engine.begin_cycle()
+
     for symbol in settings.TRADE_UNIVERSE:
         status = _new_symbol_status()
         cycle_record["agent_status"][symbol] = status
@@ -307,19 +379,17 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
             # ------------------------------------------------------------
             # 1. MARKET DATA + NORMALIZATION + DETERMINISTIC ANALYTICS
             #    (one normalized bundle per symbol; agents never call
-            #    external data APIs directly)
+            #    external data APIs directly. The bundle contains NO news
+            #    fetch — news is owned by the independent news worker.)
             # ------------------------------------------------------------
             data = market_data_service.get_symbol_data(symbol)
             indicators = data["indicators"]
             dq = data["data_quality"]
 
             if dq["bars"] == "OK":
-                if dq["price"] == "OK":
-                    status["market_data"] = "OK"
-                    market_data_results["symbols_ok"] += 1
-                else:
-                    status["market_data"] = "OK"  # bars OK; price fell back or absent
-                    market_data_results["symbols_ok"] += 1
+                status["market_data"] = "OK"
+                market_data_results["symbols_ok"] += 1
+                if dq["price"] != "OK":
                     _add_error("alpaca", "DATA_UNAVAILABLE", "market_data", symbol,
                                data.get("price_error") or "price source unavailable")
             else:
@@ -336,8 +406,10 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
                 market_data_results["symbols_unavailable"] += 1
 
             # ------------------------------------------------------------
-            # 2. AI REASONING: technical interpretation (evidence is
-            #    pre-computed deterministically)
+            # 2. TECHNICAL ENGINE — deterministic Python (RSI/MACD/EMA/
+            #    SMA/ATR/volume/volatility/structure). The rule-based
+            #    technical_signal IS the setup verdict; the LLM only ever
+            #    (optionally, opt-in) interprets pre-computed numbers.
             # ------------------------------------------------------------
             current_stage = "technical"
             tech_report = tech_agent.analyze_technicals(symbol, indicators)
@@ -348,33 +420,87 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
             _log_event({"agent": "technical", "symbol": symbol, "level": _report_level(tech_report),
                         "message": tech_report["summary"], "data": tech_report})
 
-            # 3. News/sentiment interpretation
+            setup = _setup_exists(indicators) and not indicators.get("error")
+
+            if not setup:
+                # --------------------------------------------------------
+                # 3. NO SETUP -> HOLD. Deterministic, zero LLM calls for
+                #    this symbol: no news verdict is needed, the risk
+                #    engine is not consulted for a trade that will not
+                #    happen, and the CIO/debate never run.
+                # --------------------------------------------------------
+                decision_report = {
+                    "agent": "cio", "symbol": symbol, "decision": "HOLD",
+                    "confidence": 0.0, "notional_usd": 0.0,
+                    "reasoning": (
+                        f"No technical setup — deterministic engine signal is "
+                        f"{indicators.get('technical_signal') or 'UNAVAILABLE'} "
+                        f"(components: {indicators.get('technical_components')}). "
+                        f"HOLD without AI review."
+                    ),
+                    "error": None, "provider": "deterministic", "model": "rule-engine",
+                    "llm_status": "SKIPPED_NO_SETUP", "latency_ms": None,
+                }
+                evidence = evidence_service.assess(
+                    tech_report, None, None, debate_report=None, indicators=indicators,
+                )
+                cycle_record["decisions"].append({
+                    "symbol": symbol,
+                    "decision": "HOLD",
+                    "confidence": 0.0,
+                    "notional_usd": 0.0,
+                    "reasoning": decision_report["reasoning"],
+                    "blocked_reason": "NO_TECHNICAL_SETUP",
+                    "evidence_quality": evidence.get("quality"),
+                    "evidence": {
+                        "agents": {name: entry["state"]
+                                   for name, entry in (evidence.get("agents") or {}).items()},
+                        "available": evidence.get("available"),
+                        "missing": evidence.get("missing"),
+                        "staleness": evidence.get("staleness"),
+                    },
+                })
+                cycle_record.setdefault("evidence", {})[symbol] = {
+                    "quality": evidence.get("quality"),
+                    "agents": {name: entry["state"]
+                               for name, entry in (evidence.get("agents") or {}).items()},
+                    "staleness": evidence.get("staleness"),
+                }
+                cycle_summary["symbols_processed"].append(symbol)
+                continue
+
+            # ------------------------------------------------------------
+            # 4. SETUP EXISTS -> NEWS CONTEXT from the persistent News
+            #    Intelligence cache (a pure cache read; the worker did the
+            #    fetch/dedup/relevance/LLM work on its own schedule).
+            # ------------------------------------------------------------
             current_stage = "news"
-            headlines = data.get("news", [])
-            if data.get("news_error"):
-                # News DATA source unavailable — the agent still runs with
-                # what it has; the data failure is recorded honestly.
-                _add_error("alpaca", "DATA_UNAVAILABLE", "news", symbol, data["news_error"])
+            news_report = news_agent.analyze_news(symbol)
+            if (news_report.get("evidence_status") == "UNAVAILABLE"
+                    and not news_report.get("error")):
+                # No cached intelligence yet (worker has not populated it or
+                # no news exists): recorded as UNAVAILABLE — never a fake
+                # verdict, never a wait.
                 status["news"] = "UNAVAILABLE"
-            news_report = news_agent.analyze_news(symbol, headlines)
-            if status["news"] != "UNAVAILABLE":
+                _add_error("news_worker", "DATA_UNAVAILABLE", "news", symbol,
+                           "no cached news intelligence yet — the news worker "
+                           "populates the cache on its own schedule")
+            else:
                 status["news"] = _stage_status(news_report)
-            if news_report.get("error"):
-                _add_error(news_report.get("provider", "llm"), _llm_error_type(news_report.get("llm_status")),
-                           "news", symbol, news_report["error"])
+                if news_report.get("error"):
+                    _add_error(news_report.get("provider", "llm"),
+                               _llm_error_type(news_report.get("llm_status")),
+                               "news", symbol, news_report["error"])
             _log_event({"agent": "news", "symbol": symbol, "level": _report_level(news_report),
                         "message": news_report["summary"], "data": news_report})
 
-            # 4. Fundamentals: normalized provider data + LLM interpretation.
+            # 5. Fundamentals: normalized provider data + LLM interpretation.
             #    No provider configured -> SKIPPED (configured-off, visible
             #    in provider_results); provider failure -> UNAVAILABLE.
             current_stage = "fundamentals"
             fundamentals_report = None
             if settings.ENABLE_FUNDAMENTALS_AGENT:
                 fundamentals_data = data["fundamentals"]
-                # Always run the agent: it fail-safes internally (no LLM call
-                # when data is unavailable) so the debate/CIO still receive an
-                # explicit "fundamentals unavailable" report.
                 fundamentals_report = fundamentals_agent.analyze_fundamentals(symbol, fundamentals_data)
                 f_status = fundamentals_data.get("status")
                 if f_status == "OK":
@@ -385,8 +511,6 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
                                    _llm_error_type(fundamentals_report.get("llm_status")),
                                    "fundamentals", symbol, fundamentals_report["error"])
                 elif fundamentals_data.get("reason") == "NO_PROVIDER_CONFIGURED":
-                    # Deliberately unconfigured (FUNDAMENTALS_PROVIDER=none):
-                    # visible in provider_results, does not degrade the cycle.
                     fundamentals_provider_results["symbols_unavailable"] += 1
                     status["fundamentals"] = "SKIPPED"
                 else:
@@ -398,11 +522,9 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
                 _log_event({"agent": "fundamentals", "symbol": symbol, "level": _report_level(fundamentals_report),
                             "message": fundamentals_report["summary"], "data": fundamentals_report})
 
-            # 5. Evidence quality snapshot (which evidence is actually
-            #    available) — computed BEFORE the debate so the debate
-            #    knows exactly what is real and what is missing, and
-            #    re-computed after it for the risk/CIO/execution stages.
-            current_stage = "debate"
+            # 6. Evidence quality snapshot (which evidence is actually
+            #    available) — computed BEFORE the risk gate and AI review.
+            current_stage = "risk"
             fundamentals_evidence_report = (
                 fundamentals_report if settings.ENABLE_FUNDAMENTALS_AGENT else None
             )
@@ -413,20 +535,124 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
                 indicators=indicators,
             )
 
+            # ------------------------------------------------------------
+            # 7. HARD RISK ENGINE (deterministic, Part 15) — runs BEFORE
+            #    any AI review. An LLM can NEVER override a rejection:
+            #    after a rejection the CIO is not even consulted.
+            # ------------------------------------------------------------
+            existing_position = positions_by_symbol.get(symbol)
+            engine_verdict = risk_engine.assess_with_orders(
+                symbol, "buy", account_summary, positions_by_symbol,
+                indicators=indicators, market_clock=market_clock,
+                news_intelligence=(
+                    news_intelligence.get_cached_news_intelligence(symbol)
+                    if settings.NEWS_ENABLED else None
+                ),
+                proposed_notional_usd=(
+                    risk_gate.assess(symbol, "buy", account_summary,
+                                     existing_position, indicators).get("max_notional_usd")
+                ),
+                recent_orders=recent_orders,
+            )
+
+            if not engine_verdict["approved"]:
+                reason_code = engine_verdict.get("reason") or "RISK_REJECTED"
+                decision_report = {
+                    "agent": "cio", "symbol": symbol, "decision": "HOLD",
+                    "confidence": 0.0, "notional_usd": 0.0,
+                    "reasoning": (
+                        f"HOLD — hard risk engine rejected the trade: {reason_code} "
+                        f"(checks: {json.dumps(engine_verdict['checks'])}). "
+                        f"No AI review was run."
+                    ),
+                    "error": None, "provider": "deterministic", "model": "risk-engine",
+                    "llm_status": "SKIPPED_RISK_REJECTED", "latency_ms": None,
+                }
+                status["risk"] = "OK"          # the engine ran and decided
+                status["cio"] = "SKIPPED"      # no AI review after rejection
+                status["execution"] = "SKIPPED"
+                evidence = analyst_evidence
+                _add_error("risk_engine", reason_code, "execution", symbol,
+                           f"BUY held — hard risk engine: {reason_code}")
+                _log_event({
+                    "agent": "execution", "symbol": symbol, "level": "WARNING",
+                    "message": f"BUY held: hard risk engine rejected ({reason_code}).",
+                    "data": engine_verdict,
+                })
+                cycle_record["decisions"].append({
+                    "symbol": symbol,
+                    "decision": "HOLD",
+                    "confidence": 0.0,
+                    "notional_usd": 0.0,
+                    "reasoning": decision_report["reasoning"],
+                    "blocked_reason": reason_code,
+                    "evidence_quality": evidence.get("quality"),
+                    "evidence": {
+                        "agents": {name: entry["state"]
+                                   for name, entry in (evidence.get("agents") or {}).items()},
+                        "available": evidence.get("available"),
+                        "missing": evidence.get("missing"),
+                        "staleness": evidence.get("staleness"),
+                    },
+                })
+                cycle_record.setdefault("evidence", {})[symbol] = {
+                    "quality": evidence.get("quality"),
+                    "agents": {name: entry["state"]
+                               for name, entry in (evidence.get("agents") or {}).items()},
+                    "staleness": evidence.get("staleness"),
+                }
+                _log_event({"agent": "cio", "symbol": symbol, "level": "INFO",
+                            "message": decision_report["reasoning"], "data": decision_report})
+                cycle_summary["symbols_processed"].append(symbol)
+                continue
+
+            # ------------------------------------------------------------
+            # 8. RISK ENGINE APPROVED -> optional AI review.
+            #    8a. Risk agent (qualitative LLM reasoning on top of the
+            #        deterministic gate; may only veto/shrink).
+            # ------------------------------------------------------------
+            risk_report = risk_agent.assess_risk(
+                symbol, "buy", account_summary, existing_position, indicators,
+                evidence=analyst_evidence,
+            )
+            # The hard engine's verdict is layered in: the LLM layer can
+            # never approve what the engine did not.
+            risk_report["approved"] = bool(risk_report.get("approved")) and engine_verdict["approved"]
+            risk_report["max_notional_usd"] = min(
+                float(risk_report.get("max_notional_usd") or 0.0),
+                float(engine_verdict.get("max_notional_usd") or 0.0),
+            )
+            risk_report["engine_reason"] = engine_verdict.get("reason")
+            status["risk"] = _stage_status(risk_report)
+            if risk_report.get("error"):
+                _add_error(risk_report.get("provider", "llm"), _llm_error_type(risk_report.get("llm_status")),
+                           "risk", symbol, risk_report["error"])
+            _log_event({"agent": "risk", "symbol": symbol, "level": _report_level(risk_report),
+                        "message": risk_report["reasoning"], "data": risk_report})
+
+            # 8b. Debate (opt-in; only on conflicting, high-confidence setups
+            #     with a healthy provider).
+            current_stage = "debate"
             debate_report = None
             if settings.ENABLE_DEBATE:
-                debate_report = debate_agent.run_debate(
-                    symbol, tech_report, news_report, fundamentals_report,
-                    evidence=analyst_evidence,
-                )
-                status["debate"] = _stage_status(debate_report)
-                if debate_report.get("error"):
-                    _add_error(debate_report.get("provider", "llm"), _llm_error_type(debate_report.get("llm_status")),
-                               "debate", symbol, debate_report["error"])
-                _log_event({"agent": "debate", "symbol": symbol, "level": _report_level(debate_report),
-                            "message": f"Bull({debate_report['bull_strength']}) vs "
-                                       f"Bear({debate_report['bear_strength']}), edge={debate_report['edge']}",
-                            "data": debate_report})
+                eligible, debate_reason = _debate_eligible(tech_report, news_report)
+                if eligible:
+                    debate_report = debate_agent.run_debate(
+                        symbol, tech_report, news_report, fundamentals_report,
+                        evidence=analyst_evidence,
+                    )
+                    status["debate"] = _stage_status(debate_report)
+                    if debate_report.get("error"):
+                        _add_error(debate_report.get("provider", "llm"),
+                                   _llm_error_type(debate_report.get("llm_status")),
+                                   "debate", symbol, debate_report["error"])
+                    _log_event({"agent": "debate", "symbol": symbol, "level": _report_level(debate_report),
+                                "message": f"Bull({debate_report['bull_strength']}) vs "
+                                           f"Bear({debate_report['bear_strength']}), edge={debate_report['edge']}",
+                                "data": debate_report})
+                else:
+                    logger.info(f"Debate skipped for {symbol}: {debate_reason}")
+                    status["debate"] = "SKIPPED"
 
             # Final evidence snapshot including the debate outcome.
             evidence = evidence_service.assess(
@@ -436,36 +662,42 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
                 indicators=indicators,
             )
 
-            # 6. Risk: deterministic PORTFOLIO-RISK gate + optional LLM
-            #    reasoning (informed about decision quality — a separate
-            #    prerequisite enforced before execution below).
-            current_stage = "risk"
-            existing_position = positions_by_symbol.get(symbol)
-            risk_report = risk_agent.assess_risk(
-                symbol, "buy", account_summary, existing_position, indicators,
-                evidence=evidence,
-            )
-            status["risk"] = _stage_status(risk_report)
-            if risk_report.get("error"):
-                _add_error(risk_report.get("provider", "llm"), _llm_error_type(risk_report.get("llm_status")),
-                           "risk", symbol, risk_report["error"])
-            _log_event({"agent": "risk", "symbol": symbol, "level": _report_level(risk_report),
-                        "message": risk_report["reasoning"], "data": risk_report})
-
-            # 7. Executive decision (LLM; HOLD fail-safe on any failure)
+            # 8c. CIO executive decision (LLM; HOLD fail-safe on failure).
             current_stage = "cio"
-            memory_summary = (
-                memory_service.get_recent_outcomes_summary(symbol=symbol, lookback=10)
-                if settings.ENABLE_MEMORY else ""
-            )
-            decision_report = cio_agent.make_decision(
-                symbol, news_report, tech_report, risk_report,
-                fundamentals_report=fundamentals_report,
-                debate_report=debate_report,
-                agent_weights=agent_weights,
-                memory_summary=memory_summary,
-                evidence=evidence,
-            )
+            if settings.CIO_AGENT_ENABLED:
+                memory_summary = (
+                    memory_service.get_recent_outcomes_summary(symbol=symbol, lookback=10)
+                    if settings.ENABLE_MEMORY else ""
+                )
+                decision_report = cio_agent.make_decision(
+                    symbol, news_report, tech_report, risk_report,
+                    fundamentals_report=fundamentals_report,
+                    debate_report=debate_report,
+                    agent_weights=agent_weights,
+                    memory_summary=memory_summary,
+                    evidence=evidence,
+                )
+            else:
+                # CIO disabled: the deterministic fail-safe decides. A setup
+                # that passed the hard risk engine may open the minimum of
+                # the engine's allowed notional and 2% of equity (a
+                # deliberately conservative default position).
+                fallback_notional = round(min(
+                    float(engine_verdict.get("max_notional_usd") or 0.0),
+                    max(0.0, float(account_summary.get("equity") or 0.0) * 0.02),
+                ), 2)
+                decision_report = {
+                    "agent": "cio", "symbol": symbol,
+                    "decision": "BUY" if fallback_notional > 0 else "HOLD",
+                    "confidence": 0.0, "notional_usd": fallback_notional,
+                    "reasoning": (
+                        "CIO disabled (CIO_AGENT_ENABLED=false): deterministic "
+                        "fail-safe — setup passed the hard risk engine; opening "
+                        "a conservative 2%-of-equity position."
+                    ),
+                    "error": None, "provider": "deterministic", "model": "fail-safe",
+                    "llm_status": "SKIPPED_DISABLED", "latency_ms": None,
+                }
             status["cio"] = _stage_status(decision_report)
             if decision_report.get("error"):
                 _add_error(decision_report.get("provider", "llm"), _llm_error_type(decision_report.get("llm_status")),
@@ -497,15 +729,8 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
             }
 
             # ------------------------------------------------------------
-            # 8. DECISION-QUALITY PREREQUISITE + VALIDATION + RISK GATE +
-            #    PAPER EXECUTION.
-            #    Deterministic final gates, in order:
-            #      a. evidence quality — a trade may never be justified
-            #         solely because the portfolio-risk cap permits the
-            #         notional; missing/stale critical evidence => HOLD.
-            #      b. order validation: action, symbol, quantity, buying
-            #         power, position limits, risk constraints. AI cannot
-            #         bypass either.
+            # 9. DECISION-QUALITY PREREQUISITE + VALIDATION + RISK GATE +
+            #    PAPER EXECUTION (unchanged hard gates; AI cannot bypass).
             # ------------------------------------------------------------
             current_stage = "execution"
             trade_result = None
@@ -515,8 +740,6 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
 
             # a. DECISION-QUALITY PREREQUISITE: portfolio risk (buying
             #    power, position caps) and decision quality are separate.
-            #    With INSUFFICIENT evidence quality a BUY is held even if
-            #    the deterministic risk gate would permit the notional.
             if decision == "BUY" and not evidence.get("trade_allowed", True):
                 reason_txt = "; ".join(evidence.get("reasons") or ["evidence quality insufficient"])
                 decision = "HOLD"
@@ -545,8 +768,6 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
                     trade_universe=settings.TRADE_UNIVERSE,
                 )
                 if not validation["valid"]:
-                    # Unsafe/impossible order blocked by the deterministic
-                    # gate: recorded, never executed, decision downgraded.
                     decision = "HOLD"
                     cycle_record["decisions"][-1]["decision"] = "HOLD"
                     status["execution"] = "ERROR"
@@ -595,6 +816,15 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
                 if not trade_result.get("success"):
                     _add_error("alpaca", "ORDER_REJECTED", "execution", symbol,
                                trade_result.get("error") or "order failed")
+                else:
+                    # Persist for the daily trade cap + per-cycle duplicate guard.
+                    try:
+                        risk_engine.mark_executed(
+                            symbol, decision.lower(),
+                            trade_result.get("notional_usd") or decision_report.get("notional_usd") or 0.0,
+                        )
+                    except Exception as exc:  # noqa: BLE001 — bookkeeping never fails a fill
+                        logger.warning(f"risk_engine.mark_executed failed: {exc}")
                 cycle_record["orders"].append({
                     "symbol": symbol,
                     "side": decision.lower(),
@@ -607,7 +837,7 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
                 })
             # else: no order required (HOLD / no position / blocked) -> SKIPPED
 
-            # 9. Record the decision to persistent memory for future learning
+            # 10. Record the decision to persistent memory for future learning
             current_stage = "memory"
             if settings.ENABLE_MEMORY and decision == "BUY" and trade_result and trade_result.get("success"):
                 entry_price = indicators.get("latest_close")
@@ -652,15 +882,47 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
     return _cycle_summary_payload(cycle_summary, cycle_status)
 
 
+STATUS_LABELS = {
+    "OK": "SUCCESS",
+    "PARTIAL_ERROR": "PARTIAL_SUCCESS",  # refined to DEGRADED when LLM failures occurred
+    "ERROR": "FAILED",
+}
+
+
+def _llm_failure_count(record: dict) -> int:
+    """Total failed LLM requests in a finished cycle (per-provider error
+    counters of the cycle's usage accounting)."""
+    total = 0
+    for usage in (record.get("llm_usage") or {}).values():
+        total += int(sum((usage.get("errors") or {}).values()))
+    return total
+
+
 def _cycle_summary_payload(cycle_summary: dict, cycle_status: str) -> dict:
     """The run-now/API view of a finished cycle: status, processed symbols,
-    per-agent results, per-provider results and every structured error."""
+    per-agent results, per-provider results and every structured error.
+    Includes the standardized degradation view (status/reason/
+    llm_failures/orders_executed)."""
     record = cycle_history[0] if cycle_history else {}
+    llm_failures = _llm_failure_count(record)
+    label = STATUS_LABELS.get(cycle_status, cycle_status)
+    if cycle_status == "PARTIAL_ERROR" and llm_failures > 0:
+        label = "DEGRADED"
+    reason = "Cycle completed successfully."
+    if cycle_summary["errors"]:
+        first = cycle_summary["errors"][0]
+        reason = f"{first.get('type', 'ERROR')}: {first.get('message', '')}"
+        if label == "DEGRADED":
+            reason = f"LLM unavailable ({llm_failures} failure(s)); cached/deterministic fallback used. First error: {reason}"
     return {
         "triggered_by": cycle_summary["triggered_by"],
         "status": cycle_status,
-        "processed_symbols": cycle_summary["symbols_processed"],
-        "symbols_processed": cycle_summary["symbols_processed"],  # legacy key
+        "status_label": label,
+        "reason": reason,
+        "symbols_processed": cycle_summary["symbols_processed"],
+        "processed_symbols": cycle_summary["symbols_processed"],  # legacy key
+        "llm_failures": llm_failures,
+        "orders_executed": len(record.get("orders") or []),
         "agent_results": record.get("agent_results"),
         "provider_results": record.get("provider_results"),
         "llm_usage": record.get("llm_usage"),
@@ -712,6 +974,12 @@ async def lifespan(app: FastAPI):
     # Startup
     if settings.ENABLE_MEMORY:
         memory_service.init_db()
+    # News Intelligence + risk-engine tables live in the SAME SQLite file.
+    try:
+        news_intelligence.init_db()
+        risk_engine.init_db()
+    except Exception as exc:  # noqa: BLE001 — persistence must never crash boot
+        logger.error(f"News intelligence / risk engine DB init failed (non-fatal): {exc}")
 
     warnings = settings.validate()
     for w in warnings:
@@ -760,6 +1028,27 @@ async def lifespan(app: FastAPI):
         id="trading_cycle",
         replace_existing=True,
     )
+    # Independent News Worker (Part 11): its own schedule, never inside a
+    # trading cycle. An initial pass runs shortly after boot so the cache
+    # fills without anyone having to wait for it.
+    if settings.NEWS_ENABLED:
+        from datetime import timedelta as _timedelta
+        from apscheduler.triggers.date import DateTrigger
+        scheduler.add_job(
+            news_worker.scheduled_refresh,
+            trigger=IntervalTrigger(minutes=max(1.0, float(settings.NEWS_REFRESH_MINUTES))),
+            id="news_refresh",
+            replace_existing=True,
+        )
+        scheduler.add_job(
+            news_worker.scheduled_refresh,
+            trigger=DateTrigger(run_date=datetime.now(timezone.utc) + _timedelta(seconds=20)),
+            id="news_refresh_initial",
+            replace_existing=True,
+        )
+        logger.info(f"News worker scheduled. Refresh interval: {settings.NEWS_REFRESH_MINUTES} min.")
+    else:
+        logger.info("News worker disabled (NEWS_ENABLED=false).")
     scheduler.start()
     logger.info(f"Scheduler started. Cycle interval: {settings.CYCLE_INTERVAL_MINUTES} min.")
     yield
@@ -880,6 +1169,61 @@ async def api_realtime():
     payload = realtime_service.get_state()
     payload["market_clock"] = alpaca_service.get_clock()
     return JSONResponse(payload)
+
+
+@app.get("/api/providers/health")
+async def api_providers_health():
+    """LLM provider health: enabled flag, status, circuit state, last
+    success/failure. Never exposes API keys, headers or secrets."""
+    states = llm_service.provider_states()
+    providers = {}
+    for provider, state in states.items():
+        status = "HEALTHY"
+        if state["state"] == "NOT_CONFIGURED":
+            status = "NOT_CONFIGURED"
+        elif state["state"] in ("QUOTA_EXHAUSTED", "AUTH_ERROR", "MODEL_UNAVAILABLE",
+                                "NETWORK_ERROR", "DEGRADED"):
+            status = "UNHEALTHY"
+        providers[provider] = {
+            "enabled": bool(state.get("enabled")),
+            "status": status,
+            "circuit": state.get("circuit"),
+            "failure_count": state.get("failure_count"),
+            "last_success": state.get("last_success"),
+            "last_failure": state.get("last_failure"),
+            "detail": state.get("detail"),
+        }
+    return JSONResponse({
+        "providers": providers,
+        "unorouter_model_chain": llm_service.unorouter_model_chain(),
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+@app.get("/api/news/status")
+async def api_news_status():
+    """News worker status: last refresh, symbols processed, articles
+    fetched, duplicates ignored, articles analyzed, cache counts,
+    provider failures."""
+    return JSONResponse(news_worker.stats())
+
+
+@app.get("/api/news/{symbol}")
+async def api_news_symbol(symbol: str):
+    """Cached News Intelligence for one symbol. This is a pure cache read —
+    it NEVER triggers LLM analysis or a news fetch."""
+    intel = news_intelligence.get_cached_news_intelligence(symbol.upper())
+    return JSONResponse(intel)
+
+
+@app.get("/api/news/{symbol}/articles")
+async def api_news_symbol_articles(symbol: str):
+    """Known recent articles for a symbol (persisted, deduplicated,
+    relevance-scored). Includes analysis when one exists; never triggers
+    new analysis."""
+    articles = news_intelligence.get_recent_articles(symbol.upper())
+    return JSONResponse({"symbol": symbol.upper(), "articles": articles,
+                         "count": len(articles)})
 
 
 @app.get("/api/config")

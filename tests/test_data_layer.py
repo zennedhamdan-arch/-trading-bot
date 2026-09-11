@@ -172,8 +172,9 @@ for sym in UNIVERSE:
           bundle["price"] == 101.25 and bundle["price_source"] == "snapshot.latest_trade")
     check(f"{sym}: quote normalized (bid/ask)", bundle["quote"]["bid_price"] == 100.5
           and bundle["quote"]["ask_price"] == 101.5)
-    check(f"{sym}: data_quality price/bars/news OK",
-          q["price"] == "OK" and q["bars"] == "OK" and q["news"] == "OK")
+    check(f"{sym}: data_quality price/bars OK, news delegated to the worker",
+          q["price"] == "OK" and q["bars"] == "OK"
+          and q["news"] == "DELEGATED_TO_WORKER")
     check(f"{sym}: fundamentals DATA_UNAVAILABLE (no provider), never fabricated",
           q["fundamentals"] == "DATA_UNAVAILABLE"
           and bundle["fundamentals"]["reason"] == "NO_PROVIDER_CONFIGURED"
@@ -181,9 +182,17 @@ for sym in UNIVERSE:
     check(f"{sym}: feed labeled honestly", bundle["feed"] == "IEX")
 
 bundle = market_data_service.get_symbol_data("AAPL")
+check("cycle bundle carries no news fetch (worker-owned; cycle never blocks on news)",
+      bundle["news"] == [] and _FakeNewsClient.last_request is None)
+news_result = market_data_service.get_news("AAPL")
 check("news headlines retrieved via the normalized layer",
-      bundle["news"] == ["headline-1", "headline-2"] and _FakeNewsClient.last_request is not None)
+      news_result["headlines"] == ["headline-1", "headline-2"]
+      and _FakeNewsClient.last_request is not None)
 check("news request carries symbol", _FakeNewsClient.last_request.symbols == "AAPL")
+articles = market_data_service.get_news_articles("AAPL")
+check("full article objects available for the news worker (id/headline/source/...)",
+      articles["error"] is None and len(articles["articles"]) == 2
+      and articles["articles"][0]["headline"] == "headline-1")
 
 # ---------------------------------------------------------------------------
 print("2. price fallback chain (snapshot unavailable -> bar close):")

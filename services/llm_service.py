@@ -1,13 +1,52 @@
 """
 services/llm_service.py
 
-Centralized LLM router (the "LLMRouter" of the architecture):
+Centralized LLM router (the "LLMService" of the V2 architecture):
 
-    LLMRouter
-      ├── GroqProvider
-      ├── NVIDIAProvider
-      ├── GeminiProvider
-      └── OpenRouterProvider
+    LLM REQUEST
+      |
+      v
+    CHECK CACHE  --(hit)--> RETURN CACHE
+      | miss
+      v
+    UNOROUTER PRIMARY MODEL
+      | fail
+      v
+    UNOROUTER FALLBACK MODEL 1
+      | fail
+      v
+    UNOROUTER FALLBACK MODEL 2          (<= LLM_MAX_MODEL_ATTEMPTS models)
+      | fail
+      v
+    GROQ                               (final provider fallback)
+      | fail
+      v
+    CACHED RESULT (if one exists, even stale)
+      | none
+      v
+    DETERMINISTIC FALLBACK             (agent-level, e.g. news keywords)
+
+Providers (OpenAI-compatible unless noted):
+    unorouter (PRIMARY), groq, nvidia, gemini, openrouter
+
+Hard latency policy (no long retries, ever):
+    * every HTTP call has a LLM_REQUEST_TIMEOUT_SECONDS timeout
+    * SDK-level retries are LLM_MAX_RETRIES (default 0)
+    * a failed attempt records the failure, updates the circuit breaker and
+      IMMEDIATELY moves to the next model/provider — the trading cycle never
+      waits 30-60s for a provider to recover.
+
+Circuit breakers per provider:
+    * classic consecutive-failure breaker: CLOSED -> OPEN (after
+      LLM_CIRCUIT_BREAKER_FAILURE_THRESHOLD consecutive failures, for
+      LLM_CIRCUIT_BREAKER_BACKOFF_SECONDS) -> HALF_OPEN probe -> CLOSED/OPEN.
+      While OPEN no requests are sent to that provider at all.
+    * plus the specific circuits: 429 quota (provider paused), 401/403 auth
+      (provider paused), 404 model (that provider+model pair paused).
+
+Standardized response: every result can be rendered via LLMResult.standard():
+    {"success": true, "provider": "...", "model": "...", "content": "...",
+     "cached": false, "fallback_used": false, "latency_ms": 0, "error": null}
 
 Agents never implement provider-specific HTTP calls. They call
 
@@ -15,42 +54,25 @@ Agents never implement provider-specific HTTP calls. They call
     llm_service.call(agent="debate", system=..., user=...)   # system/user-style
     llm_service.call_json(agent="news", system=..., user=...)  # + JSON parsing
 
-Responsibilities:
-  - Routing: task -> (provider, model), resolved from settings at CALL time
-    (LLM_<TASK>_PROVIDER plus per-provider model envs). No model ids are
-    hardcoded in agent source files.
-  - Optional global fallback route (LLM_FALLBACK_PROVIDER/LLM_FALLBACK_MODEL),
-    used only when explicitly configured AND verified in the fallback
-    provider's live catalog — never for quota errors, never silently.
-  - Statuses (every result carries provider/model/status/latency/error_type):
-        OK, NOT_CONFIGURED, MODEL_NOT_FOUND, PROVIDER_QUOTA_EXCEEDED,
-        RATE_LIMITED, PROVIDER_ERROR, AUTH_ERROR, NETWORK_ERROR,
-        INVALID_RESPONSE
-  - Circuit breakers per provider:
-        * 429 quota-exhausted  -> provider paused for the server retry delay
-          (or the configured backoff); NEVER retried; later calls short-
-          circuit with PROVIDER_QUOTA_EXCEEDED. No per-agent/per-symbol
-          retry storms, no duplicate requests.
-        * 429 transient        -> at most LLM_RATE_LIMIT_MAX_RETRIES retries,
-          only when the server gave a short explicit retry delay.
-        * 404 MODEL_NOT_FOUND  -> the (provider, model) pair is short-circuited
-          for MODEL_UNAVAILABLE_COOLDOWN_MINUTES; the same request is never
-          re-sent blindly.
-        * 401/403 auth failure -> provider paused for AUTH_COOLDOWN_MINUTES;
-          no repeated auth attempts.
-        * local rolling-24h request budget per provider (e.g. Gemini free
-          tier = 20/day) short-circuits BEFORE requests are sent.
-  - Usage accounting: per-cycle counters per provider/agent/symbol.
-  - Startup validation: validate_models() checks every configured model id
-    against each provider's LIVE /models catalog.
-  - provider_states(): READY / DEGRADED / QUOTA_EXHAUSTED / MODEL_UNAVAILABLE /
-    AUTH_ERROR / NETWORK_ERROR / NOT_CONFIGURED for dashboards and health.
+Statuses (every result carries provider/model/status/latency/error_type):
+    OK, NOT_CONFIGURED, MODEL_NOT_FOUND, PROVIDER_QUOTA_EXCEEDED,
+    RATE_LIMITED, PROVIDER_ERROR, AUTH_ERROR, NETWORK_ERROR,
+    INVALID_RESPONSE, CIRCUIT_OPEN
+
+Model selection is EXPLICIT and owned by this application — UnoRouter (or any
+gateway) never chooses models for us. Configured ids are verified against each
+provider's LIVE /models catalog at startup; an id that no longer exists is
+skipped at runtime with LLM_MODEL_UNAVAILABLE logged and the next configured
+model is tried. No unlimited model guessing: at most LLM_MAX_MODEL_ATTEMPTS
+models per request.
 """
 
+import hashlib
 import logging
 import re
 import time
-from collections import deque
+from collections import OrderedDict, deque
+from datetime import datetime, timezone
 
 from config import settings
 from services import gemini_service
@@ -61,7 +83,7 @@ logger = logging.getLogger("llm_service")
 # gemini transport module for backward compatibility with direct callers).
 extract_json = gemini_service._extract_json
 
-PROVIDERS = ("groq", "nvidia", "gemini", "openrouter")
+PROVIDERS = ("unorouter", "groq", "nvidia", "gemini", "openrouter")
 
 # ---------------------------------------------------------------------------
 # Provider classes
@@ -73,6 +95,7 @@ class BaseLLMProvider:
 
     name = "base"
     key_attr = ""                    # settings attribute holding the API key
+    enabled_attr = ""                # settings attribute gating the provider
     daily_limit_attr = ""            # settings attribute for the local 24h budget
     quota_backoff_attr = ""          # settings attribute for the 429 backoff
 
@@ -89,6 +112,7 @@ class BaseLLMProvider:
 class GroqProvider(BaseLLMProvider):
     name = "groq"
     key_attr = "GROQ_API_KEY"
+    enabled_attr = "GROQ_ENABLED"
     daily_limit_attr = "GROQ_DAILY_REQUEST_LIMIT"
     quota_backoff_attr = "GROQ_QUOTA_BACKOFF_MINUTES"
 
@@ -96,7 +120,11 @@ class GroqProvider(BaseLLMProvider):
         client = _clients.get(self.name)
         if client is None:
             from groq import Groq
-            client = Groq(api_key=_provider_key(self.name))
+            client = Groq(
+                api_key=_provider_key(self.name),
+                timeout=max(1.0, float(settings.LLM_REQUEST_TIMEOUT_SECONDS)),
+                max_retries=max(0, int(settings.LLM_MAX_RETRIES)),
+            )
             _clients[self.name] = client
         return client
 
@@ -117,7 +145,7 @@ class GroqProvider(BaseLLMProvider):
 
 
 class _OpenAICompatProvider(BaseLLMProvider):
-    """OpenAI-compatible endpoint (OpenRouter, NVIDIA NIM)."""
+    """OpenAI-compatible endpoint (UnoRouter, OpenRouter, NVIDIA NIM)."""
 
     def get_client(self):
         client = _clients.get(self.name)
@@ -126,6 +154,8 @@ class _OpenAICompatProvider(BaseLLMProvider):
             client = OpenAI(
                 api_key=_provider_key(self.name),
                 base_url=self.base_url(),
+                timeout=max(1.0, float(settings.LLM_REQUEST_TIMEOUT_SECONDS)),
+                max_retries=max(0, int(settings.LLM_MAX_RETRIES)),
             )
             _clients[self.name] = client
         return client
@@ -147,6 +177,22 @@ class _OpenAICompatProvider(BaseLLMProvider):
 
     def list_models(self):
         return _extract_model_ids(self.get_client().models.list())
+
+
+class UnoRouterProvider(_OpenAICompatProvider):
+    """UnoRouter — OpenAI-compatible gateway (api.unorouter.com/v1).
+
+    The APPLICATION owns model selection: primary + fallback model ids come
+    from config and are tried in order. UnoRouter never chooses for us.
+    """
+    name = "unorouter"
+    key_attr = "UNOROUTER_API_KEY"
+    enabled_attr = "UNOROUTER_ENABLED"
+    daily_limit_attr = "UNOROUTER_DAILY_REQUEST_LIMIT"
+    quota_backoff_attr = "UNOROUTER_QUOTA_BACKOFF_MINUTES"
+
+    def base_url(self):
+        return settings.UNOROUTER_BASE_URL
 
 
 class OpenRouterProvider(_OpenAICompatProvider):
@@ -188,6 +234,7 @@ class GeminiProvider(BaseLLMProvider):
 
 
 _PROVIDER_INSTANCES = {
+    "unorouter": UnoRouterProvider(),
     "groq": GroqProvider(),
     "nvidia": NVIDIAProvider(),
     "gemini": GeminiProvider(),
@@ -228,6 +275,14 @@ _TASK_MODELS = {
     ("nvidia", "cio"): "NVIDIA_MODEL",
     ("nvidia", "news"): "NVIDIA_MODEL",
     ("nvidia", "fundamentals"): "NVIDIA_MODEL",
+    # UnoRouter tasks all use the application's explicit model chain
+    # (primary + UNOROUTER_FALLBACK_MODELS), resolved in _candidate_chain().
+    ("unorouter", "technical"): "UNOROUTER_PRIMARY_MODEL",
+    ("unorouter", "debate"): "UNOROUTER_PRIMARY_MODEL",
+    ("unorouter", "risk"): "UNOROUTER_PRIMARY_MODEL",
+    ("unorouter", "cio"): "UNOROUTER_PRIMARY_MODEL",
+    ("unorouter", "news"): "UNOROUTER_PRIMARY_MODEL",
+    ("unorouter", "fundamentals"): "UNOROUTER_PRIMARY_MODEL",
 }
 
 
@@ -260,6 +315,13 @@ def _provider_key(provider: str) -> str:
     return str(getattr(settings, _PROVIDER_INSTANCES[provider].key_attr, "") or "")
 
 
+def _provider_enabled(provider: str) -> bool:
+    inst = _PROVIDER_INSTANCES[provider]
+    if not inst.enabled_attr:
+        return True
+    return bool(getattr(settings, inst.enabled_attr, True))
+
+
 def _daily_limit(provider: str) -> int:
     return int(getattr(settings, _PROVIDER_INSTANCES[provider].daily_limit_attr, 0) or 0)
 
@@ -267,6 +329,13 @@ def _daily_limit(provider: str) -> int:
 def _quota_backoff_seconds(provider: str) -> float:
     minutes = float(getattr(settings, _PROVIDER_INSTANCES[provider].quota_backoff_attr, 30) or 30)
     return max(30.0, minutes * 60.0)
+
+
+def _groq_chain_model(task: str) -> str:
+    """The Groq model used when the chain falls back to Groq for a task
+    routed to UnoRouter: the task's Groq model when configured, else the
+    generic Groq fallback model."""
+    return _task_model("groq", task) or str(settings.GROQ_FALLBACK_MODEL or "")
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +351,20 @@ _auth_backoff_until = {p: 0.0 for p in PROVIDERS}       # 401/403 circuit
 _model_unavailable_until = {}                           # (provider, model) -> deadline (404 circuit)
 _request_times = {p: deque() for p in PROVIDERS}        # rolling 24h send stamps
 _last_failure = {p: None for p in PROVIDERS}            # {"status", "at"} for DEGRADED display
+
+# Classic consecutive-failure circuit breaker (CLOSED -> OPEN -> HALF_OPEN).
+_breaker = {
+    p: {"failures": 0, "open_until": 0.0,
+        "last_success": None, "last_failure": None}
+    for p in PROVIDERS
+}
+
+# Router-level response cache: identical (agent, prompt) within the TTL is
+# served without a network call; on total chain failure the last cached
+# response is the "cached result" stop before the agent deterministic
+# fallback. Bounded (LRU eviction), never stores secrets beyond prompt text
+# the agents themselves already hold.
+_response_cache: "OrderedDict[tuple, dict]" = OrderedDict()
 
 _cycle_usage = {}
 
@@ -305,8 +388,8 @@ def reset_cycle_usage() -> None:
 
 
 def reset_all_state() -> None:
-    """Test hook: clears clients, circuits, rolling budgets, usage and
-    validation cache. Does NOT touch settings."""
+    """Test hook: clears clients, circuits, breakers, caches, rolling
+    budgets, usage and validation cache. Does NOT touch settings."""
     _clients.clear()
     _verified_models.clear()
     global _last_validation
@@ -316,7 +399,10 @@ def reset_all_state() -> None:
         _auth_backoff_until[p] = 0.0
         _request_times[p].clear()
         _last_failure[p] = None
+        _breaker[p] = {"failures": 0, "open_until": 0.0,
+                       "last_success": None, "last_failure": None}
     _model_unavailable_until.clear()
+    _response_cache.clear()
     reset_cycle_usage()
 
 
@@ -337,11 +423,76 @@ def cycle_usage() -> dict:
     return out
 
 
-def provider_states() -> dict:
-    """Circuit-breaker state per provider (for /api/health, /api/config).
+# ---------------------------------------------------------------------------
+# Classic circuit breaker (CLOSED / OPEN / HALF_OPEN)
+# ---------------------------------------------------------------------------
 
-    READY | NOT_CONFIGURED | QUOTA_EXHAUSTED | MODEL_UNAVAILABLE |
-    AUTH_ERROR | NETWORK_ERROR | DEGRADED
+def _breaker_state(provider: str) -> str:
+    entry = _breaker[provider]
+    if entry["failures"] >= _breaker_threshold() and entry["open_until"] > time.monotonic():
+        return "OPEN"
+    if entry["failures"] >= _breaker_threshold():
+        return "HALF_OPEN"  # backoff expired: the next request is a probe
+    return "CLOSED"
+
+
+def _breaker_threshold() -> int:
+    return max(1, int(settings.LLM_CIRCUIT_BREAKER_FAILURE_THRESHOLD or 3))
+
+
+def _breaker_backoff_s() -> float:
+    return max(1.0, float(settings.LLM_CIRCUIT_BREAKER_BACKOFF_SECONDS or 600.0))
+
+
+def _breaker_check(provider: str):
+    """(allowed, reason). While OPEN no request is sent to the provider."""
+    if not settings.LLM_CIRCUIT_BREAKER_ENABLED:
+        return True, None
+    state = _breaker_state(provider)
+    if state == "OPEN":
+        remaining = int(round(_breaker[provider]["open_until"] - time.monotonic()))
+        return False, (
+            f"circuit OPEN after {_breaker[provider]['failures']} consecutive "
+            f"failures — no request sent for another {remaining}s"
+        )
+    return True, None
+
+
+def _breaker_success(provider: str) -> None:
+    _breaker[provider]["failures"] = 0
+    _breaker[provider]["open_until"] = 0.0
+    _breaker[provider]["last_success"] = _now_iso()
+
+
+def _breaker_failure(provider: str, status: str) -> None:
+    if not settings.LLM_CIRCUIT_BREAKER_ENABLED:
+        _breaker[provider]["last_failure"] = _now_iso()
+        return
+    entry = _breaker[provider]
+    entry["failures"] += 1
+    entry["last_failure"] = _now_iso()
+    if entry["failures"] >= _breaker_threshold():
+        was_open = _breaker_state(provider) in ("OPEN", "HALF_OPEN")
+        entry["open_until"] = time.monotonic() + _breaker_backoff_s()
+        if not was_open:
+            logger.warning(
+                f"{provider}: circuit breaker OPEN after {entry['failures']} "
+                f"consecutive failures (last status {status}); no requests for "
+                f"{_breaker_backoff_s():.0f}s."
+            )
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def provider_states() -> dict:
+    """Circuit-breaker state per provider (for /api/health, /api/config,
+    /api/providers/health). No secrets.
+
+    state: READY | NOT_CONFIGURED | QUOTA_EXHAUSTED | MODEL_UNAVAILABLE |
+           AUTH_ERROR | NETWORK_ERROR | DEGRADED
+    circuit: CLOSED | OPEN | HALF_OPEN   (classic consecutive-failure breaker)
     """
     now = time.monotonic()
     states = {}
@@ -352,8 +503,12 @@ def provider_states() -> dict:
         while stamps and stamps[0] <= now - _ROLLING_WINDOW_S:
             stamps.popleft()
 
+        breaker = _breaker[provider]
         detail = ""
-        if not _provider_key(provider):
+        if not _provider_enabled(provider):
+            state = "NOT_CONFIGURED"
+            detail = f"disabled via {inst.enabled_attr}=false"
+        elif not _provider_key(provider):
             state = "NOT_CONFIGURED"
             detail = f"{inst.key_attr} not set"
         elif _auth_backoff_until[provider] > now:
@@ -387,6 +542,17 @@ def provider_states() -> dict:
         states[provider] = {
             "state": state,
             "detail": detail,
+            "enabled": _provider_enabled(provider) and bool(_provider_key(provider)),
+            "circuit": _breaker_state(provider),
+            "failure_count": breaker["failures"],
+            "open_until": (
+                datetime.fromtimestamp(
+                    time.time() + (breaker["open_until"] - now), tz=timezone.utc
+                ).isoformat()
+                if breaker["open_until"] > now else None
+            ),
+            "last_success": breaker["last_success"],
+            "last_failure": breaker["last_failure"],
             "requests_last_24h": len(stamps),
             "daily_request_limit": limit,
             "quota_cooldown_remaining_s": round(max(0.0, _quota_backoff_until[provider] - now), 1),
@@ -501,7 +667,7 @@ def _classify_exception(exc: Exception):
 
 
 # ---------------------------------------------------------------------------
-# Circuit breakers
+# Specific circuits (quota / auth / dead model)
 # ---------------------------------------------------------------------------
 
 def _quota_blocked(provider: str):
@@ -550,8 +716,9 @@ def _mark_model_unavailable(provider: str, model: str) -> None:
     minutes = max(0.5, float(settings.MODEL_UNAVAILABLE_COOLDOWN_MINUTES or 30))
     _model_unavailable_until[(provider, model)] = time.monotonic() + minutes * 60.0
     logger.warning(
-        f"{provider}: model '{model}' not found (404). Circuit open for "
-        f"{minutes:.0f} min; requests to it short-circuit with MODEL_NOT_FOUND."
+        f"LLM_MODEL_UNAVAILABLE: {provider}: model '{model}' not found (404) "
+        f"or absent from the live catalog. Circuit open for {minutes:.0f} min; "
+        f"requests to it short-circuit and the next configured model is tried."
     )
 
 
@@ -579,13 +746,27 @@ def _count_request(provider: str) -> None:
 # Result type + usage recording
 # ---------------------------------------------------------------------------
 
+# Standardized error codes for LLMResult.standard() (Part 5 contract).
+_ERROR_CODES = {
+    "NOT_CONFIGURED": "PROVIDER_NOT_CONFIGURED",
+    "MODEL_NOT_FOUND": "LLM_MODEL_UNAVAILABLE",
+    "PROVIDER_QUOTA_EXCEEDED": "QUOTA_EXCEEDED",
+    "RATE_LIMITED": "RATE_LIMITED",
+    "PROVIDER_ERROR": "PROVIDER_ERROR",
+    "AUTH_ERROR": "AUTH_ERROR",
+    "NETWORK_ERROR": "NETWORK_ERROR",
+    "INVALID_RESPONSE": "INVALID_RESPONSE",
+    "CIRCUIT_OPEN": "PROVIDER_UNAVAILABLE",
+}
+
 
 class LLMResult:
-    """Outcome of one task->provider request."""
+    """Outcome of one task request (standardized via standard())."""
 
     def __init__(self, agent, provider, model, status, text="", parsed=None,
                  latency_ms=None, error=None, error_type=None, attempts=0,
-                 fallback_used=False):
+                 fallback_used=False, cached=False, cache_age_s=None,
+                 cache_replay=False):
         self.agent = agent
         self.provider = provider
         self.model = model
@@ -597,10 +778,39 @@ class LLMResult:
         self.error_type = error_type or (None if status == "OK" else status)
         self.attempts = attempts
         self.fallback_used = fallback_used
+        self.cached = cached
+        self.cache_age_s = cache_age_s
+        # cache_replay: served from cache AFTER a total chain failure
+        # (the "cached result" stop before the deterministic fallback).
+        self.cache_replay = cache_replay
 
     @property
     def ok(self) -> bool:
         return self.status == "OK"
+
+    def standard(self) -> dict:
+        """The standardized response shape every provider funnel returns."""
+        if self.ok:
+            return {
+                "success": True,
+                "provider": self.provider,
+                "model": self.model,
+                "content": self.text,
+                "cached": self.cached,
+                "fallback_used": self.fallback_used,
+                "latency_ms": self.latency_ms,
+                "error": None,
+            }
+        return {
+            "success": False,
+            "provider": None,
+            "model": None,
+            "content": None,
+            "cached": False,
+            "fallback_used": self.fallback_used,
+            "latency_ms": self.latency_ms,
+            "error": _ERROR_CODES.get(self.status, "PROVIDER_UNAVAILABLE"),
+        }
 
     def as_dict(self) -> dict:
         return {
@@ -613,6 +823,8 @@ class LLMResult:
             "error_type": self.error_type,
             "attempts": self.attempts,
             "fallback_used": self.fallback_used,
+            "cached": self.cached,
+            "cache_replay": self.cache_replay,
         }
 
 
@@ -662,7 +874,8 @@ def _reclassify(result: LLMResult, symbol=None) -> LLMResult:
 
 
 # ---------------------------------------------------------------------------
-# Transport (one attempt = bounded retries for transient rate limits only)
+# Transport (one attempt = NO retries unless a short explicit 429 delay;
+# failures immediately hand over to the next model/provider)
 # ---------------------------------------------------------------------------
 
 
@@ -710,110 +923,242 @@ def _attempt(provider: str, model: str, system: str, user: str,
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# Response cache
 # ---------------------------------------------------------------------------
 
 
-def _resolve_route(agent: str):
-    """Returns (provider, model, fallback_provider, fallback_model)."""
+def _cache_key(agent: str, system: str, user: str) -> str:
+    payload = f"{agent}\x00{system}\x00{user}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _cache_get(key: str, fresh_only: bool = True):
+    entry = _response_cache.get(key)
+    if entry is None:
+        return None
+    if fresh_only and entry["expires"] <= time.monotonic():
+        return None  # stale entries only serve total-failure replay
+    _response_cache.move_to_end(key)
+    return entry
+
+
+def _cache_put(key: str, text: str, parsed, provider: str, model: str) -> None:
+    ttl = max(0.0, float(settings.LLM_RESPONSE_CACHE_TTL_MINUTES) * 60.0)
+    if ttl <= 0:
+        return
+    _response_cache[key] = {
+        "expires": time.monotonic() + ttl,
+        "stored": time.monotonic(),
+        "text": text,
+        "parsed": parsed,
+        "provider": provider,
+        "model": model,
+    }
+    _response_cache.move_to_end(key)
+    max_entries = max(1, int(settings.LLM_RESPONSE_CACHE_MAX_ENTRIES or 500))
+    while len(_response_cache) > max_entries:
+        _response_cache.popitem(last=False)
+
+
+# ---------------------------------------------------------------------------
+# Candidate chain resolution (the application's OWN model fallback logic)
+# ---------------------------------------------------------------------------
+
+
+def _candidate_chain(agent: str):
+    """Resolves the ordered (provider, model) candidates for a task.
+
+    - task routed to UnoRouter: [uno primary, uno fallback 1, uno fallback 2,
+      ...] capped at LLM_MAX_MODEL_ATTEMPTS models, then Groq (the final
+      provider fallback) when Groq is configured.
+    - task routed to Groq: [groq model] (+ the optional verified global
+      fallback route, unchanged legacy behavior).
+    - any other provider: [provider model] (+ optional global fallback).
+    """
     route = route_info(agent)
     provider, model = route["provider"], route["model"]
-    fb_provider = route["fallback_provider"]
-    fb_model = route["fallback_model"]
+    fb_provider, fb_model = route["fallback_provider"], route["fallback_model"]
+
+    if provider == "unorouter":
+        models = [str(settings.UNOROUTER_PRIMARY_MODEL or "")]
+        models += [m for m in (settings.UNOROUTER_FALLBACK_MODELS or []) if m]
+        # Cap MODEL attempts (never unlimited model guessing).
+        cap = max(1, int(settings.LLM_MAX_MODEL_ATTEMPTS or 3))
+        models = models[:cap]
+        chain = [("unorouter", m) for m in models if m]
+        # Final provider fallback: Groq, when it is usable at all.
+        if _provider_enabled("groq") and _provider_key("groq"):
+            groq_model = _groq_chain_model(agent)
+            if groq_model:
+                chain.append(("groq", groq_model))
+        return chain, route
+
+    # Legacy/single-route providers (+ optional verified global fallback).
+    chain = [(provider, model)] if provider in _PROVIDER_INSTANCES else []
     fallback_usable = (
         bool(fb_provider) and bool(fb_model)
         and fb_provider in _PROVIDER_INSTANCES
         and fb_provider != provider
         and fb_model in _verified_models.get(fb_provider, set())
     )
-    return provider, model, (fb_provider if fallback_usable else None), (fb_model if fallback_usable else None)
+    if fallback_usable:
+        chain.append((fb_provider, fb_model))
+    return chain, route
+
+
+def _candidate_precheck(provider: str, model: str):
+    """(status, error) when a candidate must be skipped WITHOUT a network
+    call (circuits), else (None, None)."""
+    now = time.monotonic()
+    if not _provider_enabled(provider):
+        return "NOT_CONFIGURED", f"{_PROVIDER_INSTANCES[provider].enabled_attr}=false"
+    if not _provider_key(provider):
+        key_name = _PROVIDER_INSTANCES[provider].key_attr
+        return "NOT_CONFIGURED", f"{key_name} not configured."
+    allowed, breaker_reason = _breaker_check(provider)
+    if not allowed:
+        return "CIRCUIT_OPEN", f"CIRCUIT_OPEN: {breaker_reason}."
+    blocked, reason = _quota_blocked(provider)
+    if blocked:
+        return "PROVIDER_QUOTA_EXCEEDED", f"PROVIDER_QUOTA_EXCEEDED: {reason}."
+    if _auth_backoff_until[provider] > now:
+        remaining = int(round(_auth_backoff_until[provider] - now))
+        return "AUTH_ERROR", (f"AUTH_ERROR: authentication previously failed on {provider}; "
+                              f"circuit open ({remaining}s remaining).")
+    if _model_unavailable_until.get((provider, model), 0.0) > now:
+        remaining = int(round(_model_unavailable_until[(provider, model)] - now))
+        return "MODEL_NOT_FOUND", (f"LLM_MODEL_UNAVAILABLE: model '{model}' previously "
+                                   f"returned 404 on {provider}; circuit open "
+                                   f"({remaining}s remaining).")
+    return None, None
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 
 def call(agent: str, system: str, user: str, temperature: float = 0.2,
-         max_tokens: int = 500, symbol: str = None) -> LLMResult:
-    """Runs one task request against its configured provider/model.
-    Never raises for provider-side problems."""
-    provider, model, fb_provider, fb_model = _resolve_route(agent)
+         max_tokens: int = 500, symbol: str = None,
+         expect_json: bool = False) -> LLMResult:
+    """Runs one task request through the unified chain:
 
-    # --- configuration checks (no fallback: these are config problems the
-    #     operator must see, not transient failures to route around) --------
-    if provider not in _PROVIDER_INSTANCES:
+    cache -> provider chain (primary model -> fallback models -> Groq)
+    -> cached replay on total failure. Never raises for provider-side
+    problems; never blocks on long retries (10s timeout, 0 SDK retries).
+    """
+    t0 = time.monotonic()
+    key = _cache_key(agent, system, user)
+
+    # 1. CACHE HIT (fresh) -> return without any network call.
+    entry = _cache_get(key, fresh_only=True)
+    if entry is not None:
+        return LLMResult(
+            agent, entry["provider"], entry["model"], "OK",
+            text=entry["text"], parsed=entry["parsed"],
+            latency_ms=0.0, cached=True,
+            cache_age_s=round(time.monotonic() - entry["stored"], 1),
+        )
+
+    chain, route = _candidate_chain(agent)
+
+    # Configuration problem with no usable candidate at all.
+    if not chain or route["provider"] not in _PROVIDER_INSTANCES:
         return _record(LLMResult(
-            agent, provider, model, "PROVIDER_ERROR",
-            error=f"PROVIDER_ERROR: unknown LLM provider '{provider}' "
+            agent, route["provider"], route["model"], "PROVIDER_ERROR",
+            error=f"PROVIDER_ERROR: unknown LLM provider '{route['provider']}' "
                   f"(check LLM_*_PROVIDER settings).",
         ), symbol)
-
-    if not _provider_key(provider):
-        key_name = _PROVIDER_INSTANCES[provider].key_attr
+    if not route["model"] and route["provider"] != "unorouter":
+        model_env = _TASK_MODELS.get((route["provider"], agent), "?")
         return _record(LLMResult(
-            agent, provider, model, "NOT_CONFIGURED",
-            error=f"{key_name} not configured.",
+            agent, route["provider"], "", "NOT_CONFIGURED",
+            error=f"No model configured for {agent} on {route['provider']} (set {model_env}).",
         ), symbol)
 
-    if not model:
-        model_env = _TASK_MODELS.get((provider, agent), "?")
-        return _record(LLMResult(
-            agent, provider, "", "NOT_CONFIGURED",
-            error=f"No model configured for {agent} on {provider} (set {model_env}).",
-        ), symbol)
-
-    # --- quota circuit: reported honestly, NEVER routed around -------------
-    blocked, reason = _quota_blocked(provider)
-    if blocked:
-        return _record(LLMResult(
-            agent, provider, model, "PROVIDER_QUOTA_EXCEEDED",
-            error=f"PROVIDER_QUOTA_EXCEEDED: {reason}.",
-        ), symbol)
-
-    # --- attempt plan: primary, then the verified fallback (if any). A
-    #     circuit-blocked candidate (auth / dead model) produces a synthetic
-    #     result WITHOUT a network call and falls through to the fallback.
-    t0 = time.monotonic()
-    routes = [(provider, model)]
-    if fb_provider and fb_model:
-        routes.append((fb_provider, fb_model))
-
+    # 2. Walk the chain: each failure records, updates circuits, and
+    #    IMMEDIATELY tries the next candidate. No sleeping between models.
     last_result = None
-    for idx, (cand_provider, cand_model) in enumerate(routes):
-        now = time.monotonic()
-        if _auth_backoff_until[cand_provider] > now:
-            status = "AUTH_ERROR"
-            error = (f"AUTH_ERROR: authentication previously failed on {cand_provider}; "
-                     f"circuit open ({int(round(_auth_backoff_until[cand_provider] - now))}s remaining).")
-        elif _model_unavailable_until.get((cand_provider, cand_model), 0.0) > now:
-            status = "MODEL_NOT_FOUND"
-            error = (f"MODEL_NOT_FOUND: model '{cand_model}' previously returned 404 on "
-                     f"{cand_provider}; circuit open "
-                     f"({int(round(_model_unavailable_until[(cand_provider, cand_model)] - now))}s remaining).")
-        else:
+    for idx, (cand_provider, cand_model) in enumerate(chain):
+        if not cand_model:
+            continue
+        pre_status, pre_error = _candidate_precheck(cand_provider, cand_model)
+        if pre_status is None:
             status, attempt_error, text, _ = _attempt(
                 cand_provider, cand_model, system, user, temperature, max_tokens
             )
+            parsed = None
+            if status == "OK" and expect_json:
+                # Malformed JSON is treated as a failed ATTEMPT: the next
+                # model in the chain gets a chance instead of failing the
+                # whole call.
+                try:
+                    parsed = extract_json(text)
+                except Exception as exc:  # noqa: BLE001 — parse errors are data
+                    status = "INVALID_RESPONSE"
+                    attempt_error = f"unparseable JSON response: {exc}"
             if status == "OK":
+                _breaker_success(cand_provider)
+                if expect_json and parsed is None:
+                    parsed = _safe_parse(text)
+                _cache_put(key, text, parsed, cand_provider, cand_model)
                 return _record(LLMResult(
                     agent, cand_provider, cand_model, "OK", text=text,
+                    parsed=parsed,
                     latency_ms=round((time.monotonic() - t0) * 1000, 1),
                     attempts=idx + 1, fallback_used=idx > 0,
                 ), symbol)
             error = f"{status}: {attempt_error}"
+        else:
+            # Circuit/config skip (no network call): the specific circuit
+            # (quota/auth/model/breaker) already owns its window — a skip is
+            # NOT counted as a new failure, so the breaker can close.
+            status, error = pre_status, pre_error
 
+        # Only an ACTUAL failed attempt updates the failure breaker.
+        if pre_status is None:
+            _breaker_failure(cand_provider, status)
         last_result = LLMResult(
             agent, cand_provider, cand_model, status,
             latency_ms=round((time.monotonic() - t0) * 1000, 1),
             error=error, attempts=idx + 1, fallback_used=idx > 0,
         )
-        if status == "PROVIDER_QUOTA_EXCEEDED":
-            break  # quota is reported honestly, never routed around
-        if idx == 0 and len(routes) > 1:
-            logger.warning(
-                f"{agent}: {provider}/{model} failed ({status}); trying verified "
-                f"fallback {fb_provider}/{fb_model}."
+        if idx == 0 and len(chain) > 1:
+            log = logger.info if status == "NOT_CONFIGURED" else logger.warning
+            log(
+                f"{agent}: {cand_provider}/{cand_model} unavailable ({status}); "
+                f"trying next fallback in the chain."
             )
-            continue
-        break
+        # Quota exhaustion ends the chain for THAT provider only; other
+        # providers (e.g. Groq after UnoRouter) still get their turn.
+
+    # 3. Total chain failure -> cached replay (even a stale entry) if one
+    #    exists; the agent's deterministic fallback is the next stop after.
+    if last_result is None:
+        last_result = LLMResult(
+            agent, route["provider"], route["model"], "PROVIDER_ERROR",
+            error="PROVIDER_ERROR: no usable provider/model candidate in the chain.",
+        )
+    replay = _response_cache.get(key)
+    if replay is not None:
+        _record(last_result, symbol)  # the failure is still accounted
+        return LLMResult(
+            agent, replay["provider"], replay["model"], "OK",
+            text=replay["text"], parsed=replay["parsed"],
+            latency_ms=round((time.monotonic() - t0) * 1000, 1),
+            cached=True, fallback_used=True,
+            cache_age_s=round(time.monotonic() - replay["stored"], 1),
+            cache_replay=True,
+        )
 
     return _record(last_result, symbol)
+
+
+def _safe_parse(text: str):
+    try:
+        return extract_json(text)
+    except Exception:  # noqa: BLE001 — best effort only
+        return None
 
 
 def complete(task: str, messages: list = None, system: str = None,
@@ -841,19 +1186,22 @@ def complete(task: str, messages: list = None, system: str = None,
 
 def call_json(agent: str, system: str, user: str, temperature: float = 0.2,
               max_tokens: int = 500, symbol: str = None) -> LLMResult:
-    """call() + tolerant JSON parsing. Parse failures come back with status
-    INVALID_RESPONSE (never fabricated content)."""
+    """call() + tolerant JSON parsing. A malformed response is retried down
+    the model chain inside call(); if every model returns unparseable output
+    the result comes back with status INVALID_RESPONSE (never fabricated
+    content)."""
     result = call(agent, system, user, temperature=temperature,
-                  max_tokens=max_tokens, symbol=symbol)
+                  max_tokens=max_tokens, symbol=symbol, expect_json=True)
     if not result.ok:
         return result
-    try:
-        result.parsed = extract_json(result.text)
-    except Exception as exc:  # noqa: BLE001 — parse errors are data, not crashes
-        result.status = "INVALID_RESPONSE"
-        result.error = f"INVALID_RESPONSE: {exc}"
-        result.error_type = "INVALID_RESPONSE"
-        _reclassify(result, symbol)
+    if result.parsed is None:
+        try:
+            result.parsed = extract_json(result.text)
+        except Exception as exc:  # noqa: BLE001 — parse errors are data, not crashes
+            result.status = "INVALID_RESPONSE"
+            result.error = f"INVALID_RESPONSE: {exc}"
+            result.error_type = "INVALID_RESPONSE"
+            _reclassify(result, symbol)
     return result
 
 
@@ -879,11 +1227,21 @@ def _extract_model_ids(response) -> set:
     return ids
 
 
+def unorouter_model_chain() -> list:
+    """The application's explicit UnoRouter model chain (primary +
+    fallbacks, capped at LLM_MAX_MODEL_ATTEMPTS)."""
+    models = [str(settings.UNOROUTER_PRIMARY_MODEL or "")]
+    models += [m for m in (settings.UNOROUTER_FALLBACK_MODELS or []) if m]
+    cap = max(1, int(settings.LLM_MAX_MODEL_ATTEMPTS or 3))
+    return [m for m in models if m][:cap]
+
+
 def validate_models() -> dict:
     """Verifies every configured model id against each provider's LIVE
     /models catalog. Providers without an API key are skipped (reported as
-    such). Results gate fallback eligibility: an unverified fallback model
-    is never used.
+    such). A model id missing from the catalog is reported as
+    LLM_MODEL_UNAVAILABLE and short-circuited at request time — the next
+    configured model is used automatically.
 
     Returns: {"providers": {name: {"ok", "models_found", "checked",
                                    "missing", "error"}},
@@ -897,6 +1255,9 @@ def validate_models() -> dict:
         inst = _PROVIDER_INSTANCES[provider]
         entry = {"ok": False, "models_found": 0, "checked": {}, "missing": [], "error": None}
         report["providers"][provider] = entry
+        if not _provider_enabled(provider):
+            entry["error"] = f"disabled via {inst.enabled_attr}=false — catalog not fetched"
+            continue
         if not _provider_key(provider):
             entry["error"] = f"{inst.key_attr} not configured — catalog not fetched"
             continue
@@ -923,11 +1284,30 @@ def validate_models() -> dict:
 
     for agent in sorted(_TASK_PROVIDERS):
         route = route_info(agent)
-        if route["provider"] in report["providers"]:
+        if route["provider"] == "unorouter":
+            for i, model in enumerate(unorouter_model_chain()):
+                _check("unorouter", model, "primary" if i == 0 else f"fallback[{i - 1}]")
+        elif route["provider"] in report["providers"]:
             _check(route["provider"], route["model"], f"{agent}.model")
         if route["fallback_provider"] in report["providers"] and route["fallback_model"]:
             _check(route["fallback_provider"], route["fallback_model"], f"{agent}.fallback")
         report["routes"][agent] = dict(route)
+
+    # Report dead UnoRouter model ids loudly (the runtime skips them).
+    uno_entry = report["providers"].get("unorouter", {})
+    chain = unorouter_model_chain()
+    for label, present in (uno_entry.get("checked") or {}).items():
+        if not present:
+            try:
+                idx = 0 if label == "primary" else int(label.split("[")[1].rstrip("]")) + 1
+            except (IndexError, ValueError):
+                idx = -1
+            missing_model = chain[idx] if 0 <= idx < len(chain) else "?"
+            logger.warning(
+                "LLM_MODEL_UNAVAILABLE: unorouter %s model '%s' is not in the "
+                "live catalog; it is skipped and the next configured model is used.",
+                label, missing_model,
+            )
 
     _last_validation = report
     return report

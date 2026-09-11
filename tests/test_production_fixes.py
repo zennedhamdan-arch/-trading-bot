@@ -15,9 +15,14 @@ Exits non-zero on any failure. No external test dependencies.
 import asyncio
 import os
 import sys
+import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Isolated SQLite for this run (news intelligence + risk engine share it).
+os.environ["MEMORY_DB_PATH"] = os.path.join(
+    tempfile.mkdtemp(prefix="prodfix-"), "test-memory.db")
 
 FAILURES = []
 
@@ -277,6 +282,8 @@ from agents import tech_agent, news_agent, risk_agent, cio_agent, debate_agent
 def _stub_everything():
     main.alpaca_service.get_account_summary = lambda: {"cash": 1000.0, "equity": 10000.0, "buying_power": 1000.0, "error": None}
     main.alpaca_service.get_open_positions = lambda: {"positions": [], "error": None}
+    main.alpaca_service.get_clock = lambda: {"is_open": True, "error": None}
+    main.alpaca_service.get_recent_orders = lambda limit=20: {"orders": [], "error": None}
     main.alpaca_service.get_indicators = lambda s, lookback_days=250: {"symbol": s, "latest_close": 100.0, "rsi_14": 55.0, "sma_20": 98.0, "sma_50": 99.0, "sma_200": 95.0, "ema_20": 99.5, "macd": 1.0, "macd_signal": 0.5, "volatility_annualized": 0.25, "max_drawdown": -0.1, "technical_signal": "BULLISH", "recent_closes": [100.0], "error": None}
     main.alpaca_service.get_snapshot = lambda s: {"symbol": s, "error": "snapshots not exercised in this section"}
     main.market_data_service.get_news = lambda s, limit=10: {"headlines": ["headline"], "error": None}
@@ -295,13 +302,18 @@ def _run_cycle():
     main.agent_logs.clear()
     main.cycle_history.clear()
     main._previous_positions.clear()
+    main.risk_engine.begin_cycle()   # per-cycle duplicate-order guard
+    main.risk_engine.init_db()       # persisted daily trade counter
+    with main.risk_engine._conn() as conn:
+        conn.execute("DELETE FROM risk_engine_trades")
     main.bot_state.update({"running": True, "last_cycle_at": None, "last_cycle_status": "NEVER_RUN"})
     return asyncio.run(main.run_trading_cycle(triggered_by="test"))
 
 # 5a. everything healthy -> OK
 _stub_everything()
+_real_analyze_news = main.news_agent.analyze_news
 main.tech_agent.analyze_technicals = lambda s, i: _ok_report("technical", s)
-main.news_agent.analyze_news = lambda s, h: _ok_report("news", s)
+main.news_agent.analyze_news = lambda s, h=None: _ok_report("news", s)
 main.fundamentals_agent.get_fundamentals = lambda s: {"symbol": s, "pe_ratio": 10.0, "error": None}
 main.fundamentals_agent.analyze_fundamentals = lambda s, f: _ok_report("fundamentals", s)
 main.debate_agent.run_debate = lambda s, t, n, f=None, evidence=None: {"agent": "debate", "symbol": s, "bull_strength": 0.7, "bull_summary": "b", "bear_strength": 0.3, "bear_summary": "r", "edge": 0.4, "error": None}
@@ -316,7 +328,9 @@ check("all 5 symbols processed", rec["symbols_processed"] == config.settings.TRA
 check("per-symbol agent_status recorded", set(rec["agent_status"].keys()) == set(config.settings.TRADE_UNIVERSE))
 nv = rec["agent_status"]["NVDA"]
 check("per-agent stages recorded", nv["market_data"] == "OK" and nv["technical"] == "OK" and nv["news"] == "OK"
-      and nv["fundamentals"] == "OK" and nv["debate"] == "OK" and nv["risk"] == "OK" and nv["cio"] == "OK")
+      and nv["fundamentals"] == "OK" and nv["risk"] == "OK" and nv["cio"] == "OK")
+check("debate disabled by default -> SKIPPED (V2 default; opt-in feature)",
+      nv["debate"] == "SKIPPED")
 check("HOLD -> execution SKIPPED (not ERROR)", nv["execution"] == "SKIPPED")
 check("memory disabled -> SKIPPED", nv["memory"] == "SKIPPED")
 
@@ -355,14 +369,18 @@ main.fundamentals_service.get_fundamentals = lambda s: {
     "market_cap": None, "revenue": None, "profit_margin": 0.2, "roe": 0.15,
     "debt_to_equity": None, "timestamp": 0.0}
 
-# 5c-2. news data source down -> news UNAVAILABLE (recorded, cycle continues)
-main.market_data_service.get_news = lambda s, limit=10: {"headlines": [], "error": "news API down"}
+# 5c-2. news intelligence cache empty -> news UNAVAILABLE (recorded, cycle
+#       continues; the worker populates the cache on its own schedule)
+main.news_agent.analyze_news = _real_analyze_news
 res = _run_cycle()
 rec = main.cycle_history[0]
-check("news data source down -> news UNAVAILABLE", rec["agent_status"]["NVDA"]["news"] == "UNAVAILABLE")
-check("news data failure in structured errors",
+check("no cached news intelligence -> news UNAVAILABLE",
+      rec["agent_status"]["NVDA"]["news"] == "UNAVAILABLE")
+check("news unavailability in structured errors",
       any(e["agent"] == "news" and e["type"] == "DATA_UNAVAILABLE" for e in rec["errors"]))
-main.market_data_service.get_news = lambda s, limit=10: {"headlines": ["headline"], "error": None}
+check("trading continued safely (risk + cio still ran)",
+      rec["agent_status"]["NVDA"]["risk"] == "OK" and rec["agent_status"]["NVDA"]["cio"] == "OK")
+main.news_agent.analyze_news = lambda s, h=None: _ok_report("news", s)
 
 # 5c-3. fundamentals with NO provider configured -> SKIPPED (visible, not an error)
 main.fundamentals_service.get_fundamentals = lambda s: {
@@ -398,7 +416,9 @@ check("subscription feed failure -> UNAVAILABLE (not a crash, not silent)",
 check("subscription failure typed SUBSCRIPTION_FEED_UNAVAILABLE",
       any(e["type"] == "SUBSCRIPTION_FEED_UNAVAILABLE" and e["provider"] == "alpaca"
           for e in rec["errors"]))
-main.alpaca_service.get_indicators = lambda s, lookback_days=250: {"symbol": s, "latest_close": 100.0, "error": None}
+# V2: restore a stub WITH a tradeable deterministic setup (the V2 setup
+# gate holds everything when technical_signal is absent/NEUTRAL).
+main.alpaca_service.get_indicators = lambda s, lookback_days=250: {"symbol": s, "latest_close": 100.0, "rsi_14": 55.0, "sma_20": 98.0, "sma_50": 99.0, "sma_200": 95.0, "ema_20": 99.5, "macd": 1.0, "macd_signal": 0.5, "volatility_annualized": 0.25, "max_drawdown": -0.1, "technical_signal": "BULLISH", "recent_closes": [100.0], "error": None}
 
 # 5e. broker unreachable -> cycle ERROR
 main.alpaca_service.get_account_summary = lambda: {"cash": 0.0, "equity": 0.0, "error": "Alpaca API keys are not configured."}
@@ -422,7 +442,7 @@ check("successful order -> execution OK", rec["agent_status"]["NVDA"]["execution
 check("order recorded in cycle", len(rec["orders"]) == len(config.settings.TRADE_UNIVERSE))
 
 # 5g. exception mid-pipeline attributed to the right stage
-def _boom_for_nvda(symbol, headlines):
+def _boom_for_nvda(symbol, headlines=None):
     if symbol == "NVDA":
         raise RuntimeError("news exploded")
     return _ok_report("news", symbol)
@@ -435,7 +455,7 @@ check("other symbols unaffected", rec["agent_status"]["AAPL"]["cio"] == "OK")
 check("single-symbol exception -> PARTIAL_ERROR", rec["status"] == "PARTIAL_ERROR")
 
 # 5h. every symbol aborts -> ERROR (not a misleading OK/PARTIAL)
-def _boom(symbol, headlines):
+def _boom(symbol, headlines=None):
     raise RuntimeError("news exploded")
 main.news_agent.analyze_news = _boom
 res = _run_cycle()
@@ -455,6 +475,9 @@ routes = {r.path for r in m.app.routes if hasattr(r, "path")}
 check("all API routes present", {"/api/portfolio", "/api/logs", "/api/cycles", "/api/orders", "/api/history", "/api/config", "/api/agent-accuracy"} <= routes)
 check("bot control endpoints present", {"/api/bot/start", "/api/bot/stop", "/api/bot/run-now"} <= routes)
 check("health + realtime endpoints present", {"/api/health", "/api/realtime"} <= routes)
+check("V2 endpoints present (providers/news)",
+      {"/api/providers/health", "/api/news/status", "/api/news/{symbol}",
+       "/api/news/{symbol}/articles"} <= routes)
 check("agent-accuracy untouched", hasattr(m, "_get_agent_weights"))
 _main_src = open("main.py").read()
 check("cycle record carries agent_results/provider_results/llm_usage",

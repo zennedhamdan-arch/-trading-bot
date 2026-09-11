@@ -23,11 +23,17 @@ Run:  python tests/test_production_hardening.py   (from the repo root)
 """
 
 import asyncio
+import os
 import sys
+import tempfile
 import time
 import types
 
 sys.path.insert(0, ".")
+
+# Isolated SQLite for this run (news intelligence + risk engine share it).
+os.environ["MEMORY_DB_PATH"] = os.path.join(
+    tempfile.mkdtemp(prefix="hardening-"), "test-memory.db")
 
 FAILURES = []
 
@@ -269,6 +275,8 @@ class _CaptureRouter:
 
 _orig_router = debate_agent.llm_service
 debate_agent.llm_service = _CaptureRouter()
+_orig_debate_flag = config.settings.ENABLE_DEBATE
+config.settings.ENABLE_DEBATE = True   # V2 default is OFF; this section tests the ON path
 try:
     ev_snap = evidence_service.assess(tech_ok, news_err, fund_unav, indicators=fresh_ind)
     d = debate_agent.run_debate("AAPL", tech_ok, news_err, fund_unav, evidence=ev_snap)
@@ -280,6 +288,7 @@ try:
           and "MISSING INFORMATION" in captured["system"])
 finally:
     debate_agent.llm_service = _orig_router
+    config.settings.ENABLE_DEBATE = _orig_debate_flag
 
 # ===========================================================================
 print("5. decision-quality prerequisite (risk cap alone never justifies a trade):")
@@ -299,7 +308,13 @@ main.alpaca_service.get_account_summary = lambda: {
 main.alpaca_service.get_open_positions = lambda: {"positions": [], "error": None}
 main.market_data_service.get_symbol_data = lambda s: {
     "symbol": s, "price": 100.0, "price_source": "snapshot.latest_trade",
-    "indicators": {"latest_close": 100.0, "error": None},
+    # V2: the deterministic setup gate keys off technical_signal — the stub
+    # must carry a tradeable setup so the flow reaches the evidence gate.
+    "indicators": {"latest_close": 100.0, "volatility_annualized": 0.25,
+                   "max_drawdown": -0.1, "technical_signal": "BULLISH",
+                   "technical_components": {"trend": "BULLISH", "momentum": "BULLISH",
+                                            "rsi_flag": "NEUTRAL"},
+                   "error": None},
     "news": ["h"], "news_error": None,
     "fundamentals": {"status": "DATA_UNAVAILABLE", "reason": "NO_PROVIDER_CONFIGURED"},
     "data_quality": {"price": "OK", "bars": "OK", "news": "OK",
@@ -325,7 +340,7 @@ main.tech_agent.analyze_technicals = lambda s, i: {
     "agent": "technical", "symbol": s, "evidence_status": "UNAVAILABLE", "signal": None,
     "confidence": None, "summary": "no data", "error": "DATA_UNAVAILABLE: insufficient_bars",
     "llm_status": "SKIPPED_NO_DATA"}
-main.news_agent.analyze_news = lambda s, h: {
+main.news_agent.analyze_news = lambda s, h=None: {
     "agent": "news", "symbol": s, "evidence_status": "AVAILABLE", "sentiment": "BULLISH",
     "confidence": 0.7, "summary": "good", "error": None, "llm_status": "OK"}
 main.fundamentals_agent.analyze_fundamentals = lambda s, f: {
@@ -343,6 +358,9 @@ main.risk_agent.assess_risk = lambda s, side, acct_, pos, indicators=None, evide
 main.cio_agent.make_decision = lambda *a, **k: {
     "agent": "cio", "symbol": "X", "decision": "BUY", "confidence": 0.8,
     "notional_usd": 9999.0, "reasoning": "buy", "error": None, "llm_status": "OK"}
+
+from services import risk_engine as _risk_engine
+_risk_engine.init_db()
 
 res = asyncio.run(main.run_trading_cycle(triggered_by="test-insufficient"))
 rec = main.cycle_history[0]
@@ -370,10 +388,12 @@ main.agent_logs.clear()
 main.tech_agent.analyze_technicals = lambda s, i: {
     "agent": "technical", "symbol": s, "evidence_status": "AVAILABLE", "signal": "BULLISH",
     "confidence": 0.7, "summary": "strong", "error": None, "llm_status": "OK"}
-main.news_agent.analyze_news = lambda s, h_: {
+main.news_agent.analyze_news = lambda s, h_=None: {
     "agent": "news", "symbol": s, "evidence_status": "ERROR", "sentiment": None,
     "confidence": None, "summary": "provider failed", "error": "boom",
     "llm_status": "PROVIDER_ERROR"}
+with _risk_engine._conn() as _conn:
+    _conn.execute("DELETE FROM risk_engine_trades")
 res = asyncio.run(main.run_trading_cycle(triggered_by="test-degraded"))
 rec = main.cycle_history[0]
 check("DEGRADED evidence (news/fundamentals missing) does not block a validated BUY",
