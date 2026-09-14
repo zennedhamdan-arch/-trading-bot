@@ -70,8 +70,11 @@ models per request.
 import hashlib
 import logging
 import re
+import threading
 import time
 from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as _FutureTimeoutError
 from datetime import datetime, timezone
 
 from config import settings
@@ -346,6 +349,127 @@ _clients = {}  # provider -> cached SDK client (tests may inject)
 _verified_models = {}  # provider -> set of model ids seen in the live catalog
 _last_validation = None  # report dict returned by validate_models()
 
+# Model-catalog layer: /v1/models is fetched AT MOST once per provider per
+# LLM_CATALOG_CACHE_TTL_MINUTES window (5-10 min) — one shared catalog for
+# health checks, validations and chain resolution. A hanging provider is
+# bounded by LLM_CATALOG_TIMEOUT_SECONDS in a worker thread, so a slow
+# Gemini (or any provider) can never block startup or a health-check cycle.
+_catalog_cache = {}  # provider -> {"ids": set|None, "fetched_at": float,
+#                                "error": str|None, "timed_out": bool}
+_catalog_lock = threading.Lock()
+# TWO disjoint pools so nested work can never starve itself:
+#   _catalog_pool  — runs RAW list_models() fetches (never submits anything)
+#   _validation_pool — runs whole get_model_catalog() wrappers in parallel
+# A single shared pool deadlocks: N wrappers occupy all workers and each
+# wrapper's inner fetch stays queued behind them until its timeout fires
+# (the exact "validation times out" symptom this fix removes). Abandoned
+# hung fetches self-terminate via the SDK's own HTTP timeout.
+_catalog_pool_ref = None
+_validation_pool_ref = None
+_model_warned = {}  # (provider, model_id) -> monotonic deadline: an
+#                    LLM_MODEL_UNAVAILABLE warning is logged AT MOST once per
+#                    model per catalog/health-check period (never 6x).
+
+
+def _catalog_pool():
+    global _catalog_pool_ref
+    if _catalog_pool_ref is None:
+        _catalog_pool_ref = ThreadPoolExecutor(
+            max_workers=max(2, len(PROVIDERS)), thread_name_prefix="llm-catalog")
+    return _catalog_pool_ref
+
+
+def _validation_pool():
+    global _validation_pool_ref
+    if _validation_pool_ref is None:
+        _validation_pool_ref = ThreadPoolExecutor(
+            max_workers=max(2, len(PROVIDERS)), thread_name_prefix="llm-validate")
+    return _validation_pool_ref
+
+
+def _catalog_ttl_s() -> float:
+    return max(60.0, float(settings.LLM_CATALOG_CACHE_TTL_MINUTES or 8) * 60.0)
+
+
+def _normalize_model_id(model_id) -> str:
+    """Exact-match normalization: trim whitespace and strip a 'models/'
+    prefix (Gemini convention). Case is NOT mangled — ids match exactly."""
+    return str(model_id or "").strip().removeprefix("models/")
+
+
+def get_model_catalog(provider: str, force: bool = False) -> dict:
+    """The provider's LIVE model catalog, TTL-cached.
+
+    Returns {"ids": set|None, "fetched_at": float, "error": str|None,
+             "timed_out": bool, "cached": bool, "age_s": float|None}.
+    ids is None when the catalog could not be fetched (error/timeout/not
+    configured) — callers must treat that as 'unverified', never as empty.
+    Exactly ONE /v1/models request per provider per TTL window, shared by
+    everything; force=True refetches (used when the TTL has expired)."""
+    if provider not in _PROVIDER_INSTANCES:
+        return {"ids": None, "fetched_at": 0.0, "error": f"unknown provider '{provider}'",
+                "timed_out": False, "cached": False, "age_s": None}
+    if not force:
+        with _catalog_lock:
+            entry = _catalog_cache.get(provider)
+            if entry and entry.get("fetched_at") \
+                    and (time.monotonic() - entry["fetched_at"]) < _catalog_ttl_s():
+                out = dict(entry)
+                out["cached"] = True
+                out["age_s"] = round(time.monotonic() - entry["fetched_at"], 1)
+                return out
+
+    fetched = {"ids": None, "fetched_at": time.monotonic(),
+               "error": None, "timed_out": False}
+    inst = _PROVIDER_INSTANCES[provider]
+    if not _provider_enabled(provider) or not _provider_key(provider):
+        fetched["error"] = (f"disabled via {inst.enabled_attr}=false"
+                            if not _provider_enabled(provider)
+                            else f"{inst.key_attr} not configured")
+    else:
+        timeout_s = max(1.0, float(settings.LLM_CATALOG_TIMEOUT_SECONDS or 8))
+        try:
+            future = _catalog_pool().submit(inst.list_models)
+            try:
+                ids = future.result(timeout=timeout_s)
+                fetched["ids"] = {_normalize_model_id(i) for i in (ids or set())}
+                _verified_models[provider] = set(fetched["ids"])
+            except _FutureTimeoutError:
+                fetched["timed_out"] = True
+                fetched["error"] = (f"model catalog fetch timed out after "
+                                    f"{timeout_s:.0f}s")
+                # Retrieve/swallow the late result so the abandoned worker
+                # thread never logs an unretrieved-exception warning.
+                future.add_done_callback(lambda f: f.exception() if f.done() else None)
+        except Exception as exc:  # noqa: BLE001 — catalog fetch must never raise
+            fetched["error"] = f"could not list models: {exc}"
+
+    # A fresh catalog starts a new warning period for this provider: a model
+    # that is STILL missing warns once for the new period (not zero times,
+    # not six times).
+    if fetched["ids"] is not None:
+        for key in [k for k in _model_warned if k[0] == provider]:
+            _model_warned.pop(key, None)
+    with _catalog_lock:
+        _catalog_cache[provider] = fetched
+    out = dict(fetched)
+    out["cached"] = False
+    out["age_s"] = 0.0
+    return out
+
+
+def _warn_model_unavailable(provider: str, model: str, detail: str) -> bool:
+    """Logs LLM_MODEL_UNAVAILABLE for (provider, model) AT MOST once per
+    catalog/health-check period. Repeated 404s, six routed tasks or several
+    validations within one period never produce duplicate warnings."""
+    key = (provider, _normalize_model_id(model))
+    now = time.monotonic()
+    if now < _model_warned.get(key, 0.0):
+        return False
+    _model_warned[key] = now + _catalog_ttl_s()
+    logger.warning("LLM_MODEL_UNAVAILABLE: %s: model '%s' %s", provider, model, detail)
+    return True
+
 _quota_backoff_until = {p: 0.0 for p in PROVIDERS}      # 429 circuit
 _auth_backoff_until = {p: 0.0 for p in PROVIDERS}       # 401/403 circuit
 _model_unavailable_until = {}                           # (provider, model) -> deadline (404 circuit)
@@ -392,6 +516,9 @@ def reset_all_state() -> None:
     budgets, usage and validation cache. Does NOT touch settings."""
     _clients.clear()
     _verified_models.clear()
+    with _catalog_lock:
+        _catalog_cache.clear()
+    _model_warned.clear()
     global _last_validation
     _last_validation = None
     for p in PROVIDERS:
@@ -712,13 +839,16 @@ def _mark_quota_backoff(provider: str, retry_after) -> None:
 
 
 def _mark_model_unavailable(provider: str, model: str) -> None:
-    """404 circuit: stop requesting this (provider, model) pair."""
+    """404 circuit: stop requesting this (provider, model) pair. The warning
+    is deduplicated per catalog/health-check period — repeated 404s on the
+    same model produce ONE warning, not one per request/task."""
     minutes = max(0.5, float(settings.MODEL_UNAVAILABLE_COOLDOWN_MINUTES or 30))
     _model_unavailable_until[(provider, model)] = time.monotonic() + minutes * 60.0
-    logger.warning(
-        f"LLM_MODEL_UNAVAILABLE: {provider}: model '{model}' not found (404) "
-        f"or absent from the live catalog. Circuit open for {minutes:.0f} min; "
-        f"requests to it short-circuit and the next configured model is tried."
+    _warn_model_unavailable(
+        provider, model,
+        f"not found (404) or absent from the live catalog. Circuit open for "
+        f"{minutes:.0f} min; requests to it short-circuit and the next "
+        f"configured model is tried."
     )
 
 
@@ -980,12 +1110,12 @@ def _candidate_chain(agent: str):
     fb_provider, fb_model = route["fallback_provider"], route["fallback_model"]
 
     if provider == "unorouter":
-        models = [str(settings.UNOROUTER_PRIMARY_MODEL or "")]
-        models += [m for m in (settings.UNOROUTER_FALLBACK_MODELS or []) if m]
-        # Cap MODEL attempts (never unlimited model guessing).
-        cap = max(1, int(settings.LLM_MAX_MODEL_ATTEMPTS or 3))
-        models = models[:cap]
-        chain = [("unorouter", m) for m in models if m]
+        # Catalog-verified chain: configured primary + fallback candidates,
+        # filtered to ids that EXIST in the live /v1/models catalog (TTL
+        # cached — no extra catalog calls). A model absent from the catalog
+        # is never attempted (no 404 round-trip); the cap still applies.
+        effective = unorouter_effective_chain()
+        chain = [("unorouter", m) for m in effective["chain"]]
         # Final provider fallback: Groq, when it is usable at all.
         if _provider_enabled("groq") and _provider_key("groq"):
             groq_model = _groq_chain_model(agent)
@@ -1030,6 +1160,20 @@ def _candidate_precheck(provider: str, model: str):
         return "MODEL_NOT_FOUND", (f"LLM_MODEL_UNAVAILABLE: model '{model}' previously "
                                    f"returned 404 on {provider}; circuit open "
                                    f"({remaining}s remaining).")
+    # Catalog-verified skip: a model id that is not in the (TTL-cached) live
+    # catalog is never sent — no 404 round-trip is needed. Only applied when
+    # a catalog was actually fetched; an unavailable catalog never blocks.
+    catalog = get_model_catalog(provider)
+    live_ids = catalog.get("ids")
+    if live_ids is not None and _normalize_model_id(model) not in live_ids:
+        _warn_model_unavailable(
+            provider, model,
+            f"is not in the live /v1/models catalog ({len(live_ids)} live "
+            f"models, catalog {catalog.get('age_s')}s old); skipped without "
+            f"a request, the next configured model is used.")
+        return "MODEL_NOT_FOUND", (
+            f"LLM_MODEL_UNAVAILABLE: model '{model}' is not in the live "
+            f"catalog ({len(live_ids)} live models).")
     return None, None
 
 
@@ -1211,102 +1355,297 @@ def call_json(agent: str, system: str, user: str, temperature: float = 0.2,
 
 
 def _extract_model_ids(response) -> set:
-    """Pulls model id strings out of a provider's models.list() response."""
+    """Pulls model id strings out of a provider's /v1/models response.
+    Handles OpenAI-style objects (.data[] of items with .id), raw dicts
+    ({"data": [{"id": ...}]}) and plain lists — always the ACTUAL returned
+    ids from data[].id, never assumptions from public documentation."""
     ids = set()
     data = getattr(response, "data", None)
+    if data is None and isinstance(response, dict):
+        data = response.get("data")
     items = data if data is not None else response
     if items is None:
         return ids
+    if isinstance(items, dict):
+        items = items.get("data") or items.get("models") or []
     try:
         for item in items:
-            model_id = getattr(item, "id", None) or getattr(item, "name", None)
+            if isinstance(item, dict):
+                model_id = item.get("id") or item.get("name")
+            else:
+                model_id = getattr(item, "id", None) or getattr(item, "name", None)
             if model_id:
-                ids.add(str(model_id).removeprefix("models/"))
+                ids.add(_normalize_model_id(model_id))
     except TypeError:
         pass
     return ids
 
 
+def _model_attempt_cap() -> int:
+    return max(1, int(settings.LLM_MAX_MODEL_ATTEMPTS or 3))
+
+
 def unorouter_model_chain() -> list:
-    """The application's explicit UnoRouter model chain (primary +
-    fallbacks, capped at LLM_MAX_MODEL_ATTEMPTS)."""
+    """The CONFIGURED UnoRouter model chain: primary + ALL ordered fallback
+    candidates (uncapped — this is what the operator asked for, reported in
+    diagnostics). The attempt cap is applied to the EFFECTIVE (catalog-
+    verified) chain so a dead candidate never wastes an attempt slot."""
     models = [str(settings.UNOROUTER_PRIMARY_MODEL or "")]
     models += [m for m in (settings.UNOROUTER_FALLBACK_MODELS or []) if m]
-    cap = max(1, int(settings.LLM_MAX_MODEL_ATTEMPTS or 3))
-    return [m for m in models if m][:cap]
+    return [_normalize_model_id(m) for m in models if m]
 
 
-def validate_models() -> dict:
+def unorouter_effective_chain(catalog_ids=None) -> dict:
+    """The catalog-VERIFIED UnoRouter chain.
+
+    Every configured id (primary first, then the ordered fallback
+    candidates) is kept ONLY if that exact id is present in the live
+    /v1/models catalog. Ids are never invented or substituted: a missing
+    candidate is reported and skipped, and the next candidate that DOES
+    exist is selected. When the catalog itself is unavailable (fetch
+    failed/timed out) the configured order is kept — verification is
+    impossible, and the runtime 404 circuits still protect every request —
+    with catalog_available=False reporting that honestly.
+
+    Returns {"chain": [...], "configured": [...], "missing": [...],
+             "selected_fallback": str|None, "catalog_available": bool}."""
+    configured = unorouter_model_chain()
+    if catalog_ids is None:
+        catalog_ids = get_model_catalog("unorouter").get("ids")
+    if catalog_ids is None:
+        return {"chain": list(configured)[:_model_attempt_cap()],
+                "configured": configured, "missing": [],
+                "selected_fallback": (
+                    configured[1] if len(configured) > 1 else None),
+                "catalog_available": False}
+    live = {_normalize_model_id(m) for m in catalog_ids}
+    chain, missing = [], []
+    for model in configured:
+        (chain if model in live else missing).append(model)
+    # The attempt cap applies to LIVE models only (never unlimited guessing;
+    # a dead candidate never consumes an attempt slot).
+    chain = chain[:_model_attempt_cap()]
+    return {"chain": chain, "configured": configured, "missing": missing,
+            "selected_fallback": (chain[1] if len(chain) > 1 else None),
+            "catalog_available": True}
+
+
+def _configured_models_for(provider: str) -> list:
+    """The model ids this deployment actually uses on a provider (ordered,
+    unique, normalized). unorouter: primary + fallback candidates. groq:
+    task-specific models for groq-routed tasks plus the chain-final
+    GROQ_FALLBACK_MODEL whenever Groq backs up UnoRouter-routed tasks.
+    gemini/nvidia/openrouter: their model when a task is routed there."""
+    out = []
+
+    def add(model):
+        model = _normalize_model_id(model)
+        if model and model not in out:
+            out.append(model)
+
+    routed = [str(getattr(settings, attr, "") or "").lower()
+              for attr in _TASK_PROVIDERS.values()]
+    if provider == "unorouter":
+        for m in unorouter_model_chain():
+            add(m)
+    elif provider == "groq":
+        for task, attr in sorted(_TASK_PROVIDERS.items()):
+            if str(getattr(settings, attr, "") or "").lower() == "groq":
+                add(_task_model("groq", task))
+        if "unorouter" in routed and _provider_enabled("groq") and _provider_key("groq"):
+            add(_groq_chain_model("technical") or str(settings.GROQ_FALLBACK_MODEL or ""))
+    elif provider == "gemini":
+        if "gemini" in routed:
+            add(settings.GEMINI_MODEL)
+    elif provider == "nvidia":
+        if "nvidia" in routed:
+            add(settings.NVIDIA_MODEL)
+    elif provider == "openrouter":
+        if "openrouter" in routed:
+            add(settings.OPENROUTER_MODEL)
+    return out
+
+
+def active_chain_providers() -> list:
+    """Providers the ACTIVE request chain depends on: every provider a task
+    is routed to, plus Groq when any task is UnoRouter-routed (Groq is the
+    chain-final provider fallback). Used by health to decide which LLM
+    providers are REQUIRED."""
+    routed = {str(getattr(settings, attr, "") or "").lower()
+              for attr in _TASK_PROVIDERS.values()}
+    routed.discard("")
+    if "unorouter" in routed:
+        routed.add("groq")
+    return sorted(p for p in routed if p in _PROVIDER_INSTANCES)
+
+
+def validate_models(refresh_if_stale: bool = False) -> dict:
     """Verifies every configured model id against each provider's LIVE
-    /models catalog. Providers without an API key are skipped (reported as
-    such). A model id missing from the catalog is reported as
-    LLM_MODEL_UNAVAILABLE and short-circuited at request time — the next
-    configured model is used automatically.
+    /v1/models catalog.
 
-    Returns: {"providers": {name: {"ok", "models_found", "checked",
-                                   "missing", "error"}},
+    Catalog policy (one fetch per provider per health-check period):
+      * /v1/models is fetched AT MOST once per provider per
+        LLM_CATALOG_CACHE_TTL_MINUTES (5-10 min) — health checks, startup
+        validation, chain resolution and /api/providers/health all share the
+        same TTL-cached catalog.
+      * Each fetch is bounded by LLM_CATALOG_TIMEOUT_SECONDS in a worker
+        thread (a hanging provider, e.g. Gemini, is marked DEGRADED and the
+        check continues — startup never blocks).
+      * ids are compared with EXACT normalization (trim + 'models/' prefix);
+        nothing is assumed from public documentation.
+
+    Per-provider status:
+      READY            catalog fetched, all configured models matched
+      NO_USABLE_MODEL  catalog fetched but ZERO configured models matched
+      DEGRADED         catalog fetch timed out (provider kept, unverified)
+      ERROR            catalog fetch failed
+      NOT_CONFIGURED   no key / disabled — catalog not fetched
+
+    Returns: {"providers": {name: {"ok", "status", "models_found",
+                                   "configured", "matched", "missing",
+                                   "checked", "selected_fallback",
+                                   "catalog_age_s", "catalog_cached",
+                                   "timed_out", "error"}},
               "routes": {task: {provider, model, fallback_provider,
                                 fallback_model}}}
     """
     global _last_validation
+
     report = {"providers": {}, "routes": {}}
+
+    # --- fetch every enabled+keyed provider's catalog ONCE (concurrently,
+    #     each bounded by LLM_CATALOG_TIMEOUT_SECONDS) ----------------------
+    to_fetch = [p for p in PROVIDERS
+                if _provider_enabled(p) and _provider_key(p)]
+    force_providers = set()
+    if refresh_if_stale:
+        now = time.monotonic()
+        with _catalog_lock:
+            for p in to_fetch:
+                entry = _catalog_cache.get(p)
+                if not entry or not entry.get("fetched_at") \
+                        or (now - entry["fetched_at"]) >= _catalog_ttl_s():
+                    force_providers.add(p)
+    futures = {}
+    for p in to_fetch:
+        futures[p] = _validation_pool().submit(
+            get_model_catalog, p, p in force_providers)
+    catalogs = {}
+    for p in to_fetch:
+        try:
+            catalogs[p] = futures[p].result(
+                timeout=max(2.0, float(settings.LLM_CATALOG_TIMEOUT_SECONDS)) + 2.0)
+        except Exception:  # noqa: BLE001 — one provider never fails validation
+            catalogs[p] = get_model_catalog(p)
 
     for provider in PROVIDERS:
         inst = _PROVIDER_INSTANCES[provider]
-        entry = {"ok": False, "models_found": 0, "checked": {}, "missing": [], "error": None}
+        configured = _configured_models_for(provider)
+        entry = {
+            "ok": False, "status": "NOT_CONFIGURED", "models_found": 0,
+            "configured": configured, "matched": [], "missing": [],
+            "missing_models": [], "checked": {}, "selected_fallback": None,
+            "catalog_age_s": None, "catalog_cached": False,
+            "timed_out": False, "error": None,
+        }
         report["providers"][provider] = entry
+
         if not _provider_enabled(provider):
             entry["error"] = f"disabled via {inst.enabled_attr}=false — catalog not fetched"
             continue
         if not _provider_key(provider):
             entry["error"] = f"{inst.key_attr} not configured — catalog not fetched"
             continue
-        try:
-            ids = inst.list_models()
-            entry["models_found"] = len(ids)
-            entry["ok"] = True
-            _verified_models[provider] = ids
-        except Exception as exc:  # noqa: BLE001 — validation must never crash startup
-            entry["error"] = f"could not list models: {exc}"
-            logger.warning(f"{provider}: model validation failed: {exc}")
+
+        catalog = catalogs.get(provider) or get_model_catalog(provider)
+        entry["catalog_age_s"] = catalog.get("age_s")
+        entry["catalog_cached"] = bool(catalog.get("cached"))
+        entry["timed_out"] = bool(catalog.get("timed_out"))
+        live_ids = catalog.get("ids")
+
+        if live_ids is None:
+            entry["error"] = catalog.get("error") or "catalog unavailable"
+            if catalog.get("timed_out"):
+                entry["status"] = "DEGRADED"
+                logger.warning(
+                    f"LLM CATALOG {provider}: {entry['error']} — provider "
+                    f"marked DEGRADED, validation continues without it.")
+            else:
+                entry["status"] = "ERROR"
+                logger.warning(f"LLM CATALOG {provider}: {entry['error']}")
             continue
 
-    def _check(provider, model, label):
-        if not model:
-            return
+        entry["ok"] = True
+        entry["models_found"] = len(live_ids)
+        matched = [m for m in configured if m in live_ids]
+        missing = [m for m in configured if m not in live_ids]
+        entry["matched"] = matched
+        entry["missing_models"] = missing
+
+        if provider == "unorouter":
+            effective = unorouter_effective_chain(live_ids)
+            entry["selected_fallback"] = effective["selected_fallback"]
+            entry["effective_chain"] = effective["chain"]
+            entry["catalog_available"] = True
+
+        if configured and not matched:
+            # Endpoint works but NOTHING configured is usable — never READY.
+            entry["status"] = "NO_USABLE_MODEL"
+        else:
+            entry["status"] = "READY"
+
+    # --- per-task route checks (back-compat label mapping) ------------------
+    def _mark(provider, model, label):
         entry = report["providers"][provider]
         if not entry["ok"]:
             return
-        present = model in _verified_models.get(provider, set())
+        if label in entry["checked"]:
+            return  # dedup: 6 tasks sharing one label -> ONE row, ONE warning
+        present = _normalize_model_id(model) in (live_catalog_ids.get(provider) or set())
         entry["checked"][label] = present
         if not present:
-            entry["missing"].append(f"{label}: {model}")
+            entry["missing"].append(f"{label}: {_normalize_model_id(model)}")
+
+    live_catalog_ids = {p: (report["providers"][p].get("ok") and
+                            get_model_catalog(p).get("ids")) or set()
+                        for p in PROVIDERS}
 
     for agent in sorted(_TASK_PROVIDERS):
         route = route_info(agent)
         if route["provider"] == "unorouter":
             for i, model in enumerate(unorouter_model_chain()):
-                _check("unorouter", model, "primary" if i == 0 else f"fallback[{i - 1}]")
+                _mark("unorouter", model, "primary" if i == 0 else f"fallback[{i - 1}]")
         elif route["provider"] in report["providers"]:
-            _check(route["provider"], route["model"], f"{agent}.model")
+            _mark(route["provider"], route["model"], f"{agent}.model")
         if route["fallback_provider"] in report["providers"] and route["fallback_model"]:
-            _check(route["fallback_provider"], route["fallback_model"], f"{agent}.fallback")
+            _mark(route["fallback_provider"], route["fallback_model"], f"{agent}.fallback")
         report["routes"][agent] = dict(route)
 
-    # Report dead UnoRouter model ids loudly (the runtime skips them).
-    uno_entry = report["providers"].get("unorouter", {})
-    chain = unorouter_model_chain()
-    for label, present in (uno_entry.get("checked") or {}).items():
-        if not present:
-            try:
-                idx = 0 if label == "primary" else int(label.split("[")[1].rstrip("]")) + 1
-            except (IndexError, ValueError):
-                idx = -1
-            missing_model = chain[idx] if 0 <= idx < len(chain) else "?"
-            logger.warning(
-                "LLM_MODEL_UNAVAILABLE: unorouter %s model '%s' is not in the "
-                "live catalog; it is skipped and the next configured model is used.",
-                label, missing_model,
+    # --- ONE warning per missing model per period + safe diagnostics --------
+    for provider in PROVIDERS:
+        entry = report["providers"][provider]
+        configured = entry.get("configured") or []
+        # warnings: the provider's OWN missing configured models — exactly
+        # ONE warning per model per catalog period (never 6 identical lines)
+        if entry["ok"] and entry.get("missing_models"):
+            for model in entry["missing_models"]:
+                _warn_model_unavailable(
+                    provider, model,
+                    "is configured but not in the live /v1/models catalog "
+                    f"({entry['models_found']} live models); it is skipped "
+                    f"and the next valid configured model is used.")
+        # safe diagnostics line (NEVER any key/header/secret)
+        if entry["status"] != "NOT_CONFIGURED":
+            def shown(ids):
+                ids = list(ids or [])
+                return (",".join(ids[:8]) + ("…" if len(ids) > 8 else "")) or "none"
+            logger.info(
+                "LLM CATALOG %s: status=%s live_models=%s configured=%s matched=%s missing=%s%s",
+                provider, entry["status"], entry["models_found"],
+                shown(configured), shown(entry.get("matched") or []),
+                shown(entry.get("missing_models") or []),
+                (f" selected_fallback={entry['selected_fallback']}"
+                 if provider == "unorouter" and entry.get("selected_fallback") else ""),
             )
 
     _last_validation = report

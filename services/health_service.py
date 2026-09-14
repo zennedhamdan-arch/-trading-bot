@@ -112,13 +112,24 @@ def _refresh_live_probes(force: bool = False) -> dict:
 
 
 def _realtime_row() -> dict:
-    """Real-time stream row (live state at check time)."""
+    """Real-time stream row (live state at check time). A stream whose last
+    tick is stale is reported as STALE WITH ITS AGE IN SECONDS — never as
+    CONNECTED/healthy. (Staleness is judged while the market is open: a
+    silent closed market is normal and stays CONNECTED with its tick age.)"""
     state = realtime_service.get_state()
     status = state.get("connection_status") or state.get("status") or "UNKNOWN"
-    if status == "CONNECTED":
+    age = state.get("seconds_since_last_tick")
+    age_txt = f"{age:.0f}s ago" if age is not None else "no tick yet"
+    threshold = float(settings.REALTIME_STALE_TICK_SECONDS or 0)
+    if status == "STALE":
+        detail = (
+            f"STALE — last tick {age_txt} (threshold {threshold:.0f}s, "
+            f"market open); the supervisor is recycling the stream"
+        )
+    elif status == "CONNECTED":
         detail = (
             f"feed={state.get('feed')}, {len(state.get('symbols') or [])} symbols, "
-            f"last tick {'%.0fs ago' % state['seconds_since_last_tick'] if state.get('seconds_since_last_tick') is not None else 'n/a'}"
+            f"last tick {age_txt}"
         )
     elif status == "DISABLED":
         detail = "disabled via REALTIME_ENABLED=false"
@@ -130,21 +141,28 @@ def _realtime_row() -> dict:
         "component": "REAL-TIME STREAM",
         "status": status,
         "detail": detail,
+        "last_tick_age_s": age,
+        "stale_threshold_s": threshold or None,
     }
 
 
 def _routed_providers() -> list:
-    """Providers actually ROUTED for at least one LLM task (these are
-    required for the AI pipeline; unrouted optional providers are not)."""
-    routed = set()
+    """Providers the ACTIVE request chain depends on: every provider an LLM
+    task is routed to, plus Groq when UnoRouter is routed (Groq is the
+    chain-final provider fallback). These are REQUIRED for the AI pipeline;
+    unrouted optional providers are not."""
     try:
-        for route in (llm_service.llm_routes() or {}).values():
-            provider = (route or {}).get("provider")
-            if provider:
-                routed.add(str(provider).lower())
+        return llm_service.active_chain_providers()
     except Exception:  # noqa: BLE001 — health must never crash
-        pass
-    return sorted(routed)
+        routed = set()
+        try:
+            for route in (llm_service.llm_routes() or {}).values():
+                provider = (route or {}).get("provider")
+                if provider:
+                    routed.add(str(provider).lower())
+        except Exception:  # noqa: BLE001
+            pass
+        return sorted(routed)
 
 
 def overall_status(live: bool = True) -> dict:
@@ -196,15 +214,23 @@ def _overall_from(account: dict, market: dict) -> dict:
     rt = realtime_service.get_state()
     rt_state = rt.get("connection_status") or rt.get("status")
     if rt_state not in ("CONNECTED", "DISABLED", "NO_KEYS"):
-        # Real-time is an observability layer: disconnected/stale/error
-        # degrades the system but never takes it offline.
+        # Real-time is an observability layer: disconnected/STALE/error
+        # degrades the system but never takes it offline. A stale stream
+        # (last tick older than REALTIME_STALE_TICK_SECONDS while the market
+        # is open) is NEVER reported as connected/healthy — its age in
+        # seconds is part of the reason.
         status = "DEGRADED"
         attempt = rt.get("reconnect_attempt")
+        age = rt.get("seconds_since_last_tick")
+        age_txt = f", last tick {age:.0f}s ago" if age is not None else ""
         reasons.append(
-            f"real-time stream {rt_state}"
+            f"real-time stream {rt_state}{age_txt}"
             + (f" (reconnect attempt #{attempt})" if attempt else "")
         )
 
+    # --- required LLM providers: circuit state AND catalog usability -------
+    validation = (llm_service.last_validation() or {}).get("providers", {})
+    usable_providers = []
     for provider in _routed_providers():
         state = (llm_service.provider_states().get(provider) or {})
         circuit = state.get("state")
@@ -214,6 +240,35 @@ def _overall_from(account: dict, market: dict) -> dict:
                 f"LLM provider {provider} {circuit}"
                 + (f": {state.get('detail', '')}" if state.get("detail") else "")
             )
+            continue
+        ventry = validation.get(provider) or {}
+        vstatus = ventry.get("status")
+        if vstatus == "NO_USABLE_MODEL":
+            # Endpoint reachable but ZERO configured models are in the live
+            # catalog — the provider cannot serve anything as configured.
+            status = "DEGRADED"
+            missing = ", ".join(ventry.get("missing_models") or []) or "none configured"
+            reasons.append(
+                f"LLM provider {provider} NO_USABLE_MODEL "
+                f"(configured models missing from the live catalog: {missing})"
+            )
+            continue
+        if vstatus in ("DEGRADED", "ERROR"):
+            status = "DEGRADED"
+            reasons.append(
+                f"LLM provider {provider} model validation {vstatus}"
+                + (f": {ventry.get('error')}" if ventry.get("error") else "")
+            )
+            continue
+        usable_providers.append(provider)
+
+    # No usable configured LLM model ANYWHERE on the active chain.
+    if _routed_providers() and not usable_providers:
+        status = "DEGRADED"
+        reasons.append(
+            "no usable configured LLM model on any active-chain provider "
+            f"({', '.join(_routed_providers())})"
+        )
 
     fundamentals = fundamentals_service.health_check()
     provider_name = str(fundamentals.get("provider") or settings.FUNDAMENTALS_PROVIDER or "none").lower()
@@ -307,30 +362,58 @@ def run_startup_checks() -> dict:
     rows.append({"component": "NEWS INTELLIGENCE", **news_row})
 
     # --- LLM providers ---------------------------------------------------------
+    # One /v1/models fetch per provider per catalog-TTL window; each fetch is
+    # timeout-bounded so a hanging provider (e.g. Gemini) is marked DEGRADED
+    # and the check continues. Statuses reflect catalog usability:
+    # a reachable provider with ZERO matching configured models is
+    # NO_USABLE_MODEL — never READY.
     validation = llm_service.validate_models()
     states = llm_service.provider_states()
     llm_providers = {}
     for provider in ("unorouter", "groq", "nvidia", "gemini", "openrouter"):
         state = states.get(provider, {})
         entry = validation.get("providers", {}).get(provider, {})
-        missing = entry.get("missing") or []
         if state.get("state") == "NOT_CONFIGURED":
-            status = "NOT_CONFIGURED"
-            detail = state.get("detail", "")
-        elif missing:
-            status = "MODEL_UNAVAILABLE"
-            detail = "; ".join(missing)
+            status, detail = "NOT_CONFIGURED", state.get("detail", "")
+        elif entry.get("status") == "NO_USABLE_MODEL":
+            status = "NO_USABLE_MODEL"
+            detail = (
+                f"endpoint OK ({entry.get('models_found', 0)} live models) but "
+                f"ZERO configured models match: "
+                f"{', '.join(entry.get('missing_models') or []) or 'none configured'}"
+            )
+        elif entry.get("status") in ("DEGRADED", "ERROR"):
+            status = entry["status"]
+            detail = str(entry.get("error") or entry["status"])
         elif state.get("state") != "READY":
-            status = state.get("state")
-            detail = state.get("detail", "")
+            status, detail = state.get("state"), state.get("detail", "")
         else:
-            checked = entry.get("checked") or {}
-            verified = sum(1 for v in checked.values() if v)
+            matched = entry.get("matched") or []
+            missing = entry.get("missing_models") or []
             status = "READY"
-            detail = f"{verified} model id(s) verified against the live catalog"
-        llm_providers[provider] = {"status": status, "detail": detail,
-                                   "circuit": state.get("state"),
-                                   "models_checked": entry.get("checked", {})}
+            detail = (
+                f"{len(matched)}/{len(entry.get('configured') or [])} configured "
+                f"model(s) matched in the live catalog "
+                f"({entry.get('models_found', 0)} live)"
+                + (f"; missing: {', '.join(missing)}" if missing else "")
+                + (f"; selected fallback: {entry['selected_fallback']}"
+                   if provider == "unorouter" and entry.get("selected_fallback") else "")
+            )
+        llm_providers[provider] = {
+            "status": status, "detail": detail,
+            "circuit": state.get("state"),
+            "models_checked": entry.get("checked", {}),
+            "catalog": {
+                "live_models": entry.get("models_found", 0),
+                "configured": entry.get("configured", []),
+                "matched": entry.get("matched", []),
+                "missing": entry.get("missing_models", []),
+                "selected_fallback": entry.get("selected_fallback"),
+                "age_s": entry.get("catalog_age_s"),
+                "cached": entry.get("catalog_cached", False),
+                "timed_out": entry.get("timed_out", False),
+            },
+        }
         rows.append({"component": provider.upper(), "status": status, "detail": detail})
 
     # Top-level status from the rows computed above (no recursion).

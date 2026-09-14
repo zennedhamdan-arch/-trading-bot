@@ -92,17 +92,28 @@ class Settings:
     GROQ_FALLBACK_MODEL: str = _get_str("GROQ_FALLBACK_MODEL", "openai/gpt-oss-20b")
     UNOROUTER_DAILY_REQUEST_LIMIT: int = _get_int("UNOROUTER_DAILY_REQUEST_LIMIT", 0)
     UNOROUTER_QUOTA_BACKOFF_MINUTES: float = _get_float("UNOROUTER_QUOTA_BACKOFF_MINUTES", 10)
-    # Comma-separated application-level fallback models (tried in order).
-    # NOTE (verified 2026-09-11 against the live UnoRouter catalog):
-    # qwen3.8-flash-next:free is NOT in the catalog; it is skipped at runtime
-    # and the chain continues to glm-5.3-flash:free. The closest valid free
-    # Qwen3.8 id is qwen3.8-27b:free.
+    # Comma-separated APPLICATION-level fallback candidates (tried in this
+    # order). A candidate is ONLY selected if that exact id exists in the
+    # provider's LIVE /v1/models catalog at validation time — ids are never
+    # invented or substituted. (qwen3.8-flash-next:free was removed as a
+    # hardcoded fallback: reported absent from the live catalog by the
+    # running app; verified 2026-09-14 — the public catalog lists it again
+    # but at 7.8% uptime, and the runtime catalog is the only source of
+    # truth.)
     UNOROUTER_FALLBACK_MODELS: list = [
         m.strip() for m in os.getenv(
             "UNOROUTER_FALLBACK_MODELS",
-            "qwen3.8-flash-next:free,glm-5.3-flash:free",
+            "glm-5.3-flash:free,glm-5.3-flash-think-search:free,"
+            "glm-5.3-flash-search:free,ling-3.0-flash-fin:free",
         ).split(",") if m.strip()
     ]
+    # Model-catalog cache: /v1/models is fetched AT MOST once per provider
+    # per TTL window (5-10 minutes) no matter how many health checks,
+    # validations or chain resolutions run in between.
+    LLM_CATALOG_CACHE_TTL_MINUTES: float = _get_float("LLM_CATALOG_CACHE_TTL_MINUTES", 8.0)
+    # Hard timeout for ONE provider's catalog fetch (a hanging provider,
+    # e.g. Gemini, must never block startup or a health-check cycle).
+    LLM_CATALOG_TIMEOUT_SECONDS: float = _get_float("LLM_CATALOG_TIMEOUT_SECONDS", 8.0)
     # Provider enable switches (a disabled provider is skipped in the chain).
     GROQ_ENABLED: bool = _get_bool("GROQ_ENABLED", True)
 

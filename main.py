@@ -1005,27 +1005,26 @@ async def lifespan(app: FastAPI):
     except Exception as exc:  # noqa: BLE001 — optional layer, never fatal
         logger.error(f"Real-time layer failed to start (non-fatal): {exc}")
 
-    # Verify every configured LLM model id against each provider's LIVE
-    # catalog (Groq/OpenRouter/Gemini). Providers without keys are skipped
-    # (already reported by settings.validate). Missing models are surfaced
-    # as warnings — they will fail per-request with MODEL_NOT_FOUND, never
-    # silently.
-    validation = llm_service.validate_models()
-    for provider, entry in validation["providers"].items():
-        for missing in entry.get("missing", []):
-            msg = f"LLM model validation ({provider}): {missing} is not in the provider's current model list."
-            logger.warning(msg)
-            _log_event({"agent": "system", "symbol": None, "level": "WARNING", "message": msg})
-        error = entry.get("error")
-        if error and "not configured" not in error:
-            msg = f"LLM model validation ({provider}): {error}"
-            logger.warning(msg)
-            _log_event({"agent": "system", "symbol": None, "level": "WARNING", "message": msg})
+    # NOTE: LLM model validation already ran inside the startup health check
+    # above (ONE /v1/models fetch per provider per catalog-TTL window, each
+    # bounded by a short timeout; missing models warn exactly once per
+    # period). Re-running it here used to duplicate every warning 6x.
 
     scheduler.add_job(
         _scheduled_job,
         trigger=IntervalTrigger(minutes=settings.CYCLE_INTERVAL_MINUTES),
         id="trading_cycle",
+        replace_existing=True,
+    )
+    # LLM catalog refresh: re-validate configured model ids against each
+    # provider's live /v1/models catalog every cache-TTL window (at most one
+    # fetch per provider per window; a fresh catalog re-arms the
+    # one-warning-per-model-per-period policy).
+    scheduler.add_job(
+        lambda: llm_service.validate_models(refresh_if_stale=True),
+        trigger=IntervalTrigger(
+            minutes=max(1.0, float(settings.LLM_CATALOG_CACHE_TTL_MINUTES))),
+        id="llm_catalog_refresh",
         replace_existing=True,
     )
     # Independent News Worker (Part 11): its own schedule, never inside a
@@ -1174,13 +1173,24 @@ async def api_realtime():
 @app.get("/api/providers/health")
 async def api_providers_health():
     """LLM provider health: enabled flag, status, circuit state, last
-    success/failure. Never exposes API keys, headers or secrets."""
+    success/failure — plus per-provider model-catalog diagnostics
+    (configured / live / matched / missing / selected fallback). Catalogs
+    are TTL-cached: at most ONE /v1/models fetch per provider per window
+    (refreshed here when stale). Never exposes API keys, headers or
+    secrets."""
+    validation = llm_service.validate_models(refresh_if_stale=True)
     states = llm_service.provider_states()
     providers = {}
     for provider, state in states.items():
+        ventry = (validation.get("providers") or {}).get(provider, {})
+        vstatus = ventry.get("status")
         status = "HEALTHY"
         if state["state"] == "NOT_CONFIGURED":
             status = "NOT_CONFIGURED"
+        elif vstatus == "NO_USABLE_MODEL":
+            status = "NO_USABLE_MODEL"
+        elif vstatus in ("DEGRADED", "ERROR"):
+            status = "DEGRADED"
         elif state["state"] in ("QUOTA_EXHAUSTED", "AUTH_ERROR", "MODEL_UNAVAILABLE",
                                 "NETWORK_ERROR", "DEGRADED"):
             status = "UNHEALTHY"
@@ -1192,10 +1202,23 @@ async def api_providers_health():
             "last_success": state.get("last_success"),
             "last_failure": state.get("last_failure"),
             "detail": state.get("detail"),
+            "validation_status": vstatus,
+            "catalog": {
+                "live_models": ventry.get("models_found", 0),
+                "configured": ventry.get("configured", []),
+                "matched": ventry.get("matched", []),
+                "missing": ventry.get("missing_models", []),
+                "selected_fallback": ventry.get("selected_fallback"),
+                "age_s": ventry.get("catalog_age_s"),
+                "cached": ventry.get("catalog_cached", False),
+                "timed_out": ventry.get("timed_out", False),
+                "error": ventry.get("error") if vstatus in ("DEGRADED", "ERROR") else None,
+            },
         }
     return JSONResponse({
         "providers": providers,
         "unorouter_model_chain": llm_service.unorouter_model_chain(),
+        "unorouter_effective_chain": llm_service.unorouter_effective_chain(),
         "checked_at": datetime.now(timezone.utc).isoformat(),
     })
 
