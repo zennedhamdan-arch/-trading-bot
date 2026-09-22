@@ -247,6 +247,7 @@
     health: function () { return get("/api/health"); },
     realtime: function () { return get("/api/realtime"); },
     providersHealth: function () { return get("/api/providers/health"); },
+    llmUsage: function () { return get("/api/llm/usage"); },
     newsStatus: function () { return get("/api/news/status"); },
     news: function (symbol) { return get("/api/news/" + encodeURIComponent(symbol)); },
     newsArticles: function (symbol) { return get("/api/news/" + encodeURIComponent(symbol) + "/articles"); },

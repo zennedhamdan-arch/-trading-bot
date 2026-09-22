@@ -68,14 +68,17 @@ models per request.
 """
 
 import hashlib
+import json
 import logging
 import re
+import sqlite3
 import threading
 import time
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as _FutureTimeoutError
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from config import settings
 from services import gemini_service
@@ -476,6 +479,132 @@ _model_unavailable_until = {}                           # (provider, model) -> d
 _request_times = {p: deque() for p in PROVIDERS}        # rolling 24h send stamps
 _last_failure = {p: None for p in PROVIDERS}            # {"status", "at"} for DEGRADED display
 
+# Quota management:
+_model_last_send = {}     # (provider, model) -> monotonic ts of the last send
+_state_lock = threading.Lock()
+_cycle_send_count = 0     # NETWORK SENDS this trading cycle (budget counter;
+#                          reset by reset_cycle_usage, enforced in call())
+_request_log_seq = 0      # occasional prune trigger for the persisted log
+
+# Persisted per-request usage log (the SAME SQLite file as memory_service —
+# no second storage engine). One row per network send / cache hit / replay:
+# powers /api/llm/usage (requests_last_hour, requests_today, 429_count,
+# cache_hits/misses, calls_by_agent, calls_by_model). Metadata only —
+# NEVER prompts, responses, API keys or headers.
+_REQUEST_LOG_SCHEMA = """
+CREATE TABLE IF NOT EXISTS llm_request_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts_epoch REAL NOT NULL,
+    ts_iso TEXT NOT NULL,
+    date TEXT NOT NULL,
+    kind TEXT NOT NULL,          -- send | cache_hit | cache_replay | cache_miss
+    provider TEXT,
+    model TEXT,
+    agent TEXT,
+    symbol TEXT,
+    reason TEXT,
+    ok INTEGER NOT NULL DEFAULT 0,
+    status TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_llm_req_log_ts ON llm_request_log(ts_epoch);
+CREATE INDEX IF NOT EXISTS idx_llm_req_log_date ON llm_request_log(date);
+"""
+
+
+_request_log_ready = False
+
+
+def _request_log_conn():
+    db_path = Path(str(settings.MEMORY_DB_PATH))
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path), timeout=10.0)
+    return conn
+
+
+def _ensure_request_log(conn) -> None:
+    """Creates the llm_request_log table when first needed (idempotent)."""
+    global _request_log_ready
+    if _request_log_ready:
+        return
+    conn.executescript(_REQUEST_LOG_SCHEMA)
+    _request_log_ready = True
+
+
+def _log_request(kind: str, provider=None, model=None, agent=None,
+                 symbol=None, reason=None, ok=False, status=None,
+                 latency_ms=None) -> None:
+    """Counts + logs + persists ONE LLM request event.
+
+    Structured log line: provider, model, caller/agent, symbol, reason —
+    never any API key, header, prompt or response content. Persistence is
+    best-effort: accounting must never break a request."""
+    try:
+        logger.info(
+            "LLM_REQUEST kind=%s provider=%s model=%s agent=%s symbol=%s "
+            "reason=%s ok=%s status=%s%s",
+            kind, provider or "-", model or "-", agent or "-", symbol or "-",
+            reason or "-", ok, status or "-",
+            f" latency_ms={latency_ms:.0f}" if latency_ms is not None else "",
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    global _request_log_seq
+    _request_log_seq += 1
+    try:
+        now = datetime.now(timezone.utc)
+        with _request_log_conn() as conn:
+            _ensure_request_log(conn)
+            if _request_log_seq % 64 == 1:
+                keep_days = max(1, int(settings.LLM_REQUEST_LOG_KEEP_DAYS or 2))
+                cutoff = (now - timedelta(days=keep_days)).strftime("%Y-%m-%d")
+                conn.execute("DELETE FROM llm_request_log WHERE date < ?", (cutoff,))
+            conn.execute(
+                "INSERT INTO llm_request_log (ts_epoch, ts_iso, date, kind, "
+                "provider, model, agent, symbol, reason, ok, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (now.timestamp(), now.isoformat(), now.strftime("%Y-%m-%d"),
+                 kind, provider, model, agent, symbol, reason,
+                 1 if ok else 0, status),
+            )
+    except Exception:  # noqa: BLE001 — persistence is best-effort only
+        pass
+
+
+def _model_min_interval_s(provider: str) -> float:
+    """Conservative minimum interval between sends to the SAME model.
+    Free UnoRouter models default to 60s; other providers 0 (their own
+    rate limits and circuits apply)."""
+    if provider == "unorouter":
+        return max(0.0, float(settings.LLM_MODEL_MIN_INTERVAL_SECONDS_UNOROUTER or 0))
+    return max(0.0, float(settings.LLM_MODEL_MIN_INTERVAL_SECONDS or 0))
+
+
+def _model_rate_limited(provider: str, model: str) -> float:
+    """Seconds the caller must wait before this model may be used again
+    (0.0 = allowed now). Enforced per (provider, model)."""
+    interval = _model_min_interval_s(provider)
+    if interval <= 0:
+        return 0.0
+    with _state_lock:
+        last = _model_last_send.get((provider, model))
+    if last is None:
+        return 0.0
+    remaining = interval - (time.monotonic() - last)
+    return max(0.0, remaining)
+
+
+def _mark_model_sent(provider: str, model: str) -> None:
+    with _state_lock:
+        _model_last_send[(provider, model)] = time.monotonic()
+
+
+def _cycle_send_budget() -> int:
+    return max(1, int(settings.LLM_CYCLE_MAX_REQUESTS or 12))
+
+
+def _cycle_sends_remaining() -> int:
+    return max(0, _cycle_send_budget() - _cycle_send_count)
+
 # Classic consecutive-failure circuit breaker (CLOSED -> OPEN -> HALF_OPEN).
 _breaker = {
     p: {"failures": 0, "open_until": 0.0,
@@ -498,8 +627,13 @@ _DEGRADED_WINDOW_S = 120.0
 
 
 def reset_cycle_usage() -> None:
-    """Zeroes the per-cycle usage counters. main.run_trading_cycle calls
-    this at the start of every cycle."""
+    """Zeroes the per-cycle usage counters AND the per-cycle network-send
+    budget. main.run_trading_cycle calls this at the start of every cycle
+    (the news worker runs OUTSIDE cycles and never calls this — its volume
+    is bounded by design: at most one batched request per symbol per
+    refresh, only for NEW important articles)."""
+    global _cycle_send_count
+    _cycle_send_count = 0
     _cycle_usage.clear()
     for provider in PROVIDERS:
         _cycle_usage[provider] = {
@@ -519,8 +653,14 @@ def reset_all_state() -> None:
     with _catalog_lock:
         _catalog_cache.clear()
     _model_warned.clear()
-    global _last_validation
+    global _last_validation, _cycle_send_count
     _last_validation = None
+    with _state_lock:
+        _model_last_send.clear()
+    _cycle_send_count = 0
+    global _request_log_seq, _request_log_ready
+    _request_log_seq = 0
+    _request_log_ready = False
     for p in PROVIDERS:
         _quota_backoff_until[p] = 0.0
         _auth_backoff_until[p] = 0.0
@@ -531,6 +671,95 @@ def reset_all_state() -> None:
     _model_unavailable_until.clear()
     _response_cache.clear()
     reset_cycle_usage()
+
+
+def usage_status() -> dict:
+    """The LLM usage/quota status payload (/api/llm/usage):
+
+    requests_this_cycle, requests_last_hour, requests_today, 429_count,
+    cache_hits, cache_misses, current_circuit_state (per provider) +
+    cooldown_remaining, calls_by_agent, calls_by_model. Served from the
+    in-process cycle counters and the persisted llm_request_log (same
+    SQLite file as memory_service). No secrets, no prompts, no responses."""
+    now = datetime.now(timezone.utc)
+    hour_ago = now.timestamp() - 3600.0
+    today = now.strftime("%Y-%m-%d")
+    stats = {
+        "requests_this_cycle": 0, "network_sends_this_cycle": _cycle_send_count,
+        "cycle_send_budget": _cycle_send_budget(),
+        "requests_last_hour": 0, "requests_today": 0, "429_count": 0,
+        "cache_hits": 0, "cache_misses": 0,
+        "calls_by_agent": {}, "calls_by_model": {},
+    }
+    # this-cycle accounting (in-process; includes cache hits and skips)
+    for usage in _cycle_usage.values():
+        stats["requests_this_cycle"] += usage.get("requests", 0)
+    try:
+        with _request_log_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            _ensure_request_log(conn)
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM llm_request_log "
+                "WHERE kind='send' AND ts_epoch >= ?", (hour_ago,)).fetchone()
+            stats["requests_last_hour"] = row["n"]
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM llm_request_log "
+                "WHERE kind='send' AND date = ?", (today,)).fetchone()
+            stats["requests_today"] = row["n"]
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM llm_request_log "
+                "WHERE kind='send' AND status='PROVIDER_QUOTA_EXCEEDED' "
+                "AND date = ?", (today,)).fetchone()
+            stats["429_count"] = row["n"]
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM llm_request_log "
+                "WHERE kind='cache_hit' AND date = ?", (today,)).fetchone()
+            stats["cache_hits"] = row["n"]
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM llm_request_log "
+                "WHERE kind='cache_miss' AND date = ?", (today,)).fetchone()
+            stats["cache_misses"] = row["n"]
+            for row in conn.execute(
+                    "SELECT agent, COUNT(*) AS n FROM llm_request_log "
+                    "WHERE kind='send' AND date = ? GROUP BY agent", (today,)):
+                stats["calls_by_agent"][row["agent"] or "unknown"] = row["n"]
+            for row in conn.execute(
+                    "SELECT provider, model, COUNT(*) AS n FROM llm_request_log "
+                    "WHERE kind='send' AND date = ? GROUP BY provider, model",
+                    (today,)):
+                key = f"{row['provider']}/{row['model']}"
+                stats["calls_by_model"][key] = row["n"]
+    except Exception as exc:  # noqa: BLE001 — stats must never fail the API
+        stats["log_error"] = str(exc)
+    hits = stats["cache_hits"]
+    lookups = hits + stats["cache_misses"]
+    stats["cache_hit_rate"] = round(hits / lookups, 3) if lookups else None
+
+    circuits = {}
+    cooldown_remaining = 0.0
+    for provider, state in provider_states().items():
+        provider_cooldown = max(
+            state.get("quota_cooldown_remaining_s") or 0.0,
+            state.get("auth_cooldown_remaining_s") or 0.0,
+        )
+        cooldown_remaining = max(cooldown_remaining, provider_cooldown)
+        circuits[provider] = {
+            "state": state.get("state"),
+            "circuit": state.get("circuit"),
+            "cooldown_remaining_s": provider_cooldown,
+            "model_cooldowns_s": {
+                model.split("/", 1)[1]: round(max(0.0, until - time.monotonic()), 0)
+                for (p, model), until in _model_unavailable_until.items()
+                if p == provider and until > time.monotonic()
+            },
+        }
+    return {
+        "checked_at": now.isoformat(),
+        **stats,
+        "current_circuit_state": circuits,
+        "cooldown_remaining": round(cooldown_remaining, 1),
+        "active_chain_providers": active_chain_providers(),
+    }
 
 
 def cycle_usage() -> dict:
@@ -887,6 +1116,8 @@ _ERROR_CODES = {
     "NETWORK_ERROR": "NETWORK_ERROR",
     "INVALID_RESPONSE": "INVALID_RESPONSE",
     "CIRCUIT_OPEN": "PROVIDER_UNAVAILABLE",
+    "RATE_LIMITED_LOCAL": "RATE_LIMITED_LOCAL",
+    "CYCLE_BUDGET_EXCEEDED": "CYCLE_BUDGET_EXCEEDED",
 }
 
 
@@ -1184,19 +1415,34 @@ def _candidate_precheck(provider: str, model: str):
 
 def call(agent: str, system: str, user: str, temperature: float = 0.2,
          max_tokens: int = 500, symbol: str = None,
-         expect_json: bool = False) -> LLMResult:
+         expect_json: bool = False, reason: str = None) -> LLMResult:
     """Runs one task request through the unified chain:
 
-    cache -> provider chain (primary model -> fallback models -> Groq)
-    -> cached replay on total failure. Never raises for provider-side
+    budget -> cache -> provider chain (primary model -> fallback models ->
+    Groq) -> cached replay on total failure. Never raises for provider-side
     problems; never blocks on long retries (10s timeout, 0 SDK retries).
+
+    Quota management (why this cycle will never hammer an endpoint):
+      * a per-model minimum interval (60s for free UnoRouter models) — a
+        request that would arrive sooner is NOT sent; the chain instantly
+        fails over to the next model (never waits),
+      * a global per-cycle network-send budget (LLM_CYCLE_MAX_REQUESTS),
+      * open circuits (quota/auth/model/breaker) are skipped with no call,
+      * every event (send / cache_hit / cache_replay / cache_miss) is
+        logged with provider, model, agent, symbol and reason, and
+        persisted for /api/llm/usage.
     """
+    global _cycle_send_count
     t0 = time.monotonic()
     key = _cache_key(agent, system, user)
 
     # 1. CACHE HIT (fresh) -> return without any network call.
     entry = _cache_get(key, fresh_only=True)
     if entry is not None:
+        _log_request("cache_hit", provider=entry["provider"],
+                     model=entry["model"], agent=agent, symbol=symbol,
+                     reason=reason, ok=True, status="OK",
+                     latency_ms=0.0)
         return LLMResult(
             agent, entry["provider"], entry["model"], "OK",
             text=entry["text"], parsed=entry["parsed"],
@@ -1220,14 +1466,51 @@ def call(agent: str, system: str, user: str, temperature: float = 0.2,
             error=f"No model configured for {agent} on {route['provider']} (set {model_env}).",
         ), symbol)
 
+    # Fresh cache had nothing: this invocation is a cache miss.
+    _log_request("cache_miss", provider=route["provider"],
+                 model=route["model"], agent=agent, symbol=symbol,
+                 reason=reason)
+
     # 2. Walk the chain: each failure records, updates circuits, and
     #    IMMEDIATELY tries the next candidate. No sleeping between models.
+    #    Checks are cheapest-first: cycle budget -> circuits -> per-model
+    #    rate limit -> send.
     last_result = None
     for idx, (cand_provider, cand_model) in enumerate(chain):
         if not cand_model:
             continue
+        # 2a. Global per-cycle network-send budget: beyond the cap the call
+        #     fails fast (never a send); cached replay / deterministic
+        #     fallback take over. Protects the quota by construction.
+        if _cycle_sends_remaining() <= 0:
+            last_result = LLMResult(
+                agent, cand_provider, cand_model, "CYCLE_BUDGET_EXCEEDED",
+                latency_ms=round((time.monotonic() - t0) * 1000, 1),
+                error=(f"CYCLE_BUDGET_EXCEEDED: this cycle already sent "
+                       f"{_cycle_send_count} LLM requests (cap "
+                       f"{_cycle_send_budget()}); failing fast to protect "
+                       f"the quota."),
+                attempts=idx + 1, fallback_used=idx > 0,
+            )
+            break
         pre_status, pre_error = _candidate_precheck(cand_provider, cand_model)
+        # 2b. Per-model minimum interval (quota management): a request to a
+        #     model used too recently is NOT sent — the chain instantly
+        #     moves on (trading never waits).
         if pre_status is None:
+            wait_s = _model_rate_limited(cand_provider, cand_model)
+            if wait_s > 0:
+                pre_status, pre_error = "RATE_LIMITED_LOCAL", (
+                    f"RATE_LIMITED_LOCAL: model '{cand_model}' was used "
+                    f"{_model_min_interval_s(cand_provider) - wait_s:.0f}s ago; "
+                    f"minimum interval is {wait_s:.0f}s more — trying the next "
+                    f"model instead of sending (quota protection).")
+        if pre_status is None:
+            # One NETWORK SEND: count it against the cycle budget and the
+            # per-model interval BEFORE the request leaves the process.
+            _mark_model_sent(cand_provider, cand_model)
+            _cycle_send_count += 1
+            attempt_t0 = time.monotonic()
             status, attempt_error, text, _ = _attempt(
                 cand_provider, cand_model, system, user, temperature, max_tokens
             )
@@ -1241,6 +1524,11 @@ def call(agent: str, system: str, user: str, temperature: float = 0.2,
                 except Exception as exc:  # noqa: BLE001 — parse errors are data
                     status = "INVALID_RESPONSE"
                     attempt_error = f"unparseable JSON response: {exc}"
+            _log_request(
+                "send", provider=cand_provider, model=cand_model, agent=agent,
+                symbol=symbol, reason=reason, ok=(status == "OK"),
+                status=status, latency_ms=(time.monotonic() - attempt_t0) * 1000,
+            )
             if status == "OK":
                 _breaker_success(cand_provider)
                 if expect_json and parsed is None:
@@ -1286,6 +1574,10 @@ def call(agent: str, system: str, user: str, temperature: float = 0.2,
     replay = _response_cache.get(key)
     if replay is not None:
         _record(last_result, symbol)  # the failure is still accounted
+        _log_request("cache_replay", provider=replay["provider"],
+                     model=replay["model"], agent=agent, symbol=symbol,
+                     reason=reason, ok=True, status="OK",
+                     latency_ms=(time.monotonic() - t0) * 1000)
         return LLMResult(
             agent, replay["provider"], replay["model"], "OK",
             text=replay["text"], parsed=replay["parsed"],
@@ -1329,13 +1621,15 @@ def complete(task: str, messages: list = None, system: str = None,
 
 
 def call_json(agent: str, system: str, user: str, temperature: float = 0.2,
-              max_tokens: int = 500, symbol: str = None) -> LLMResult:
+              max_tokens: int = 500, symbol: str = None,
+              reason: str = None) -> LLMResult:
     """call() + tolerant JSON parsing. A malformed response is retried down
     the model chain inside call(); if every model returns unparseable output
     the result comes back with status INVALID_RESPONSE (never fabricated
     content)."""
     result = call(agent, system, user, temperature=temperature,
-                  max_tokens=max_tokens, symbol=symbol, expect_json=True)
+                  max_tokens=max_tokens, symbol=symbol, expect_json=True,
+                  reason=reason)
     if not result.ok:
         return result
     if result.parsed is None:

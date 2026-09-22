@@ -191,6 +191,22 @@ class Settings:
     # Maximum model attempts per request across the fallback chain
     # (primary + fallback models; never unlimited model guessing).
     LLM_MAX_MODEL_ATTEMPTS: int = _get_int("LLM_MAX_MODEL_ATTEMPTS", 3)
+    # Quota management: a conservative MINIMUM INTERVAL between network
+    # requests to the SAME model. Free UnoRouter models default to 60s (a
+    # request that would arrive sooner is NOT sent — the chain fails over to
+    # the next model instantly instead of waiting; trading never blocks).
+    # Other providers default to 0 (their own rate limits + circuits apply).
+    LLM_MODEL_MIN_INTERVAL_SECONDS_UNOROUTER: float = _get_float(
+        "LLM_MODEL_MIN_INTERVAL_SECONDS_UNOROUTER", 60.0)
+    LLM_MODEL_MIN_INTERVAL_SECONDS: float = _get_float(
+        "LLM_MODEL_MIN_INTERVAL_SECONDS", 0.0)
+    # Global budget: maximum LLM NETWORK SENDS per trading cycle. Anything
+    # beyond fails fast (CYCLE_BUDGET_EXCEEDED) -> cached replay /
+    # deterministic fallback / HOLD. A normal 15-minute cycle over 5 symbols
+    # needs at most risk+cio per symbol = 10; 12 leaves headroom.
+    LLM_CYCLE_MAX_REQUESTS: int = _get_int("LLM_CYCLE_MAX_REQUESTS", 12)
+    # How long per-request usage rows (llm_request_log) are kept.
+    LLM_REQUEST_LOG_KEEP_DAYS: int = _get_int("LLM_REQUEST_LOG_KEEP_DAYS", 2)
     # Classic per-provider circuit breaker (CLOSED -> OPEN -> HALF_OPEN).
     LLM_CIRCUIT_BREAKER_ENABLED: bool = _get_bool("LLM_CIRCUIT_BREAKER_ENABLED", True)
     LLM_CIRCUIT_BREAKER_FAILURE_THRESHOLD: int = _get_int("LLM_CIRCUIT_BREAKER_FAILURE_THRESHOLD", 3)

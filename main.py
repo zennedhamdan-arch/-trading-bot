@@ -93,6 +93,11 @@ cycle_history = deque(maxlen=MAX_CYCLE_ENTRIES)
 _cycle_counter = {"n": 0}
 _active_cycle = None  # set while a cycle is running; used to tally warnings
 
+_cycle_running = False   # re-entrancy guard: the scheduler, /api/bot/run-now
+#                         and manual triggers must NEVER overlap cycles (LLM
+#                         quota, duplicate orders, double accounting).
+
+
 bot_state = {
     "running": False,
     "started_at": None,
@@ -269,8 +274,38 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
     {"provider", "type", "agent", "symbol", "message"} — a PARTIAL_ERROR
     cycle never has an empty error list again.
     """
+    global _active_cycle, _provider_extras, _cycle_running
+    if _cycle_running:
+        # Overlap protection: a cycle is already in flight (scheduler tick
+        # while a manual run-now is executing, etc.). Never start a second
+        # one — LLM quota, order accounting and cycle records would all be
+        # doubled.
+        logger.warning(
+            f"Cycle triggered by '{triggered_by}' SKIPPED: another cycle is "
+            f"already running (started by "
+            f"'{bot_state.get('last_cycle_triggered_by', 'unknown')}')."
+        )
+        return cycle_history[0] if cycle_history else {
+            "status": "SKIPPED_OVERLAP", "triggered_by": triggered_by,
+            "decisions": [], "errors": [{
+                "provider": "system", "type": "CYCLE_OVERLAP",
+                "agent": "system", "symbol": None,
+                "message": "another cycle is already running",
+            }],
+        }
+    _cycle_running = True
+    try:
+        return await _run_trading_cycle_inner(triggered_by)
+    finally:
+        _cycle_running = False
+
+
+async def _run_trading_cycle_inner(triggered_by: str = "scheduler") -> dict:
+    """The actual cycle body (call run_trading_cycle, which enforces the
+    single-flight guard)."""
     global _active_cycle, _provider_extras
     _provider_extras = {}
+    bot_state["last_cycle_triggered_by"] = triggered_by
     cycle_summary = {
         "triggered_by": triggered_by,
         "symbols_processed": [],
@@ -1015,6 +1050,8 @@ async def lifespan(app: FastAPI):
         trigger=IntervalTrigger(minutes=settings.CYCLE_INTERVAL_MINUTES),
         id="trading_cycle",
         replace_existing=True,
+        max_instances=1,           # never stack ticks of the same job
+        coalesce=True,             # missed ticks collapse into one run
     )
     # LLM catalog refresh: re-validate configured model ids against each
     # provider's live /v1/models catalog every cache-TTL window (at most one
@@ -1026,6 +1063,8 @@ async def lifespan(app: FastAPI):
             minutes=max(1.0, float(settings.LLM_CATALOG_CACHE_TTL_MINUTES))),
         id="llm_catalog_refresh",
         replace_existing=True,
+        max_instances=1,
+        coalesce=True,
     )
     # Independent News Worker (Part 11): its own schedule, never inside a
     # trading cycle. An initial pass runs shortly after boot so the cache
@@ -1038,6 +1077,8 @@ async def lifespan(app: FastAPI):
             trigger=IntervalTrigger(minutes=max(1.0, float(settings.NEWS_REFRESH_MINUTES))),
             id="news_refresh",
             replace_existing=True,
+            max_instances=1,       # worker also has its own non-blocking lock
+            coalesce=True,
         )
         scheduler.add_job(
             news_worker.scheduled_refresh,
@@ -1168,6 +1209,16 @@ async def api_realtime():
     payload = realtime_service.get_state()
     payload["market_clock"] = alpaca_service.get_clock()
     return JSONResponse(payload)
+
+
+@app.get("/api/llm/usage")
+async def api_llm_usage():
+    """LLM usage + quota status: requests_this_cycle, requests_last_hour,
+    requests_today, 429_count, cache_hits/cache_misses (+hit rate),
+    current_circuit_state with cooldown_remaining per provider, and
+    calls_by_agent / calls_by_model. Pure accounting — no LLM calls, no
+    secrets, no prompt/response content."""
+    return JSONResponse(llm_service.usage_status())
 
 
 @app.get("/api/providers/health")

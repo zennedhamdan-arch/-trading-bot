@@ -179,7 +179,7 @@ def make_decision(symbol: str, news_report: dict, tech_report: dict, risk_report
         temperature=0.2,
         max_tokens=700,
         symbol=symbol,
-    )
+        reason="cio_decision",)
 
     base_result["llm_status"] = result.status
     base_result["model"] = result.model

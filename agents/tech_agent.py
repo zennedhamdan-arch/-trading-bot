@@ -130,7 +130,7 @@ def analyze_technicals(symbol: str, indicators: dict) -> dict:
         temperature=0.2,
         max_tokens=400,
         symbol=symbol,
-    )
+        reason="technical_interpretation",)
 
     base_result["llm_status"] = result.status
     base_result["model"] = result.model

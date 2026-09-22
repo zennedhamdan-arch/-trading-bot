@@ -228,6 +228,11 @@ config.settings.FUNDAMENTALS_PROVIDER = "none"
 config.settings.LLM_FALLBACK_PROVIDER = ""
 config.settings.LLM_FALLBACK_MODEL = ""
 config.settings.LLM_RATE_LIMIT_MAX_RETRIES = 0
+# This suite exercises chain/breaker mechanics with rapid same-model calls;
+# the per-model 60s interval (quota management) has its own suite
+# (tests/test_llm_quota_management.py).
+config.settings.LLM_MODEL_MIN_INTERVAL_SECONDS_UNOROUTER = 0
+config.settings.LLM_CYCLE_MAX_REQUESTS = 1000
 
 from services import llm_service, news_intelligence, news_worker, risk_engine  # noqa: E402
 from services import alpaca_service  # noqa: E402

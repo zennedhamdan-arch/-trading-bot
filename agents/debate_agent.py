@@ -154,7 +154,7 @@ def run_debate(symbol: str, tech_report: dict, news_report: dict,
         temperature=0.4,
         max_tokens=600,
         symbol=symbol,
-    )
+        reason="debate_both_sides",)
 
     base_result["llm_status"] = result.status
     base_result["model"] = result.model
