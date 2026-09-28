@@ -1407,6 +1407,9 @@
             return { tool: t.tool, ok: t.ok !== false, label: t.tool };
           })) +
           (m.status ? '<div style="margin-top:6px" class="t-faint">response ' + partnerStatusBadge(m.status) +
+            (m.llm && m.llm.provider ? ' <span class="aux">· ' + U.esc(m.llm.provider) +
+              (m.llm.model ? " · " + U.esc(m.llm.model) : "") +
+              (m.llm.sends != null ? " · " + m.llm.sends + " LLM send" + (m.llm.sends === 1 ? "" : "s") : "") + "</span>" : "") +
             (m.latency_ms != null ? ' <span class="aux">· ' + m.latency_ms + "ms</span>" : "") + "</div>" : "") +
         "</div>";
     }
@@ -1446,7 +1449,7 @@
     }
 
     var statusRow =
-      '<div class="kpi-row" style="margin-bottom:10px">' +
+      '<div class="kpi-strip mb-12">' +
         kpiTile("Mode", '<span class="badge badge-ok">OBSERVER</span>', "Read-only · paper trading only") +
         kpiTile("LLM route",
           st.status && st.status.llm
@@ -1467,21 +1470,28 @@
         "OPERATOR_ENABLED=false on the server. The dashboard and trading are unaffected.");
     }
 
+    var greetingHTML = headCard("Trading Partner", "eye",
+      '<div class="card-bd">' +
+        '<div class="op-msg op-msg-answer">' +
+          (st.status && st.status.enabled === false
+            ? "Trading Partner is disabled on the server (OPERATOR_ENABLED=false). The dashboard and trading are unaffected."
+            : "Trading Partner online. I can inspect system health, agents, LLM providers, market-data status, paper portfolio state, configuration, and recent errors.") +
+        "</div>" +
+        '<div class="note" style="margin-top:8px">' + ICON("shield") +
+          "<span>Answers come from live read-only tools — it never guesses, never trades, never changes config. Paper trading only.</span></div>" +
+      "</div>");
+
     var convoHTML = st.messages.length
       ? st.messages.map(partnerMsgHTML).join("")
-      : headCard("Ask the operator", "eye",
+      : (greetingHTML +
+        headCard("Ask the operator", "brain",
           '<div class="card-bd">' +
-            C.stateHTML({
-              icon: "brain",
-              title: "No conversation yet",
-              msg: "Ask anything about the running system. The partner inspects live state with read-only diagnostic tools before answering — it never guesses.",
-            }) +
-            '<div class="chips" style="margin-top:10px">' +
+            '<div class="chips">' +
               PARTNER_SUGGESTIONS.map(function (q) {
                 return '<button class="chip chip-btn" data-op="ask" data-q="' + U.esc(q) + '">' + ICON("paper-plane") + U.esc(q) + "</button>";
               }).join("") +
             "</div>" +
-          "</div>");
+          "</div>"));
 
     var busyHTML = st.busy
       ? '<div class="card op-msg-card"><div class="card-bd">' +
@@ -1531,8 +1541,9 @@
 
     function refresh() { rerender({}); }
     function scrollThread() {
-      var el = qs("#op-thread", root);
-      if (el) el.scrollTop = 0; // newest messages render at the top of the thread
+      // newest messages render at the bottom of the page: bring them into
+      // view (the thread is not its own scroll container on mobile)
+      try { window.scrollTo(0, document.documentElement.scrollHeight); } catch (e) { /* ignore */ }
     }
 
     // one-time bootstrap: status + tool labels + past conversations
@@ -1576,6 +1587,7 @@
           st.error = r.error;
         }
         refresh();
+        scrollThread(); // show the latest exchange (bottom of the thread)
       });
     }
 
@@ -1601,6 +1613,7 @@
             }),
             status: d.status,
             latency_ms: d.latency_ms,
+            llm: d.llm || null,
           });
           if (d.status && d.status !== "OK" && d.error) st.error = d.error;
           // refresh the sidebar list (titles change as conversations evolve)

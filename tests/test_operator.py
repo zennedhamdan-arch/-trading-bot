@@ -452,6 +452,26 @@ check("15. delete conversation works",
       and memory.get_messages(r1["conversation_id"]) == [])
 
 # ---------------------------------------------------------------------------
+# operator is NOT throttled by the trading-cycle per-model interval
+# (regression: a 60s spacing between the operator's own tool-loop rounds
+# broke every multi-round conversation with RATE_LIMITED_LOCAL)
+# ---------------------------------------------------------------------------
+from services import llm_service as _llm                   # noqa: E402
+_mark, _limited = _llm._mark_model_sent, _llm._model_rate_limited
+_llm._mark_model_sent("unorouter", "test-model-x")         # just "used" now
+check("operator exempt from per-model interval (interactive chat, own caps)",
+      _llm._model_rate_limited("unorouter", "test-model-x") > 0)  # rule still on for trading
+llm_service.call_json = _ScriptedLLM([
+    {"tool_calls": [{"tool": "get_system_health", "args": {}}]},
+    {"final_answer": "STATUS\nTwo consecutive sends seconds apart both "
+                     "succeeded.\n\nEVIDENCE\n- no RATE_LIMITED_LOCAL"},
+])
+r = operator_service.chat("two quick sends")
+check("multi-round operator conversation survives back-to-back sends",
+      r["status"] == "OK" and "RATE_LIMITED_LOCAL" not in (r["error"] or "")
+      and r["llm"]["sends"] == 2)
+
+# ---------------------------------------------------------------------------
 # caps + system events (observability)
 # ---------------------------------------------------------------------------
 llm_service.call_json = _ScriptedLLM(

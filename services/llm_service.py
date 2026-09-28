@@ -1520,8 +1520,14 @@ def call(agent: str, system: str, user: str, temperature: float = 0.2,
         pre_status, pre_error = _candidate_precheck(cand_provider, cand_model)
         # 2b. Per-model minimum interval (quota management): a request to a
         #     model used too recently is NOT sent — the chain instantly
-        #     moves on (trading never waits).
-        if pre_status is None:
+        #     moves on (trading never waits). The "operator" task is
+        #     EXEMPT from this check: it is an interactive, user-initiated
+        #     chat bounded by OPERATOR_MAX_LLM_SENDS (never a scheduled
+        #     cycle), and a 60s spacing between its own tool-loop rounds
+        #     would break every multi-round conversation. Its sends are
+        #     still MARKED below (shared quota accounting) and the 429
+        #     circuits + daily limits still protect the endpoint.
+        if pre_status is None and agent != "operator":
             wait_s = _model_rate_limited(cand_provider, cand_model)
             if wait_s > 0:
                 pre_status, pre_error = "RATE_LIMITED_LOCAL", (
