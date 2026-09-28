@@ -6,7 +6,7 @@
  *   cd tests && npm install jsdom   (or install jsdom anywhere reachable)
  *   node ui_regression.js
  *
- * Verifies: all 11 pages render in demo mode; the Overview live-market strip;
+ * Verifies: all 12 pages render in demo mode; the Overview live-market strip;
  * the Health page startup-health table + LLM circuit table + market/realtime
  * cards; the cycle drawer's agent-execution matrix, agent-results chips, LLM
  * calls table and provider-state chips; read-only config.
@@ -54,7 +54,7 @@ check("demo mode active", w.App.store.demo === true);
 check("boot rendered overview into #page", doc.querySelector("#page").innerHTML.length > 200);
 
 // --- all 11 pages -----------------------------------------------------------
-const pages = ["overview", "portfolio", "positions", "orders", "ai", "agents", "risk", "cycles", "health", "activity", "config"];
+const pages = ["overview", "portfolio", "positions", "orders", "ai", "agents", "risk", "cycles", "health", "activity", "config", "partner"];
 for (const p of pages) {
   let ok = false;
   try {
@@ -218,4 +218,4 @@ if (failures.length) {
   failures.forEach((f) => console.log("  - " + f));
   process.exit(1);
 }
-console.log("UI REGRESSION PASSED — 11 pages, live strip, health tables, cycle drawer");
+console.log("UI REGRESSION PASSED — 12 pages, live strip, health tables, cycle drawer");

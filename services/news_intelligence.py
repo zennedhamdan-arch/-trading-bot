@@ -457,7 +457,7 @@ def analyze_new_articles(symbol: str, articles: list) -> dict:
     result = llm_service.call_json(
         "news", system=_ANALYSIS_INSTRUCTIONS, user=prompt,
         temperature=0.2, max_tokens=900, symbol=symbol,
-    )
+        reason="news_batch_analysis",)
 
     per_article = {}
     llm_summary = ""

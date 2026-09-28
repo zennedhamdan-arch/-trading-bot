@@ -223,6 +223,40 @@
     }
   }
 
+  async function postJSON(url, body, timeoutMs) {
+    const ctl = new AbortController();
+    const t = setTimeout(function () { ctl.abort(); }, timeoutMs || 120000);
+    try {
+      const r = await fetch(url, {
+        method: "POST",
+        headers: { accept: "application/json", "content-type": "application/json" },
+        body: JSON.stringify(body || {}),
+        signal: ctl.signal,
+      });
+      const j = await r.json().catch(function () { return {}; });
+      if (!r.ok) throw new Error((j && j.error) || "HTTP " + r.status);
+      MAX_AGE[url] = Date.now();
+      online = true;
+      return { ok: true, data: j };
+    } catch (e) {
+      return { ok: false, error: e && e.name === "AbortError" ? "Request timed out" : String((e && e.message) || e) };
+    } finally {
+      clearTimeout(t);
+    }
+  }
+
+  async function del(url) {
+    try {
+      const r = await fetch(url, { method: "DELETE", headers: { accept: "application/json" } });
+      const j = await r.json().catch(function () { return {}; });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      online = true;
+      return { ok: true, data: j };
+    } catch (e) {
+      return { ok: false, error: String((e && e.message) || e) };
+    }
+  }
+
   async function post(url) {
     try {
       const r = await fetch(url, { method: "POST", headers: { accept: "application/json" } });
@@ -247,9 +281,18 @@
     health: function () { return get("/api/health"); },
     realtime: function () { return get("/api/realtime"); },
     providersHealth: function () { return get("/api/providers/health"); },
+    llmUsage: function () { return get("/api/llm/usage"); },
     newsStatus: function () { return get("/api/news/status"); },
     news: function (symbol) { return get("/api/news/" + encodeURIComponent(symbol)); },
     newsArticles: function (symbol) { return get("/api/news/" + encodeURIComponent(symbol) + "/articles"); },
+    operatorStatus: function () { return get("/api/operator/status"); },
+    operatorTools: function () { return get("/api/operator/tools"); },
+    operatorChat: function (question, conversationId) {
+      return postJSON("/api/operator/chat", { question: question, conversation_id: conversationId || null }, 150000);
+    },
+    operatorConversations: function () { return get("/api/operator/conversations"); },
+    operatorConversation: function (id) { return get("/api/operator/conversations/" + encodeURIComponent(id)); },
+    operatorClear: function (id) { return del("/api/operator/conversations/" + encodeURIComponent(id)); },
     botStart: function () { return post("/api/bot/start"); },
     botStop: function () { return post("/api/bot/stop"); },
     runNow: function () { return post("/api/bot/run-now"); },
