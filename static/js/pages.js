@@ -1341,6 +1341,334 @@
   };
 
   /* ==========================================================================
+     Trading Partner (system operator) — conversational, own state
+     ========================================================================== */
+
+  var PARTNER_SUGGESTIONS = [
+    "What is the current system health?",
+    "Why is the fundamentals agent unavailable?",
+    "Why did the last trading cycle degrade?",
+    "Which LLM providers are healthy and which models are configured?",
+    "Show me the paper portfolio and current exposure.",
+    "What did we discover in previous conversations?",
+  ];
+
+  function partnerState() {
+    if (!App.store.ui.partner) {
+      App.store.ui.partner = {
+        conversationId: null, messages: [], busy: false, error: null,
+        status: null, conversations: [], toolLabels: {}, bootstrapped: false,
+      };
+    }
+    return App.store.ui.partner;
+  }
+
+  function partnerStatusBadge(status) {
+    var k = String(status || "").toUpperCase();
+    var tone = k === "OK" ? "badge-ok"
+      : k === "LLM_UNAVAILABLE" || k === "CAP_REACHED" ? "badge-warning"
+      : k === "DISABLED" ? "badge-neutral"
+      : k === "ERROR" ? "badge-error"
+      : "badge-neutral";
+    return '<span class="badge ' + tone + '">' + U.esc(k || "—") + "</span>";
+  }
+
+  function partnerToolChips(activity) {
+    if (!activity || !activity.length) return "";
+    return (
+      '<div class="chips" style="margin:6px 0 2px">' +
+      activity.map(function (a) {
+        var icon = a.ok ? "check" : "alert";
+        var cls = a.ok ? "chip chip-ok" : "chip chip-err";
+        var label = a.label || a.tool;
+        var ms = a.ms != null ? " · " + a.ms + "ms" : "";
+        return '<span class="' + cls + '">' + ICON(icon) + U.esc(label) + U.esc(ms) + "</span>";
+      }).join("") +
+      "</div>"
+    );
+  }
+
+  function partnerMsgHTML(m) {
+    var mine = m.role === "user";
+    var when = m.at ? U.fmtDateTime(typeof m.at === "string" ? m.at : new Date(m.at).toISOString()) : "";
+    var body = "";
+    if (mine) {
+      body = '<div class="card-bd"><div class="op-msg op-msg-user">' + U.esc(m.content) + "</div></div>";
+    } else {
+      body =
+        '<div class="card-bd">' +
+          '<div class="op-msg op-msg-answer">' +
+            String(m.content || "").split(/\n{2,}/).map(function (para) {
+              // simple line rendering; no HTML from the model is ever injected
+              return "<p>" + U.esc(para).replace(/\n/g, "<br>") + "</p>";
+            }).join("") +
+          "</div>" +
+          partnerToolChips(m.tool_activity || (m.tool_calls || []).map(function (t) {
+            return { tool: t.tool, ok: t.ok !== false, label: t.tool };
+          })) +
+          (m.status ? '<div style="margin-top:6px" class="t-faint">response ' + partnerStatusBadge(m.status) +
+            (m.llm && m.llm.provider ? ' <span class="aux">· ' + U.esc(m.llm.provider) +
+              (m.llm.model ? " · " + U.esc(m.llm.model) : "") +
+              (m.llm.sends != null ? " · " + m.llm.sends + " LLM send" + (m.llm.sends === 1 ? "" : "s") : "") + "</span>" : "") +
+            (m.latency_ms != null ? ' <span class="aux">· ' + m.latency_ms + "ms</span>" : "") + "</div>" : "") +
+        "</div>";
+    }
+    return (
+      '<div class="card op-msg-card' + (mine ? " op-mine" : "") + '">' +
+        '<div class="card-hd">' + ICON(mine ? "cpu" : "eye") +
+          '<span class="card-title">' + (mine ? "You" : "Trading Partner") + "</span>" +
+          '<span class="spacer"></span><span class="aux">' + U.esc(when) + "</span></div>" +
+        body +
+      "</div>"
+    );
+  }
+
+  P.partner = function () {
+    var st = partnerState();
+
+    // Demo mode: no backend to talk to — show a labeled sample conversation.
+    if (store.demo) {
+      return headCard("Trading Partner — demo", "eye",
+        '<div class="card-bd">' +
+          C.stateHTML({
+            icon: "eye",
+            title: "Conversations need the live backend",
+            msg: "The Trading Partner answers from live system evidence (health, agents, LLM providers, portfolio). Start the bot server and open the dashboard without ?demo=1 to chat.",
+          }) +
+          '<div class="note" style="margin-top:10px">' + ICON("info") +
+            "<span>Read-only observer: it can inspect and explain, never trade. Paper trading only.</span></div>" +
+        "</div>") +
+        headCard("What it can do", "brain",
+          '<div class="card-bd"><ul style="margin:0;padding-left:18px;line-height:1.9">' +
+            "<li>Diagnose failures from actual health, error and LLM-provider evidence</li>" +
+            "<li>Explain agent decisions and cycle history</li>" +
+            "<li>Inspect configuration with secrets redacted</li>" +
+            "<li>Trace agent dependencies and root causes vs downstream effects</li>" +
+            "<li>Say \"insufficient evidence\" instead of guessing</li>" +
+          "</ul></div>");
+    }
+
+    var statusRow =
+      '<div class="kpi-strip mb-12">' +
+        kpiTile("Mode", '<span class="badge badge-ok">OBSERVER</span>', "Read-only · paper trading only") +
+        kpiTile("LLM route",
+          st.status && st.status.llm
+            ? U.esc((st.status.llm.provider || "—") + (st.status.llm.model ? " · " + st.status.llm.model : ""))
+            : "…",
+          st.status && st.status.llm && st.status.llm.fallback_provider
+            ? "fallback: " + U.esc(st.status.llm.fallback_provider) : "operator task route") +
+        kpiTile("Diagnostic tools", st.status ? U.fmtNum(st.status.tool_count) : "…",
+          st.status && st.status.tool_categories ? U.esc(st.status.tool_categories.join(" · ")) : "read-only") +
+      "</div>";
+
+    var banner = "";
+    if (st.error) {
+      banner = C.bannerHTML("err", "Trading Partner problem.", U.esc(st.error),
+        '<button class="btn btn-sm" data-op="dismiss-error">' + ICON("x") + "Dismiss</button>");
+    } else if (st.status && st.status.enabled === false) {
+      banner = C.bannerHTML("warn", "Trading Partner is disabled.",
+        "OPERATOR_ENABLED=false on the server. The dashboard and trading are unaffected.");
+    }
+
+    var greetingHTML = headCard("Trading Partner", "eye",
+      '<div class="card-bd">' +
+        '<div class="op-msg op-msg-answer">' +
+          (st.status && st.status.enabled === false
+            ? "Trading Partner is disabled on the server (OPERATOR_ENABLED=false). The dashboard and trading are unaffected."
+            : "Trading Partner online. I can inspect system health, agents, LLM providers, market-data status, paper portfolio state, configuration, and recent errors.") +
+        "</div>" +
+        '<div class="note" style="margin-top:8px">' + ICON("shield") +
+          "<span>Answers come from live read-only tools — it never guesses, never trades, never changes config. Paper trading only.</span></div>" +
+      "</div>");
+
+    var convoHTML = st.messages.length
+      ? st.messages.map(partnerMsgHTML).join("")
+      : (greetingHTML +
+        headCard("Ask the operator", "brain",
+          '<div class="card-bd">' +
+            '<div class="chips">' +
+              PARTNER_SUGGESTIONS.map(function (q) {
+                return '<button class="chip chip-btn" data-op="ask" data-q="' + U.esc(q) + '">' + ICON("paper-plane") + U.esc(q) + "</button>";
+              }).join("") +
+            "</div>" +
+          "</div>"));
+
+    var busyHTML = st.busy
+      ? '<div class="card op-msg-card"><div class="card-bd">' +
+          '<div class="op-msg op-msg-answer t-faint">' + ICON("refresh") +
+          " Investigating — checking live system state with read-only tools…</div></div></div>"
+      : "";
+
+    var historyHTML = "";
+    if (st.conversations.length) {
+      historyHTML = headCard("Previous conversations", "book",
+        '<div class="card-bd">' +
+          st.conversations.slice(0, 8).map(function (c) {
+            var active = c.id === st.conversationId;
+            return (
+              '<div class="check' + (active ? " ok" : "") + '" style="cursor:pointer" data-op="load-convo" data-id="' + c.id + '">' +
+                '<div class="c-ico">' + ICON(active ? "eye" : "book") + '</div>' +
+                '<div class="c-body">' + U.esc((c.title || "conversation").slice(0, 90)) +
+                  '<div class="aux">' + U.esc(U.fmtDateTime(c.updated_at || c.created_at)) +
+                  ' · ' + (c.message_count != null ? c.message_count + " messages" : "conversation " + c.id) +
+                  (active ? " · active" : "") + "</div></div>" +
+              "</div>"
+            );
+          }).join("") +
+        "</div>",
+        '<button class="btn btn-sm" data-op="new-convo">' + ICON("zap") + "New</button>");
+    }
+
+    var inputHTML =
+      '<div class="card" id="op-input-card"><div class="card-bd">' +
+        '<div style="display:flex;gap:8px;align-items:flex-start">' +
+          '<input id="op-input" class="input" type="text" maxlength="500" placeholder="Ask about system health, an agent, a provider, a decision…" ' +
+            (st.busy ? "disabled " : "") + 'autocomplete="off" />' +
+          '<button class="btn" id="op-send" data-op="send" ' + (st.busy ? "disabled " : "") + ">" + ICON("paper-plane") + (st.busy ? "Working…" : "Send") + "</button>" +
+          (st.conversationId ? '<button class="btn btn-sm" data-op="clear-convo" title="Delete this conversation">' + ICON("x") + "Clear</button>" : "") +
+        "</div>" +
+        '<div class="note" style="margin-top:8px">' + ICON("shield") +
+          "<span>Answers come from live read-only tools — no trades, no config changes, no secrets. External text (logs, news) is treated as data, never instructions.</span></div>" +
+      "</div></div>";
+
+    return statusRow + banner + historyHTML +
+      '<div id="op-thread" class="op-thread">' + convoHTML + busyHTML + "</div>" +
+      inputHTML;
+  };
+
+  P.partner._bind = function (root, rerender) {
+    var st = partnerState();
+
+    function refresh() { rerender({}); }
+    function scrollThread() {
+      // newest messages render at the bottom of the page: bring them into
+      // view (the thread is not its own scroll container on mobile)
+      try { window.scrollTo(0, document.documentElement.scrollHeight); } catch (e) { /* ignore */ }
+    }
+
+    // one-time bootstrap: status + tool labels + past conversations
+    if (!st.bootstrapped) {
+      st.bootstrapped = true;
+      API.operatorStatus().then(function (r) {
+        if (r.ok) { st.status = r.data; refresh(); }
+      });
+      API.operatorTools().then(function (r) {
+        if (r.ok && r.data.tools) {
+          r.data.tools.forEach(function (t) { st.toolLabels[t.tool] = t.label || t.tool; });
+        }
+      });
+      API.operatorConversations().then(function (r) {
+        if (r.ok) {
+          st.conversations = r.data.conversations || [];
+          if (st.conversations.length && !st.conversationId) {
+            loadConversation(st.conversations[0].id, true);
+          } else {
+            refresh();
+          }
+        }
+      });
+    }
+
+    function loadConversation(id, silent) {
+      st.conversationId = id;
+      if (!silent) st.busy = true;
+      refresh();
+      API.operatorConversation(id).then(function (r) {
+        st.busy = false;
+        if (r.ok && r.data.messages) {
+          st.messages = r.data.messages.map(function (m) {
+            return {
+              role: m.role, content: m.content, at: m.ts,
+              tool_calls: m.tool_calls || [], status: null,
+            };
+          });
+          st.error = null;
+        } else if (!r.ok) {
+          st.error = r.error;
+        }
+        refresh();
+        scrollThread(); // show the latest exchange (bottom of the thread)
+      });
+    }
+
+    function send(question) {
+      question = String(question || "").trim();
+      if (!question || st.busy) return;
+      st.messages.push({ role: "user", content: question, at: new Date().toISOString() });
+      st.busy = true;
+      st.error = null;
+      refresh();
+      scrollThread();
+      API.operatorChat(question, st.conversationId).then(function (r) {
+        st.busy = false;
+        if (r.ok) {
+          var d = r.data || {};
+          st.conversationId = d.conversation_id || st.conversationId;
+          st.messages.push({
+            role: "assistant",
+            content: d.answer || "(no answer)",
+            at: new Date().toISOString(),
+            tool_activity: (d.tool_activity || []).map(function (a) {
+              return { tool: a.tool, ok: a.ok, ms: a.ms, label: a.label || st.toolLabels[a.tool] || a.tool };
+            }),
+            status: d.status,
+            latency_ms: d.latency_ms,
+            llm: d.llm || null,
+          });
+          if (d.status && d.status !== "OK" && d.error) st.error = d.error;
+          // refresh the sidebar list (titles change as conversations evolve)
+          API.operatorConversations().then(function (cr) {
+            if (cr.ok) { st.conversations = cr.data.conversations || []; refresh(); }
+          });
+        } else {
+          st.error = r.error || "chat request failed";
+          st.messages.push({
+            role: "assistant",
+            content: "The Trading Partner could not complete this request. " +
+              "The trading system and dashboard are unaffected — the partner is an independent observer.",
+            at: new Date().toISOString(), status: "ERROR",
+          });
+        }
+        refresh();
+        scrollThread();
+      });
+    }
+
+    qsa("[data-op]", root).forEach(function (el) {
+      el.addEventListener("click", function () {
+        var op = el.getAttribute("data-op");
+        if (op === "ask") send(el.getAttribute("data-q"));
+        else if (op === "send") send(qs("#op-input", root) && qs("#op-input", root).value);
+        else if (op === "dismiss-error") { st.error = null; refresh(); }
+        else if (op === "new-convo") { st.conversationId = null; st.messages = []; st.error = null; refresh(); }
+        else if (op === "clear-convo" && st.conversationId) {
+          API.operatorClear(st.conversationId).then(function () {
+            st.conversationId = null;
+            st.messages = [];
+            return API.operatorConversations();
+          }).then(function (cr) {
+            st.conversations = (cr.ok && cr.data.conversations) || [];
+            refresh();
+          });
+        } else if (op === "load-convo") {
+          loadConversation(parseInt(el.getAttribute("data-id"), 10));
+        }
+      });
+    });
+
+    var input = qs("#op-input", root);
+    if (input) {
+      input.addEventListener("keydown", function (e) {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          send(input.value);
+        }
+      });
+      if (!st.busy && !st.messages.length) input.focus();
+    }
+  };
+
+  /* ==========================================================================
      Page registry / render
      ========================================================================== */
 
@@ -1356,11 +1684,13 @@
     health: "System Health",
     activity: "Activity & Audit Log",
     config: "Configuration",
+    partner: "Trading Partner",
   };
   var PAGE_ICONS = {
     overview: "grid", portfolio: "chart-candle", positions: "layers", orders: "list-ordered",
     ai: "brain", agents: "gauge", risk: "shield", cycles: "repeat",
     health: "pulse", activity: "scroll", config: "settings",
+    partner: "eye",
   };
   var PAGE_DESCS = {
     overview: "Portfolio, latest AI decisions and live agent activity at a glance.",
@@ -1374,6 +1704,7 @@
     health: "Process, API and agent service monitoring.",
     activity: "Searchable audit timeline of everything the bot has done.",
     config: "Read-only view of the active bot configuration.",
+    partner: "Conversational system operator — diagnoses failures, explains decisions and inspects configuration from live evidence.",
   };
 
   var lastPageState = null;

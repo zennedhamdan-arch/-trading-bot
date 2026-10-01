@@ -151,7 +151,7 @@ def assess_risk(symbol: str, proposed_side: str, account_summary: dict,
         temperature=0.1,
         max_tokens=500,
         symbol=symbol,
-    )
+        reason="risk_reasoning",)
 
     base_result["llm_status"] = result.status
     base_result["model"] = result.model

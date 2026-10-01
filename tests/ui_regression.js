@@ -6,7 +6,7 @@
  *   cd tests && npm install jsdom   (or install jsdom anywhere reachable)
  *   node ui_regression.js
  *
- * Verifies: all 11 pages render in demo mode; the Overview live-market strip;
+ * Verifies: all 12 pages render in demo mode; the Overview live-market strip;
  * the Health page startup-health table + LLM circuit table + market/realtime
  * cards; the cycle drawer's agent-execution matrix, agent-results chips, LLM
  * calls table and provider-state chips; read-only config.
@@ -53,8 +53,8 @@ const doc = w.document;
 check("demo mode active", w.App.store.demo === true);
 check("boot rendered overview into #page", doc.querySelector("#page").innerHTML.length > 200);
 
-// --- all 11 pages -----------------------------------------------------------
-const pages = ["overview", "portfolio", "positions", "orders", "ai", "agents", "risk", "cycles", "health", "activity", "config"];
+// --- all 12 pages -----------------------------------------------------------
+const pages = ["overview", "portfolio", "positions", "orders", "ai", "agents", "risk", "cycles", "health", "activity", "config", "partner"];
 for (const p of pages) {
   let ok = false;
   try {
@@ -65,6 +65,29 @@ for (const p of pages) {
   }
   check(`page renders: ${p}`, ok);
 }
+
+// --- trading partner: access + chat UI requirements --------------------------
+check("partner: desktop sidebar link", !!doc.querySelector('.snav a[data-nav="partner"]'));
+check("partner: mobile bottom-nav link", !!doc.querySelector('.mbot a[data-nav="partner"]'));
+check("partner: mobile More-sheet link",
+  (function () {
+    // the more-sheet is filled by an inline boot script (not executed under
+    // runScripts:"outside-only"), so verify it in the page source
+    const i = html.indexOf("more-root");
+    return i >= 0 && html.slice(i).includes('data-nav="partner"');
+  })());
+// exercise the LIVE branch of the partner page (demo mode shows the
+// "needs live backend" state by design)
+w.App.store.demo = false;
+w.App.renderPage("partner", {});
+const partnerHTML = doc.querySelector("#page").innerHTML;
+check("partner: initial status message (online greeting)",
+  /Trading Partner online\. I can inspect system health, agents, LLM providers/.test(partnerHTML));
+check("partner: message input present", !!doc.querySelector("#op-input"));
+check("partner: send button present", !!doc.querySelector("#op-send"));
+check("partner: suggested questions render", /What is the current system health\?/.test(partnerHTML));
+check("partner: read-only/paper note", /Paper trading only/.test(partnerHTML));
+w.App.store.demo = true; // restore for the checks below
 
 // --- overview: live market strip --------------------------------------------
 w.App.renderPage("overview", {});
@@ -218,4 +241,4 @@ if (failures.length) {
   failures.forEach((f) => console.log("  - " + f));
   process.exit(1);
 }
-console.log("UI REGRESSION PASSED — 11 pages, live strip, health tables, cycle drawer");
+console.log("UI REGRESSION PASSED — 12 pages, live strip, health tables, cycle drawer");

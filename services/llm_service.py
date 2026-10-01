@@ -68,11 +68,17 @@ models per request.
 """
 
 import hashlib
+import json
 import logging
 import re
+import sqlite3
+import threading
 import time
 from collections import OrderedDict, deque
-from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as _FutureTimeoutError
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from config import settings
 from services import gemini_service
@@ -253,6 +259,11 @@ _TASK_PROVIDERS = {
     "cio": "LLM_CIO_PROVIDER",
     "news": "LLM_NEWS_PROVIDER",
     "fundamentals": "LLM_FUNDAMENTALS_PROVIDER",
+    # Trading Partner / System Operator: a READ-ONLY observer task. Routed
+    # like any other task (OPERATOR_LLM_PROVIDER/OPERATOR_LLM_MODEL) but
+    # deliberately EXCLUDED from active_chain_providers() — the trading
+    # system's health must never depend on the operator's provider.
+    "operator": "OPERATOR_LLM_PROVIDER",
 }
 
 # (provider, task) -> settings attribute for the model id
@@ -275,6 +286,11 @@ _TASK_MODELS = {
     ("nvidia", "cio"): "NVIDIA_MODEL",
     ("nvidia", "news"): "NVIDIA_MODEL",
     ("nvidia", "fundamentals"): "NVIDIA_MODEL",
+    # Operator: one optional model override honored across providers.
+    ("groq", "operator"): "OPERATOR_LLM_MODEL",
+    ("gemini", "operator"): "OPERATOR_LLM_MODEL",
+    ("nvidia", "operator"): "OPERATOR_LLM_MODEL",
+    ("openrouter", "operator"): "OPERATOR_LLM_MODEL",
     # UnoRouter tasks all use the application's explicit model chain
     # (primary + UNOROUTER_FALLBACK_MODELS), resolved in _candidate_chain().
     ("unorouter", "technical"): "UNOROUTER_PRIMARY_MODEL",
@@ -288,7 +304,18 @@ _TASK_MODELS = {
 
 def _task_model(provider: str, task: str) -> str:
     attr = _TASK_MODELS.get((provider, task))
-    return str(getattr(settings, attr, "") or "") if attr else ""
+    model = str(getattr(settings, attr, "") or "") if attr else ""
+    if not model and task == "operator":
+        # OPERATOR_LLM_MODEL is an optional override; without it the
+        # operator rides the provider's own configured default (never an
+        # invented id — these are all configured settings attributes).
+        model = str({
+            "groq": getattr(settings, "GROQ_FALLBACK_MODEL", ""),
+            "gemini": getattr(settings, "GEMINI_MODEL", ""),
+            "nvidia": getattr(settings, "NVIDIA_MODEL", ""),
+            "openrouter": getattr(settings, "OPENROUTER_MODEL", ""),
+        }.get(provider, "") or "")
+    return model
 
 
 def route_info(agent: str) -> dict:
@@ -346,11 +373,258 @@ _clients = {}  # provider -> cached SDK client (tests may inject)
 _verified_models = {}  # provider -> set of model ids seen in the live catalog
 _last_validation = None  # report dict returned by validate_models()
 
+# Model-catalog layer: /v1/models is fetched AT MOST once per provider per
+# LLM_CATALOG_CACHE_TTL_MINUTES window (5-10 min) — one shared catalog for
+# health checks, validations and chain resolution. A hanging provider is
+# bounded by LLM_CATALOG_TIMEOUT_SECONDS in a worker thread, so a slow
+# Gemini (or any provider) can never block startup or a health-check cycle.
+_catalog_cache = {}  # provider -> {"ids": set|None, "fetched_at": float,
+#                                "error": str|None, "timed_out": bool}
+_catalog_lock = threading.Lock()
+# TWO disjoint pools so nested work can never starve itself:
+#   _catalog_pool  — runs RAW list_models() fetches (never submits anything)
+#   _validation_pool — runs whole get_model_catalog() wrappers in parallel
+# A single shared pool deadlocks: N wrappers occupy all workers and each
+# wrapper's inner fetch stays queued behind them until its timeout fires
+# (the exact "validation times out" symptom this fix removes). Abandoned
+# hung fetches self-terminate via the SDK's own HTTP timeout.
+_catalog_pool_ref = None
+_validation_pool_ref = None
+_model_warned = {}  # (provider, model_id) -> monotonic deadline: an
+#                    LLM_MODEL_UNAVAILABLE warning is logged AT MOST once per
+#                    model per catalog/health-check period (never 6x).
+
+
+def _catalog_pool():
+    global _catalog_pool_ref
+    if _catalog_pool_ref is None:
+        _catalog_pool_ref = ThreadPoolExecutor(
+            max_workers=max(2, len(PROVIDERS)), thread_name_prefix="llm-catalog")
+    return _catalog_pool_ref
+
+
+def _validation_pool():
+    global _validation_pool_ref
+    if _validation_pool_ref is None:
+        _validation_pool_ref = ThreadPoolExecutor(
+            max_workers=max(2, len(PROVIDERS)), thread_name_prefix="llm-validate")
+    return _validation_pool_ref
+
+
+def _catalog_ttl_s() -> float:
+    return max(60.0, float(settings.LLM_CATALOG_CACHE_TTL_MINUTES or 8) * 60.0)
+
+
+def _normalize_model_id(model_id) -> str:
+    """Exact-match normalization: trim whitespace and strip a 'models/'
+    prefix (Gemini convention). Case is NOT mangled — ids match exactly."""
+    return str(model_id or "").strip().removeprefix("models/")
+
+
+def get_model_catalog(provider: str, force: bool = False) -> dict:
+    """The provider's LIVE model catalog, TTL-cached.
+
+    Returns {"ids": set|None, "fetched_at": float, "error": str|None,
+             "timed_out": bool, "cached": bool, "age_s": float|None}.
+    ids is None when the catalog could not be fetched (error/timeout/not
+    configured) — callers must treat that as 'unverified', never as empty.
+    Exactly ONE /v1/models request per provider per TTL window, shared by
+    everything; force=True refetches (used when the TTL has expired)."""
+    if provider not in _PROVIDER_INSTANCES:
+        return {"ids": None, "fetched_at": 0.0, "error": f"unknown provider '{provider}'",
+                "timed_out": False, "cached": False, "age_s": None}
+    if not force:
+        with _catalog_lock:
+            entry = _catalog_cache.get(provider)
+            if entry and entry.get("fetched_at") \
+                    and (time.monotonic() - entry["fetched_at"]) < _catalog_ttl_s():
+                out = dict(entry)
+                out["cached"] = True
+                out["age_s"] = round(time.monotonic() - entry["fetched_at"], 1)
+                return out
+
+    fetched = {"ids": None, "fetched_at": time.monotonic(),
+               "error": None, "timed_out": False}
+    inst = _PROVIDER_INSTANCES[provider]
+    if not _provider_enabled(provider) or not _provider_key(provider):
+        fetched["error"] = (f"disabled via {inst.enabled_attr}=false"
+                            if not _provider_enabled(provider)
+                            else f"{inst.key_attr} not configured")
+    else:
+        timeout_s = max(1.0, float(settings.LLM_CATALOG_TIMEOUT_SECONDS or 8))
+        try:
+            future = _catalog_pool().submit(inst.list_models)
+            try:
+                ids = future.result(timeout=timeout_s)
+                fetched["ids"] = {_normalize_model_id(i) for i in (ids or set())}
+                _verified_models[provider] = set(fetched["ids"])
+            except _FutureTimeoutError:
+                fetched["timed_out"] = True
+                fetched["error"] = (f"model catalog fetch timed out after "
+                                    f"{timeout_s:.0f}s")
+                # Retrieve/swallow the late result so the abandoned worker
+                # thread never logs an unretrieved-exception warning.
+                future.add_done_callback(lambda f: f.exception() if f.done() else None)
+        except Exception as exc:  # noqa: BLE001 — catalog fetch must never raise
+            fetched["error"] = f"could not list models: {exc}"
+
+    # A fresh catalog starts a new warning period for this provider: a model
+    # that is STILL missing warns once for the new period (not zero times,
+    # not six times).
+    if fetched["ids"] is not None:
+        for key in [k for k in _model_warned if k[0] == provider]:
+            _model_warned.pop(key, None)
+    with _catalog_lock:
+        _catalog_cache[provider] = fetched
+    out = dict(fetched)
+    out["cached"] = False
+    out["age_s"] = 0.0
+    return out
+
+
+def _warn_model_unavailable(provider: str, model: str, detail: str) -> bool:
+    """Logs LLM_MODEL_UNAVAILABLE for (provider, model) AT MOST once per
+    catalog/health-check period. Repeated 404s, six routed tasks or several
+    validations within one period never produce duplicate warnings."""
+    key = (provider, _normalize_model_id(model))
+    now = time.monotonic()
+    if now < _model_warned.get(key, 0.0):
+        return False
+    _model_warned[key] = now + _catalog_ttl_s()
+    logger.warning("LLM_MODEL_UNAVAILABLE: %s: model '%s' %s", provider, model, detail)
+    return True
+
 _quota_backoff_until = {p: 0.0 for p in PROVIDERS}      # 429 circuit
 _auth_backoff_until = {p: 0.0 for p in PROVIDERS}       # 401/403 circuit
 _model_unavailable_until = {}                           # (provider, model) -> deadline (404 circuit)
 _request_times = {p: deque() for p in PROVIDERS}        # rolling 24h send stamps
 _last_failure = {p: None for p in PROVIDERS}            # {"status", "at"} for DEGRADED display
+
+# Quota management:
+_model_last_send = {}     # (provider, model) -> monotonic ts of the last send
+_state_lock = threading.Lock()
+_cycle_send_count = 0     # NETWORK SENDS this trading cycle (budget counter;
+#                          reset by reset_cycle_usage, enforced in call())
+_request_log_seq = 0      # occasional prune trigger for the persisted log
+
+# Persisted per-request usage log (the SAME SQLite file as memory_service —
+# no second storage engine). One row per network send / cache hit / replay:
+# powers /api/llm/usage (requests_last_hour, requests_today, 429_count,
+# cache_hits/misses, calls_by_agent, calls_by_model). Metadata only —
+# NEVER prompts, responses, API keys or headers.
+_REQUEST_LOG_SCHEMA = """
+CREATE TABLE IF NOT EXISTS llm_request_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts_epoch REAL NOT NULL,
+    ts_iso TEXT NOT NULL,
+    date TEXT NOT NULL,
+    kind TEXT NOT NULL,          -- send | cache_hit | cache_replay | cache_miss
+    provider TEXT,
+    model TEXT,
+    agent TEXT,
+    symbol TEXT,
+    reason TEXT,
+    ok INTEGER NOT NULL DEFAULT 0,
+    status TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_llm_req_log_ts ON llm_request_log(ts_epoch);
+CREATE INDEX IF NOT EXISTS idx_llm_req_log_date ON llm_request_log(date);
+"""
+
+
+_request_log_ready = False
+
+
+def _request_log_conn():
+    db_path = Path(str(settings.MEMORY_DB_PATH))
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path), timeout=10.0)
+    return conn
+
+
+def _ensure_request_log(conn) -> None:
+    """Creates the llm_request_log table when first needed (idempotent)."""
+    global _request_log_ready
+    if _request_log_ready:
+        return
+    conn.executescript(_REQUEST_LOG_SCHEMA)
+    _request_log_ready = True
+
+
+def _log_request(kind: str, provider=None, model=None, agent=None,
+                 symbol=None, reason=None, ok=False, status=None,
+                 latency_ms=None) -> None:
+    """Counts + logs + persists ONE LLM request event.
+
+    Structured log line: provider, model, caller/agent, symbol, reason —
+    never any API key, header, prompt or response content. Persistence is
+    best-effort: accounting must never break a request."""
+    try:
+        logger.info(
+            "LLM_REQUEST kind=%s provider=%s model=%s agent=%s symbol=%s "
+            "reason=%s ok=%s status=%s%s",
+            kind, provider or "-", model or "-", agent or "-", symbol or "-",
+            reason or "-", ok, status or "-",
+            f" latency_ms={latency_ms:.0f}" if latency_ms is not None else "",
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    global _request_log_seq
+    _request_log_seq += 1
+    try:
+        now = datetime.now(timezone.utc)
+        with _request_log_conn() as conn:
+            _ensure_request_log(conn)
+            if _request_log_seq % 64 == 1:
+                keep_days = max(1, int(settings.LLM_REQUEST_LOG_KEEP_DAYS or 2))
+                cutoff = (now - timedelta(days=keep_days)).strftime("%Y-%m-%d")
+                conn.execute("DELETE FROM llm_request_log WHERE date < ?", (cutoff,))
+            conn.execute(
+                "INSERT INTO llm_request_log (ts_epoch, ts_iso, date, kind, "
+                "provider, model, agent, symbol, reason, ok, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (now.timestamp(), now.isoformat(), now.strftime("%Y-%m-%d"),
+                 kind, provider, model, agent, symbol, reason,
+                 1 if ok else 0, status),
+            )
+    except Exception:  # noqa: BLE001 — persistence is best-effort only
+        pass
+
+
+def _model_min_interval_s(provider: str) -> float:
+    """Conservative minimum interval between sends to the SAME model.
+    Free UnoRouter models default to 60s; other providers 0 (their own
+    rate limits and circuits apply)."""
+    if provider == "unorouter":
+        return max(0.0, float(settings.LLM_MODEL_MIN_INTERVAL_SECONDS_UNOROUTER or 0))
+    return max(0.0, float(settings.LLM_MODEL_MIN_INTERVAL_SECONDS or 0))
+
+
+def _model_rate_limited(provider: str, model: str) -> float:
+    """Seconds the caller must wait before this model may be used again
+    (0.0 = allowed now). Enforced per (provider, model)."""
+    interval = _model_min_interval_s(provider)
+    if interval <= 0:
+        return 0.0
+    with _state_lock:
+        last = _model_last_send.get((provider, model))
+    if last is None:
+        return 0.0
+    remaining = interval - (time.monotonic() - last)
+    return max(0.0, remaining)
+
+
+def _mark_model_sent(provider: str, model: str) -> None:
+    with _state_lock:
+        _model_last_send[(provider, model)] = time.monotonic()
+
+
+def _cycle_send_budget() -> int:
+    return max(1, int(settings.LLM_CYCLE_MAX_REQUESTS or 12))
+
+
+def _cycle_sends_remaining() -> int:
+    return max(0, _cycle_send_budget() - _cycle_send_count)
 
 # Classic consecutive-failure circuit breaker (CLOSED -> OPEN -> HALF_OPEN).
 _breaker = {
@@ -374,8 +648,13 @@ _DEGRADED_WINDOW_S = 120.0
 
 
 def reset_cycle_usage() -> None:
-    """Zeroes the per-cycle usage counters. main.run_trading_cycle calls
-    this at the start of every cycle."""
+    """Zeroes the per-cycle usage counters AND the per-cycle network-send
+    budget. main.run_trading_cycle calls this at the start of every cycle
+    (the news worker runs OUTSIDE cycles and never calls this — its volume
+    is bounded by design: at most one batched request per symbol per
+    refresh, only for NEW important articles)."""
+    global _cycle_send_count
+    _cycle_send_count = 0
     _cycle_usage.clear()
     for provider in PROVIDERS:
         _cycle_usage[provider] = {
@@ -392,8 +671,17 @@ def reset_all_state() -> None:
     budgets, usage and validation cache. Does NOT touch settings."""
     _clients.clear()
     _verified_models.clear()
-    global _last_validation
+    with _catalog_lock:
+        _catalog_cache.clear()
+    _model_warned.clear()
+    global _last_validation, _cycle_send_count
     _last_validation = None
+    with _state_lock:
+        _model_last_send.clear()
+    _cycle_send_count = 0
+    global _request_log_seq, _request_log_ready
+    _request_log_seq = 0
+    _request_log_ready = False
     for p in PROVIDERS:
         _quota_backoff_until[p] = 0.0
         _auth_backoff_until[p] = 0.0
@@ -404,6 +692,95 @@ def reset_all_state() -> None:
     _model_unavailable_until.clear()
     _response_cache.clear()
     reset_cycle_usage()
+
+
+def usage_status() -> dict:
+    """The LLM usage/quota status payload (/api/llm/usage):
+
+    requests_this_cycle, requests_last_hour, requests_today, 429_count,
+    cache_hits, cache_misses, current_circuit_state (per provider) +
+    cooldown_remaining, calls_by_agent, calls_by_model. Served from the
+    in-process cycle counters and the persisted llm_request_log (same
+    SQLite file as memory_service). No secrets, no prompts, no responses."""
+    now = datetime.now(timezone.utc)
+    hour_ago = now.timestamp() - 3600.0
+    today = now.strftime("%Y-%m-%d")
+    stats = {
+        "requests_this_cycle": 0, "network_sends_this_cycle": _cycle_send_count,
+        "cycle_send_budget": _cycle_send_budget(),
+        "requests_last_hour": 0, "requests_today": 0, "429_count": 0,
+        "cache_hits": 0, "cache_misses": 0,
+        "calls_by_agent": {}, "calls_by_model": {},
+    }
+    # this-cycle accounting (in-process; includes cache hits and skips)
+    for usage in _cycle_usage.values():
+        stats["requests_this_cycle"] += usage.get("requests", 0)
+    try:
+        with _request_log_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            _ensure_request_log(conn)
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM llm_request_log "
+                "WHERE kind='send' AND ts_epoch >= ?", (hour_ago,)).fetchone()
+            stats["requests_last_hour"] = row["n"]
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM llm_request_log "
+                "WHERE kind='send' AND date = ?", (today,)).fetchone()
+            stats["requests_today"] = row["n"]
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM llm_request_log "
+                "WHERE kind='send' AND status='PROVIDER_QUOTA_EXCEEDED' "
+                "AND date = ?", (today,)).fetchone()
+            stats["429_count"] = row["n"]
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM llm_request_log "
+                "WHERE kind='cache_hit' AND date = ?", (today,)).fetchone()
+            stats["cache_hits"] = row["n"]
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM llm_request_log "
+                "WHERE kind='cache_miss' AND date = ?", (today,)).fetchone()
+            stats["cache_misses"] = row["n"]
+            for row in conn.execute(
+                    "SELECT agent, COUNT(*) AS n FROM llm_request_log "
+                    "WHERE kind='send' AND date = ? GROUP BY agent", (today,)):
+                stats["calls_by_agent"][row["agent"] or "unknown"] = row["n"]
+            for row in conn.execute(
+                    "SELECT provider, model, COUNT(*) AS n FROM llm_request_log "
+                    "WHERE kind='send' AND date = ? GROUP BY provider, model",
+                    (today,)):
+                key = f"{row['provider']}/{row['model']}"
+                stats["calls_by_model"][key] = row["n"]
+    except Exception as exc:  # noqa: BLE001 — stats must never fail the API
+        stats["log_error"] = str(exc)
+    hits = stats["cache_hits"]
+    lookups = hits + stats["cache_misses"]
+    stats["cache_hit_rate"] = round(hits / lookups, 3) if lookups else None
+
+    circuits = {}
+    cooldown_remaining = 0.0
+    for provider, state in provider_states().items():
+        provider_cooldown = max(
+            state.get("quota_cooldown_remaining_s") or 0.0,
+            state.get("auth_cooldown_remaining_s") or 0.0,
+        )
+        cooldown_remaining = max(cooldown_remaining, provider_cooldown)
+        circuits[provider] = {
+            "state": state.get("state"),
+            "circuit": state.get("circuit"),
+            "cooldown_remaining_s": provider_cooldown,
+            "model_cooldowns_s": {
+                model.split("/", 1)[1]: round(max(0.0, until - time.monotonic()), 0)
+                for (p, model), until in _model_unavailable_until.items()
+                if p == provider and until > time.monotonic()
+            },
+        }
+    return {
+        "checked_at": now.isoformat(),
+        **stats,
+        "current_circuit_state": circuits,
+        "cooldown_remaining": round(cooldown_remaining, 1),
+        "active_chain_providers": active_chain_providers(),
+    }
 
 
 def cycle_usage() -> dict:
@@ -712,13 +1089,16 @@ def _mark_quota_backoff(provider: str, retry_after) -> None:
 
 
 def _mark_model_unavailable(provider: str, model: str) -> None:
-    """404 circuit: stop requesting this (provider, model) pair."""
+    """404 circuit: stop requesting this (provider, model) pair. The warning
+    is deduplicated per catalog/health-check period — repeated 404s on the
+    same model produce ONE warning, not one per request/task."""
     minutes = max(0.5, float(settings.MODEL_UNAVAILABLE_COOLDOWN_MINUTES or 30))
     _model_unavailable_until[(provider, model)] = time.monotonic() + minutes * 60.0
-    logger.warning(
-        f"LLM_MODEL_UNAVAILABLE: {provider}: model '{model}' not found (404) "
-        f"or absent from the live catalog. Circuit open for {minutes:.0f} min; "
-        f"requests to it short-circuit and the next configured model is tried."
+    _warn_model_unavailable(
+        provider, model,
+        f"not found (404) or absent from the live catalog. Circuit open for "
+        f"{minutes:.0f} min; requests to it short-circuit and the next "
+        f"configured model is tried."
     )
 
 
@@ -757,6 +1137,8 @@ _ERROR_CODES = {
     "NETWORK_ERROR": "NETWORK_ERROR",
     "INVALID_RESPONSE": "INVALID_RESPONSE",
     "CIRCUIT_OPEN": "PROVIDER_UNAVAILABLE",
+    "RATE_LIMITED_LOCAL": "RATE_LIMITED_LOCAL",
+    "CYCLE_BUDGET_EXCEEDED": "CYCLE_BUDGET_EXCEEDED",
 }
 
 
@@ -980,12 +1362,12 @@ def _candidate_chain(agent: str):
     fb_provider, fb_model = route["fallback_provider"], route["fallback_model"]
 
     if provider == "unorouter":
-        models = [str(settings.UNOROUTER_PRIMARY_MODEL or "")]
-        models += [m for m in (settings.UNOROUTER_FALLBACK_MODELS or []) if m]
-        # Cap MODEL attempts (never unlimited model guessing).
-        cap = max(1, int(settings.LLM_MAX_MODEL_ATTEMPTS or 3))
-        models = models[:cap]
-        chain = [("unorouter", m) for m in models if m]
+        # Catalog-verified chain: configured primary + fallback candidates,
+        # filtered to ids that EXIST in the live /v1/models catalog (TTL
+        # cached — no extra catalog calls). A model absent from the catalog
+        # is never attempted (no 404 round-trip); the cap still applies.
+        effective = unorouter_effective_chain()
+        chain = [("unorouter", m) for m in effective["chain"]]
         # Final provider fallback: Groq, when it is usable at all.
         if _provider_enabled("groq") and _provider_key("groq"):
             groq_model = _groq_chain_model(agent)
@@ -1030,6 +1412,20 @@ def _candidate_precheck(provider: str, model: str):
         return "MODEL_NOT_FOUND", (f"LLM_MODEL_UNAVAILABLE: model '{model}' previously "
                                    f"returned 404 on {provider}; circuit open "
                                    f"({remaining}s remaining).")
+    # Catalog-verified skip: a model id that is not in the (TTL-cached) live
+    # catalog is never sent — no 404 round-trip is needed. Only applied when
+    # a catalog was actually fetched; an unavailable catalog never blocks.
+    catalog = get_model_catalog(provider)
+    live_ids = catalog.get("ids")
+    if live_ids is not None and _normalize_model_id(model) not in live_ids:
+        _warn_model_unavailable(
+            provider, model,
+            f"is not in the live /v1/models catalog ({len(live_ids)} live "
+            f"models, catalog {catalog.get('age_s')}s old); skipped without "
+            f"a request, the next configured model is used.")
+        return "MODEL_NOT_FOUND", (
+            f"LLM_MODEL_UNAVAILABLE: model '{model}' is not in the live "
+            f"catalog ({len(live_ids)} live models).")
     return None, None
 
 
@@ -1040,19 +1436,34 @@ def _candidate_precheck(provider: str, model: str):
 
 def call(agent: str, system: str, user: str, temperature: float = 0.2,
          max_tokens: int = 500, symbol: str = None,
-         expect_json: bool = False) -> LLMResult:
+         expect_json: bool = False, reason: str = None) -> LLMResult:
     """Runs one task request through the unified chain:
 
-    cache -> provider chain (primary model -> fallback models -> Groq)
-    -> cached replay on total failure. Never raises for provider-side
+    budget -> cache -> provider chain (primary model -> fallback models ->
+    Groq) -> cached replay on total failure. Never raises for provider-side
     problems; never blocks on long retries (10s timeout, 0 SDK retries).
+
+    Quota management (why this cycle will never hammer an endpoint):
+      * a per-model minimum interval (60s for free UnoRouter models) — a
+        request that would arrive sooner is NOT sent; the chain instantly
+        fails over to the next model (never waits),
+      * a global per-cycle network-send budget (LLM_CYCLE_MAX_REQUESTS),
+      * open circuits (quota/auth/model/breaker) are skipped with no call,
+      * every event (send / cache_hit / cache_replay / cache_miss) is
+        logged with provider, model, agent, symbol and reason, and
+        persisted for /api/llm/usage.
     """
+    global _cycle_send_count
     t0 = time.monotonic()
     key = _cache_key(agent, system, user)
 
     # 1. CACHE HIT (fresh) -> return without any network call.
     entry = _cache_get(key, fresh_only=True)
     if entry is not None:
+        _log_request("cache_hit", provider=entry["provider"],
+                     model=entry["model"], agent=agent, symbol=symbol,
+                     reason=reason, ok=True, status="OK",
+                     latency_ms=0.0)
         return LLMResult(
             agent, entry["provider"], entry["model"], "OK",
             text=entry["text"], parsed=entry["parsed"],
@@ -1076,14 +1487,62 @@ def call(agent: str, system: str, user: str, temperature: float = 0.2,
             error=f"No model configured for {agent} on {route['provider']} (set {model_env}).",
         ), symbol)
 
+    # Fresh cache had nothing: this invocation is a cache miss.
+    _log_request("cache_miss", provider=route["provider"],
+                 model=route["model"], agent=agent, symbol=symbol,
+                 reason=reason)
+
     # 2. Walk the chain: each failure records, updates circuits, and
     #    IMMEDIATELY tries the next candidate. No sleeping between models.
+    #    Checks are cheapest-first: cycle budget -> circuits -> per-model
+    #    rate limit -> send.
     last_result = None
     for idx, (cand_provider, cand_model) in enumerate(chain):
         if not cand_model:
             continue
+        # 2a. Global per-cycle network-send budget: beyond the cap the call
+        #     fails fast (never a send); cached replay / deterministic
+        #     fallback take over. Protects the quota by construction.
+        #     The operator task is EXEMPT: it is an observer running
+        #     OUTSIDE trading cycles (operator_service enforces its own
+        #     per-request send cap) and must never starve a trading cycle.
+        if agent != "operator" and _cycle_sends_remaining() <= 0:
+            last_result = LLMResult(
+                agent, cand_provider, cand_model, "CYCLE_BUDGET_EXCEEDED",
+                latency_ms=round((time.monotonic() - t0) * 1000, 1),
+                error=(f"CYCLE_BUDGET_EXCEEDED: this cycle already sent "
+                       f"{_cycle_send_count} LLM requests (cap "
+                       f"{_cycle_send_budget()}); failing fast to protect "
+                       f"the quota."),
+                attempts=idx + 1, fallback_used=idx > 0,
+            )
+            break
         pre_status, pre_error = _candidate_precheck(cand_provider, cand_model)
+        # 2b. Per-model minimum interval (quota management): a request to a
+        #     model used too recently is NOT sent — the chain instantly
+        #     moves on (trading never waits). The "operator" task is
+        #     EXEMPT from this check: it is an interactive, user-initiated
+        #     chat bounded by OPERATOR_MAX_LLM_SENDS (never a scheduled
+        #     cycle), and a 60s spacing between its own tool-loop rounds
+        #     would break every multi-round conversation. Its sends are
+        #     still MARKED below (shared quota accounting) and the 429
+        #     circuits + daily limits still protect the endpoint.
+        if pre_status is None and agent != "operator":
+            wait_s = _model_rate_limited(cand_provider, cand_model)
+            if wait_s > 0:
+                pre_status, pre_error = "RATE_LIMITED_LOCAL", (
+                    f"RATE_LIMITED_LOCAL: model '{cand_model}' was used "
+                    f"{_model_min_interval_s(cand_provider) - wait_s:.0f}s ago; "
+                    f"minimum interval is {wait_s:.0f}s more — trying the next "
+                    f"model instead of sending (quota protection).")
         if pre_status is None:
+            # One NETWORK SEND: count it against the per-model interval
+            # (always — the quota is shared) and the trading-cycle budget
+            # (trading tasks only) BEFORE the request leaves the process.
+            _mark_model_sent(cand_provider, cand_model)
+            if agent != "operator":
+                _cycle_send_count += 1
+            attempt_t0 = time.monotonic()
             status, attempt_error, text, _ = _attempt(
                 cand_provider, cand_model, system, user, temperature, max_tokens
             )
@@ -1097,6 +1556,11 @@ def call(agent: str, system: str, user: str, temperature: float = 0.2,
                 except Exception as exc:  # noqa: BLE001 — parse errors are data
                     status = "INVALID_RESPONSE"
                     attempt_error = f"unparseable JSON response: {exc}"
+            _log_request(
+                "send", provider=cand_provider, model=cand_model, agent=agent,
+                symbol=symbol, reason=reason, ok=(status == "OK"),
+                status=status, latency_ms=(time.monotonic() - attempt_t0) * 1000,
+            )
             if status == "OK":
                 _breaker_success(cand_provider)
                 if expect_json and parsed is None:
@@ -1142,6 +1606,10 @@ def call(agent: str, system: str, user: str, temperature: float = 0.2,
     replay = _response_cache.get(key)
     if replay is not None:
         _record(last_result, symbol)  # the failure is still accounted
+        _log_request("cache_replay", provider=replay["provider"],
+                     model=replay["model"], agent=agent, symbol=symbol,
+                     reason=reason, ok=True, status="OK",
+                     latency_ms=(time.monotonic() - t0) * 1000)
         return LLMResult(
             agent, replay["provider"], replay["model"], "OK",
             text=replay["text"], parsed=replay["parsed"],
@@ -1185,13 +1653,15 @@ def complete(task: str, messages: list = None, system: str = None,
 
 
 def call_json(agent: str, system: str, user: str, temperature: float = 0.2,
-              max_tokens: int = 500, symbol: str = None) -> LLMResult:
+              max_tokens: int = 500, symbol: str = None,
+              reason: str = None) -> LLMResult:
     """call() + tolerant JSON parsing. A malformed response is retried down
     the model chain inside call(); if every model returns unparseable output
     the result comes back with status INVALID_RESPONSE (never fabricated
     content)."""
     result = call(agent, system, user, temperature=temperature,
-                  max_tokens=max_tokens, symbol=symbol, expect_json=True)
+                  max_tokens=max_tokens, symbol=symbol, expect_json=True,
+                  reason=reason)
     if not result.ok:
         return result
     if result.parsed is None:
@@ -1211,102 +1681,304 @@ def call_json(agent: str, system: str, user: str, temperature: float = 0.2,
 
 
 def _extract_model_ids(response) -> set:
-    """Pulls model id strings out of a provider's models.list() response."""
+    """Pulls model id strings out of a provider's /v1/models response.
+    Handles OpenAI-style objects (.data[] of items with .id), raw dicts
+    ({"data": [{"id": ...}]}) and plain lists — always the ACTUAL returned
+    ids from data[].id, never assumptions from public documentation."""
     ids = set()
     data = getattr(response, "data", None)
+    if data is None and isinstance(response, dict):
+        data = response.get("data")
     items = data if data is not None else response
     if items is None:
         return ids
+    if isinstance(items, dict):
+        items = items.get("data") or items.get("models") or []
     try:
         for item in items:
-            model_id = getattr(item, "id", None) or getattr(item, "name", None)
+            if isinstance(item, dict):
+                model_id = item.get("id") or item.get("name")
+            else:
+                model_id = getattr(item, "id", None) or getattr(item, "name", None)
             if model_id:
-                ids.add(str(model_id).removeprefix("models/"))
+                ids.add(_normalize_model_id(model_id))
     except TypeError:
         pass
     return ids
 
 
+def _model_attempt_cap() -> int:
+    return max(1, int(settings.LLM_MAX_MODEL_ATTEMPTS or 3))
+
+
 def unorouter_model_chain() -> list:
-    """The application's explicit UnoRouter model chain (primary +
-    fallbacks, capped at LLM_MAX_MODEL_ATTEMPTS)."""
+    """The CONFIGURED UnoRouter model chain: primary + ALL ordered fallback
+    candidates (uncapped — this is what the operator asked for, reported in
+    diagnostics). The attempt cap is applied to the EFFECTIVE (catalog-
+    verified) chain so a dead candidate never wastes an attempt slot."""
     models = [str(settings.UNOROUTER_PRIMARY_MODEL or "")]
     models += [m for m in (settings.UNOROUTER_FALLBACK_MODELS or []) if m]
-    cap = max(1, int(settings.LLM_MAX_MODEL_ATTEMPTS or 3))
-    return [m for m in models if m][:cap]
+    return [_normalize_model_id(m) for m in models if m]
 
 
-def validate_models() -> dict:
+def unorouter_effective_chain(catalog_ids=None) -> dict:
+    """The catalog-VERIFIED UnoRouter chain.
+
+    Every configured id (primary first, then the ordered fallback
+    candidates) is kept ONLY if that exact id is present in the live
+    /v1/models catalog. Ids are never invented or substituted: a missing
+    candidate is reported and skipped, and the next candidate that DOES
+    exist is selected. When the catalog itself is unavailable (fetch
+    failed/timed out) the configured order is kept — verification is
+    impossible, and the runtime 404 circuits still protect every request —
+    with catalog_available=False reporting that honestly.
+
+    Returns {"chain": [...], "configured": [...], "missing": [...],
+             "selected_fallback": str|None, "catalog_available": bool}."""
+    configured = unorouter_model_chain()
+    if catalog_ids is None:
+        catalog_ids = get_model_catalog("unorouter").get("ids")
+    if catalog_ids is None:
+        return {"chain": list(configured)[:_model_attempt_cap()],
+                "configured": configured, "missing": [],
+                "selected_fallback": (
+                    configured[1] if len(configured) > 1 else None),
+                "catalog_available": False}
+    live = {_normalize_model_id(m) for m in catalog_ids}
+    chain, missing = [], []
+    for model in configured:
+        (chain if model in live else missing).append(model)
+    # The attempt cap applies to LIVE models only (never unlimited guessing;
+    # a dead candidate never consumes an attempt slot).
+    chain = chain[:_model_attempt_cap()]
+    return {"chain": chain, "configured": configured, "missing": missing,
+            "selected_fallback": (chain[1] if len(chain) > 1 else None),
+            "catalog_available": True}
+
+
+def _configured_models_for(provider: str) -> list:
+    """The model ids this deployment actually uses on a provider (ordered,
+    unique, normalized). unorouter: primary + fallback candidates. groq:
+    task-specific models for groq-routed tasks plus the chain-final
+    GROQ_FALLBACK_MODEL whenever Groq backs up UnoRouter-routed tasks.
+    gemini/nvidia/openrouter: their model when a task is routed there."""
+    out = []
+
+    def add(model):
+        model = _normalize_model_id(model)
+        if model and model not in out:
+            out.append(model)
+
+    routed = [str(getattr(settings, attr, "") or "").lower()
+              for attr in _TASK_PROVIDERS.values()]
+    if provider == "unorouter":
+        for m in unorouter_model_chain():
+            add(m)
+    elif provider == "groq":
+        for task, attr in sorted(_TASK_PROVIDERS.items()):
+            if str(getattr(settings, attr, "") or "").lower() == "groq":
+                add(_task_model("groq", task))
+        if "unorouter" in routed and _provider_enabled("groq") and _provider_key("groq"):
+            add(_groq_chain_model("technical") or str(settings.GROQ_FALLBACK_MODEL or ""))
+    elif provider == "gemini":
+        if "gemini" in routed:
+            add(settings.GEMINI_MODEL)
+        if str(settings.OPERATOR_LLM_PROVIDER).lower() == "gemini":
+            add(_task_model("gemini", "operator"))
+    elif provider == "nvidia":
+        if "nvidia" in routed:
+            add(settings.NVIDIA_MODEL)
+        if str(settings.OPERATOR_LLM_PROVIDER).lower() == "nvidia":
+            add(_task_model("nvidia", "operator"))
+    elif provider == "openrouter":
+        if "openrouter" in routed:
+            add(settings.OPENROUTER_MODEL)
+        if str(settings.OPERATOR_LLM_PROVIDER).lower() == "openrouter":
+            add(_task_model("openrouter", "operator"))
+    return out
+
+
+def active_chain_providers() -> list:
+    """Providers the ACTIVE request chain depends on: every provider a task
+    is routed to, plus Groq when any task is UnoRouter-routed (Groq is the
+    chain-final provider fallback). Used by health to decide which LLM
+    providers are REQUIRED."""
+    routed = {str(getattr(settings, attr, "") or "").lower()
+              for attr in _TASK_PROVIDERS.values()}
+    routed.discard("")
+    routed.discard("operator")   # observer layer: never a required provider
+    if "unorouter" in routed:
+        routed.add("groq")
+    return sorted(p for p in routed if p in _PROVIDER_INSTANCES)
+
+
+def validate_models(refresh_if_stale: bool = False) -> dict:
     """Verifies every configured model id against each provider's LIVE
-    /models catalog. Providers without an API key are skipped (reported as
-    such). A model id missing from the catalog is reported as
-    LLM_MODEL_UNAVAILABLE and short-circuited at request time — the next
-    configured model is used automatically.
+    /v1/models catalog.
 
-    Returns: {"providers": {name: {"ok", "models_found", "checked",
-                                   "missing", "error"}},
+    Catalog policy (one fetch per provider per health-check period):
+      * /v1/models is fetched AT MOST once per provider per
+        LLM_CATALOG_CACHE_TTL_MINUTES (5-10 min) — health checks, startup
+        validation, chain resolution and /api/providers/health all share the
+        same TTL-cached catalog.
+      * Each fetch is bounded by LLM_CATALOG_TIMEOUT_SECONDS in a worker
+        thread (a hanging provider, e.g. Gemini, is marked DEGRADED and the
+        check continues — startup never blocks).
+      * ids are compared with EXACT normalization (trim + 'models/' prefix);
+        nothing is assumed from public documentation.
+
+    Per-provider status:
+      READY            catalog fetched, all configured models matched
+      NO_USABLE_MODEL  catalog fetched but ZERO configured models matched
+      DEGRADED         catalog fetch timed out (provider kept, unverified)
+      ERROR            catalog fetch failed
+      NOT_CONFIGURED   no key / disabled — catalog not fetched
+
+    Returns: {"providers": {name: {"ok", "status", "models_found",
+                                   "configured", "matched", "missing",
+                                   "checked", "selected_fallback",
+                                   "catalog_age_s", "catalog_cached",
+                                   "timed_out", "error"}},
               "routes": {task: {provider, model, fallback_provider,
                                 fallback_model}}}
     """
     global _last_validation
+
     report = {"providers": {}, "routes": {}}
+
+    # --- fetch every enabled+keyed provider's catalog ONCE (concurrently,
+    #     each bounded by LLM_CATALOG_TIMEOUT_SECONDS) ----------------------
+    to_fetch = [p for p in PROVIDERS
+                if _provider_enabled(p) and _provider_key(p)]
+    force_providers = set()
+    if refresh_if_stale:
+        now = time.monotonic()
+        with _catalog_lock:
+            for p in to_fetch:
+                entry = _catalog_cache.get(p)
+                if not entry or not entry.get("fetched_at") \
+                        or (now - entry["fetched_at"]) >= _catalog_ttl_s():
+                    force_providers.add(p)
+    futures = {}
+    for p in to_fetch:
+        futures[p] = _validation_pool().submit(
+            get_model_catalog, p, p in force_providers)
+    catalogs = {}
+    for p in to_fetch:
+        try:
+            catalogs[p] = futures[p].result(
+                timeout=max(2.0, float(settings.LLM_CATALOG_TIMEOUT_SECONDS)) + 2.0)
+        except Exception:  # noqa: BLE001 — one provider never fails validation
+            catalogs[p] = get_model_catalog(p)
 
     for provider in PROVIDERS:
         inst = _PROVIDER_INSTANCES[provider]
-        entry = {"ok": False, "models_found": 0, "checked": {}, "missing": [], "error": None}
+        configured = _configured_models_for(provider)
+        entry = {
+            "ok": False, "status": "NOT_CONFIGURED", "models_found": 0,
+            "configured": configured, "matched": [], "missing": [],
+            "missing_models": [], "checked": {}, "selected_fallback": None,
+            "catalog_age_s": None, "catalog_cached": False,
+            "timed_out": False, "error": None,
+        }
         report["providers"][provider] = entry
+
         if not _provider_enabled(provider):
             entry["error"] = f"disabled via {inst.enabled_attr}=false — catalog not fetched"
             continue
         if not _provider_key(provider):
             entry["error"] = f"{inst.key_attr} not configured — catalog not fetched"
             continue
-        try:
-            ids = inst.list_models()
-            entry["models_found"] = len(ids)
-            entry["ok"] = True
-            _verified_models[provider] = ids
-        except Exception as exc:  # noqa: BLE001 — validation must never crash startup
-            entry["error"] = f"could not list models: {exc}"
-            logger.warning(f"{provider}: model validation failed: {exc}")
+
+        catalog = catalogs.get(provider) or get_model_catalog(provider)
+        entry["catalog_age_s"] = catalog.get("age_s")
+        entry["catalog_cached"] = bool(catalog.get("cached"))
+        entry["timed_out"] = bool(catalog.get("timed_out"))
+        live_ids = catalog.get("ids")
+
+        if live_ids is None:
+            entry["error"] = catalog.get("error") or "catalog unavailable"
+            if catalog.get("timed_out"):
+                entry["status"] = "DEGRADED"
+                logger.warning(
+                    f"LLM CATALOG {provider}: {entry['error']} — provider "
+                    f"marked DEGRADED, validation continues without it.")
+            else:
+                entry["status"] = "ERROR"
+                logger.warning(f"LLM CATALOG {provider}: {entry['error']}")
             continue
 
-    def _check(provider, model, label):
-        if not model:
-            return
+        entry["ok"] = True
+        entry["models_found"] = len(live_ids)
+        matched = [m for m in configured if m in live_ids]
+        missing = [m for m in configured if m not in live_ids]
+        entry["matched"] = matched
+        entry["missing_models"] = missing
+
+        if provider == "unorouter":
+            effective = unorouter_effective_chain(live_ids)
+            entry["selected_fallback"] = effective["selected_fallback"]
+            entry["effective_chain"] = effective["chain"]
+            entry["catalog_available"] = True
+
+        if configured and not matched:
+            # Endpoint works but NOTHING configured is usable — never READY.
+            entry["status"] = "NO_USABLE_MODEL"
+        else:
+            entry["status"] = "READY"
+
+    # --- per-task route checks (back-compat label mapping) ------------------
+    def _mark(provider, model, label):
         entry = report["providers"][provider]
         if not entry["ok"]:
             return
-        present = model in _verified_models.get(provider, set())
+        if label in entry["checked"]:
+            return  # dedup: 6 tasks sharing one label -> ONE row, ONE warning
+        present = _normalize_model_id(model) in (live_catalog_ids.get(provider) or set())
         entry["checked"][label] = present
         if not present:
-            entry["missing"].append(f"{label}: {model}")
+            entry["missing"].append(f"{label}: {_normalize_model_id(model)}")
+
+    live_catalog_ids = {p: (report["providers"][p].get("ok") and
+                            get_model_catalog(p).get("ids")) or set()
+                        for p in PROVIDERS}
 
     for agent in sorted(_TASK_PROVIDERS):
         route = route_info(agent)
         if route["provider"] == "unorouter":
             for i, model in enumerate(unorouter_model_chain()):
-                _check("unorouter", model, "primary" if i == 0 else f"fallback[{i - 1}]")
+                _mark("unorouter", model, "primary" if i == 0 else f"fallback[{i - 1}]")
         elif route["provider"] in report["providers"]:
-            _check(route["provider"], route["model"], f"{agent}.model")
+            _mark(route["provider"], route["model"], f"{agent}.model")
         if route["fallback_provider"] in report["providers"] and route["fallback_model"]:
-            _check(route["fallback_provider"], route["fallback_model"], f"{agent}.fallback")
+            _mark(route["fallback_provider"], route["fallback_model"], f"{agent}.fallback")
         report["routes"][agent] = dict(route)
 
-    # Report dead UnoRouter model ids loudly (the runtime skips them).
-    uno_entry = report["providers"].get("unorouter", {})
-    chain = unorouter_model_chain()
-    for label, present in (uno_entry.get("checked") or {}).items():
-        if not present:
-            try:
-                idx = 0 if label == "primary" else int(label.split("[")[1].rstrip("]")) + 1
-            except (IndexError, ValueError):
-                idx = -1
-            missing_model = chain[idx] if 0 <= idx < len(chain) else "?"
-            logger.warning(
-                "LLM_MODEL_UNAVAILABLE: unorouter %s model '%s' is not in the "
-                "live catalog; it is skipped and the next configured model is used.",
-                label, missing_model,
+    # --- ONE warning per missing model per period + safe diagnostics --------
+    for provider in PROVIDERS:
+        entry = report["providers"][provider]
+        configured = entry.get("configured") or []
+        # warnings: the provider's OWN missing configured models — exactly
+        # ONE warning per model per catalog period (never 6 identical lines)
+        if entry["ok"] and entry.get("missing_models"):
+            for model in entry["missing_models"]:
+                _warn_model_unavailable(
+                    provider, model,
+                    "is configured but not in the live /v1/models catalog "
+                    f"({entry['models_found']} live models); it is skipped "
+                    f"and the next valid configured model is used.")
+        # safe diagnostics line (NEVER any key/header/secret)
+        if entry["status"] != "NOT_CONFIGURED":
+            def shown(ids):
+                ids = list(ids or [])
+                return (",".join(ids[:8]) + ("…" if len(ids) > 8 else "")) or "none"
+            logger.info(
+                "LLM CATALOG %s: status=%s live_models=%s configured=%s matched=%s missing=%s%s",
+                provider, entry["status"], entry["models_found"],
+                shown(configured), shown(entry.get("matched") or []),
+                shown(entry.get("missing_models") or []),
+                (f" selected_fallback={entry['selected_fallback']}"
+                 if provider == "unorouter" and entry.get("selected_fallback") else ""),
             )
 
     _last_validation = report
