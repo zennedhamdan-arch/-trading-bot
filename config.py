@@ -266,6 +266,11 @@ class Settings:
     # technicals, news and risk. Providers are pluggable (implement
     # services/fundamentals_service.FundamentalsProvider); nothing scrapes
     # Yahoo Finance or relies on Yahoo cookies/crumbs. yfinance is GONE.
+    # "alphavantage": official Alpha Vantage HTTP API (fundamentals DATA
+    # provider only — the LLM interpretation of that data is routed
+    # separately via LLM_FUNDAMENTALS_PROVIDER; an LLM is never a data
+    # source). Never logged or exposed in health/config output.
+    ALPHAVANTAGE_API_KEY: str = os.getenv("ALPHAVANTAGE_API_KEY", "")
     FUNDAMENTALS_PROVIDER: str = _get_str("FUNDAMENTALS_PROVIDER", "none").lower()
     FUNDAMENTALS_FALLBACK_PROVIDER: str = _get_str("FUNDAMENTALS_FALLBACK_PROVIDER", "").lower()
     # Seconds a fundamentals result (success or unavailability) is cached per
@@ -367,6 +372,8 @@ class Settings:
             warnings.append("NVIDIA_API_KEY is not set. NVIDIA LLM provider is not configured (optional).")
         if self.FUNDAMENTALS_PROVIDER == "none":
             warnings.append("No fundamentals provider configured (FUNDAMENTALS_PROVIDER=none); fundamentals analysis will report DATA_UNAVAILABLE.")
+        if self.FUNDAMENTALS_PROVIDER == "alphavantage" and not self.ALPHAVANTAGE_API_KEY:
+            warnings.append("FUNDAMENTALS_PROVIDER=alphavantage but ALPHAVANTAGE_API_KEY is not set; fundamentals data will be unavailable.")
         return warnings
 
 
