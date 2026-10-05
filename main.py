@@ -58,7 +58,7 @@ from collections import deque
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import Body, FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -69,6 +69,8 @@ from services import (alpaca_service, memory_service, llm_service,
                       market_data_service, risk_gate, risk_engine, health_service,
                       realtime_service, fundamentals_service, evidence as evidence_service,
                       news_intelligence, news_worker)
+from services.operator import memory as operator_memory
+from services.operator import operator_service, operator_tools
 from agents import news_agent, tech_agent, risk_agent, cio_agent, fundamentals_agent, debate_agent
 
 logging.basicConfig(
@@ -92,6 +94,11 @@ MAX_CYCLE_ENTRIES = 100
 cycle_history = deque(maxlen=MAX_CYCLE_ENTRIES)
 _cycle_counter = {"n": 0}
 _active_cycle = None  # set while a cycle is running; used to tally warnings
+
+_cycle_running = False   # re-entrancy guard: the scheduler, /api/bot/run-now
+#                         and manual triggers must NEVER overlap cycles (LLM
+#                         quota, duplicate orders, double accounting).
+
 
 bot_state = {
     "running": False,
@@ -269,8 +276,38 @@ async def run_trading_cycle(triggered_by: str = "scheduler") -> dict:
     {"provider", "type", "agent", "symbol", "message"} — a PARTIAL_ERROR
     cycle never has an empty error list again.
     """
+    global _active_cycle, _provider_extras, _cycle_running
+    if _cycle_running:
+        # Overlap protection: a cycle is already in flight (scheduler tick
+        # while a manual run-now is executing, etc.). Never start a second
+        # one — LLM quota, order accounting and cycle records would all be
+        # doubled.
+        logger.warning(
+            f"Cycle triggered by '{triggered_by}' SKIPPED: another cycle is "
+            f"already running (started by "
+            f"'{bot_state.get('last_cycle_triggered_by', 'unknown')}')."
+        )
+        return cycle_history[0] if cycle_history else {
+            "status": "SKIPPED_OVERLAP", "triggered_by": triggered_by,
+            "decisions": [], "errors": [{
+                "provider": "system", "type": "CYCLE_OVERLAP",
+                "agent": "system", "symbol": None,
+                "message": "another cycle is already running",
+            }],
+        }
+    _cycle_running = True
+    try:
+        return await _run_trading_cycle_inner(triggered_by)
+    finally:
+        _cycle_running = False
+
+
+async def _run_trading_cycle_inner(triggered_by: str = "scheduler") -> dict:
+    """The actual cycle body (call run_trading_cycle, which enforces the
+    single-flight guard)."""
     global _active_cycle, _provider_extras
     _provider_extras = {}
+    bot_state["last_cycle_triggered_by"] = triggered_by
     cycle_summary = {
         "triggered_by": triggered_by,
         "symbols_processed": [],
@@ -1005,28 +1042,31 @@ async def lifespan(app: FastAPI):
     except Exception as exc:  # noqa: BLE001 — optional layer, never fatal
         logger.error(f"Real-time layer failed to start (non-fatal): {exc}")
 
-    # Verify every configured LLM model id against each provider's LIVE
-    # catalog (Groq/OpenRouter/Gemini). Providers without keys are skipped
-    # (already reported by settings.validate). Missing models are surfaced
-    # as warnings — they will fail per-request with MODEL_NOT_FOUND, never
-    # silently.
-    validation = llm_service.validate_models()
-    for provider, entry in validation["providers"].items():
-        for missing in entry.get("missing", []):
-            msg = f"LLM model validation ({provider}): {missing} is not in the provider's current model list."
-            logger.warning(msg)
-            _log_event({"agent": "system", "symbol": None, "level": "WARNING", "message": msg})
-        error = entry.get("error")
-        if error and "not configured" not in error:
-            msg = f"LLM model validation ({provider}): {error}"
-            logger.warning(msg)
-            _log_event({"agent": "system", "symbol": None, "level": "WARNING", "message": msg})
+    # NOTE: LLM model validation already ran inside the startup health check
+    # above (ONE /v1/models fetch per provider per catalog-TTL window, each
+    # bounded by a short timeout; missing models warn exactly once per
+    # period). Re-running it here used to duplicate every warning 6x.
 
     scheduler.add_job(
         _scheduled_job,
         trigger=IntervalTrigger(minutes=settings.CYCLE_INTERVAL_MINUTES),
         id="trading_cycle",
         replace_existing=True,
+        max_instances=1,           # never stack ticks of the same job
+        coalesce=True,             # missed ticks collapse into one run
+    )
+    # LLM catalog refresh: re-validate configured model ids against each
+    # provider's live /v1/models catalog every cache-TTL window (at most one
+    # fetch per provider per window; a fresh catalog re-arms the
+    # one-warning-per-model-per-period policy).
+    scheduler.add_job(
+        lambda: llm_service.validate_models(refresh_if_stale=True),
+        trigger=IntervalTrigger(
+            minutes=max(1.0, float(settings.LLM_CATALOG_CACHE_TTL_MINUTES))),
+        id="llm_catalog_refresh",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
     )
     # Independent News Worker (Part 11): its own schedule, never inside a
     # trading cycle. An initial pass runs shortly after boot so the cache
@@ -1039,6 +1079,8 @@ async def lifespan(app: FastAPI):
             trigger=IntervalTrigger(minutes=max(1.0, float(settings.NEWS_REFRESH_MINUTES))),
             id="news_refresh",
             replace_existing=True,
+            max_instances=1,       # worker also has its own non-blocking lock
+            coalesce=True,
         )
         scheduler.add_job(
             news_worker.scheduled_refresh,
@@ -1171,16 +1213,37 @@ async def api_realtime():
     return JSONResponse(payload)
 
 
+@app.get("/api/llm/usage")
+async def api_llm_usage():
+    """LLM usage + quota status: requests_this_cycle, requests_last_hour,
+    requests_today, 429_count, cache_hits/cache_misses (+hit rate),
+    current_circuit_state with cooldown_remaining per provider, and
+    calls_by_agent / calls_by_model. Pure accounting — no LLM calls, no
+    secrets, no prompt/response content."""
+    return JSONResponse(llm_service.usage_status())
+
+
 @app.get("/api/providers/health")
 async def api_providers_health():
     """LLM provider health: enabled flag, status, circuit state, last
-    success/failure. Never exposes API keys, headers or secrets."""
+    success/failure — plus per-provider model-catalog diagnostics
+    (configured / live / matched / missing / selected fallback). Catalogs
+    are TTL-cached: at most ONE /v1/models fetch per provider per window
+    (refreshed here when stale). Never exposes API keys, headers or
+    secrets."""
+    validation = llm_service.validate_models(refresh_if_stale=True)
     states = llm_service.provider_states()
     providers = {}
     for provider, state in states.items():
+        ventry = (validation.get("providers") or {}).get(provider, {})
+        vstatus = ventry.get("status")
         status = "HEALTHY"
         if state["state"] == "NOT_CONFIGURED":
             status = "NOT_CONFIGURED"
+        elif vstatus == "NO_USABLE_MODEL":
+            status = "NO_USABLE_MODEL"
+        elif vstatus in ("DEGRADED", "ERROR"):
+            status = "DEGRADED"
         elif state["state"] in ("QUOTA_EXHAUSTED", "AUTH_ERROR", "MODEL_UNAVAILABLE",
                                 "NETWORK_ERROR", "DEGRADED"):
             status = "UNHEALTHY"
@@ -1192,12 +1255,100 @@ async def api_providers_health():
             "last_success": state.get("last_success"),
             "last_failure": state.get("last_failure"),
             "detail": state.get("detail"),
+            "validation_status": vstatus,
+            # Separated views: catalog DISCOVERY vs actual INFERENCE. A
+            # catalog timeout (catalog_status=UNAVAILABLE) is not proof the
+            # provider is down — inference_status reports the live circuit
+            # independently (UNKNOWN = not exercised recently).
+            "catalog_status": ventry.get("catalog_status"),
+            "inference_status": ventry.get("inference_status"),
+            "catalog": {
+                "live_models": ventry.get("models_found", 0),
+                "configured": ventry.get("configured", []),
+                "matched": ventry.get("matched", []),
+                "missing": ventry.get("missing_models", []),
+                "selected_fallback": ventry.get("selected_fallback"),
+                "age_s": ventry.get("catalog_age_s"),
+                "cached": ventry.get("catalog_cached", False),
+                "timed_out": ventry.get("timed_out", False),
+                "error": ventry.get("error") if vstatus in ("DEGRADED", "ERROR") else None,
+            },
         }
     return JSONResponse({
         "providers": providers,
         "unorouter_model_chain": llm_service.unorouter_model_chain(),
+        "unorouter_effective_chain": llm_service.unorouter_effective_chain(),
         "checked_at": datetime.now(timezone.utc).isoformat(),
     })
+
+
+# ---------------------------------------------------------------------------
+# Trading Partner / System Operator (read-only observer)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/operator/status")
+async def api_operator_status():
+    """Operator status: enabled flag, its LLM route, tool count/categories,
+    caps and latest conversation. Pure accounting — no LLM calls."""
+    if not settings.OPERATOR_ENABLED:
+        return JSONResponse({"enabled": False,
+                             "error": "Trading Partner is disabled "
+                                      "(OPERATOR_ENABLED=false)."})
+    return JSONResponse(operator_service.status())
+
+
+@app.get("/api/operator/tools")
+async def api_operator_tools():
+    """The read-only diagnostic tool catalog (name, description, category,
+    args, human-readable activity label)."""
+    return JSONResponse({"tools": [spec.public() for spec in
+                                   operator_tools.list_tools()],
+                         "count": len(operator_tools.list_tools())})
+
+
+@app.post("/api/operator/chat")
+async def api_operator_chat(payload: dict = Body(...)):
+    """One Trading Partner exchange. The operator inspects the system with
+    read-only tools and answers from actual evidence. Runs in a worker
+    thread so the event loop (and trading cycles) never block on it.
+    Fail-safe: LLM problems return a clear error, never break trading."""
+    question = str((payload or {}).get("question") or "").strip()
+    conversation_id = (payload or {}).get("conversation_id")
+    if not question:
+        return JSONResponse({"error": "question is required"}, status_code=400)
+    if not settings.OPERATOR_ENABLED:
+        return JSONResponse({"status": "DISABLED",
+                             "error": "Trading Partner is disabled "
+                                      "(OPERATOR_ENABLED=false).",
+                             "answer": None})
+    result = await asyncio.to_thread(
+        operator_service.chat, question,
+        int(conversation_id) if conversation_id else None)
+    return JSONResponse(result)
+
+
+@app.get("/api/operator/conversations")
+async def api_operator_conversations():
+    """Previous Trading Partner conversations (most recent first)."""
+    return JSONResponse({"conversations": operator_memory.list_conversations(limit=50)})
+
+
+@app.get("/api/operator/conversations/{conversation_id}")
+async def api_operator_conversation(conversation_id: int):
+    """Full message history of one conversation (user + assistant messages,
+    tool-call summaries, system-state snapshots)."""
+    detail = operator_service.conversation_detail(conversation_id)
+    if detail is None:
+        return JSONResponse({"error": "conversation not found"},
+                            status_code=404)
+    return JSONResponse(detail)
+
+
+@app.delete("/api/operator/conversations/{conversation_id}")
+async def api_operator_delete_conversation(conversation_id: int):
+    """Deletes one conversation (read-only system events are kept)."""
+    deleted = operator_memory.delete_conversation(conversation_id)
+    return JSONResponse({"deleted": bool(deleted)})
 
 
 @app.get("/api/news/status")

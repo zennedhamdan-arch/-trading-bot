@@ -104,7 +104,9 @@ def _client(responder, model_ids):
     return client
 
 
-UNO_MODELS = ("glm-5.3-flash-thinking:free", "qwen3.8-flash-next:free", "glm-5.3-flash:free")
+UNO_MODELS = ("glm-5.3-flash-thinking:free", "glm-5.3-flash:free",
+              "glm-5.3-flash-think-search:free", "glm-5.3-flash-search:free",
+              "ling-3.0-flash-fin:free", "qwen3.8-flash-next:free")
 GROQ_MODELS = ("openai/gpt-oss-20b", "openai/gpt-oss-120b")
 
 NEWS_ANALYSIS_JSON = json.dumps({
@@ -226,6 +228,11 @@ config.settings.FUNDAMENTALS_PROVIDER = "none"
 config.settings.LLM_FALLBACK_PROVIDER = ""
 config.settings.LLM_FALLBACK_MODEL = ""
 config.settings.LLM_RATE_LIMIT_MAX_RETRIES = 0
+# This suite exercises chain/breaker mechanics with rapid same-model calls;
+# the per-model 60s interval (quota management) has its own suite
+# (tests/test_llm_quota_management.py).
+config.settings.LLM_MODEL_MIN_INTERVAL_SECONDS_UNOROUTER = 0
+config.settings.LLM_CYCLE_MAX_REQUESTS = 1000
 
 from services import llm_service, news_intelligence, news_worker, risk_engine  # noqa: E402
 from services import alpaca_service  # noqa: E402
@@ -346,14 +353,15 @@ uno_client = llm_service._clients["unorouter"]
 models_tried = [c["model"] for c in uno_client.chat.completions.calls]
 check("primary model failure triggers the fallback model",
       r.ok and r.fallback_used and models_tried[0] == "glm-5.3-flash-thinking:free"
-      and r.model != "glm-5.3-flash-thinking:free")
+      and r.model == "glm-5.3-flash:free")
 
-# 7: first fallback 404s (the REAL catalog situation for qwen3.8-flash-next:free)
+# 7: first fallback 404s mid-window (a model vanished after the catalog
+#    refresh — the 404 circuit covers what the catalog cache cannot see)
 _reset()
 
 
 def _fb1_404(kwargs):
-    if kwargs["model"] == "qwen3.8-flash-next:free":
+    if kwargs["model"] == "glm-5.3-flash:free":
         raise _HTTPError(404, "model not found")
     if kwargs["model"] == "glm-5.3-flash-thinking:free":
         raise _HTTPError(500, "down")
@@ -363,11 +371,10 @@ def _fb1_404(kwargs):
 llm_service._clients["unorouter"] = _client(_fb1_404, UNO_MODELS)
 r = llm_service.call("news", system="s", user="prompt-7", symbol="AAPL", expect_json=True)
 check("first fallback failure (404) triggers the second fallback",
-      r.ok and r.model == "glm-5.3-flash:free")
+      r.ok and r.model == "glm-5.3-flash-think-search:free")
 check("dead model circuit short-circuits it (LLM_MODEL_UNAVAILABLE)",
-      llm_service.provider_states()["unorouter"]["state"] == "MODEL_UNAVAILABLE"
-      or ("qwen3.8-flash-next:free", ) and
-      ("unorouter", "qwen3.8-flash-next:free") in llm_service._model_unavailable_until)
+      ("unorouter", "glm-5.3-flash:free") in llm_service._model_unavailable_until
+      or llm_service.provider_states()["unorouter"]["state"] == "MODEL_UNAVAILABLE")
 
 # 8: ALL UnoRouter models fail -> Groq answers
 _reset()
@@ -510,7 +517,9 @@ llm_service._clients["unorouter"] = _client(lambda kw: NEWS_ANALYSIS_JSON, UNO_M
 r = llm_service.call("news", system="s", user="b5", symbol="AAPL")
 check("successful HALF_OPEN probe closes the breaker",
       r.ok and llm_service.provider_states()["unorouter"]["circuit"] == "CLOSED")
-config.settings.UNOROUTER_FALLBACK_MODELS = ["qwen3.8-flash-next:free", "glm-5.3-flash:free"]
+config.settings.UNOROUTER_FALLBACK_MODELS = [
+    "glm-5.3-flash:free", "glm-5.3-flash-think-search:free",
+    "glm-5.3-flash-search:free", "ling-3.0-flash-fin:free"]
 config.settings.LLM_MAX_MODEL_ATTEMPTS = 3
 
 # ===========================================================================

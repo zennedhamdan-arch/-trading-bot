@@ -178,7 +178,7 @@ def analyze_fundamentals(symbol: str, fundamentals: dict) -> dict:
         temperature=0.2,
         max_tokens=400,
         symbol=symbol,
-    )
+        reason="fundamentals_interpretation",)
 
     base_result["llm_status"] = result.status
     base_result["model"] = result.model

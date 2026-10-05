@@ -786,3 +786,25 @@ select.sel:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0
 }
 .callout.warn { border-left-color: var(--amber); background: var(--amber-bg); color: #d8b36a; }
 .callout.err { border-left-color: var(--red); background: var(--red-bg); color: #e39aa2; }
+
+/* == Trading Partner (operator conversation) ================================= */
+
+.op-thread { display: flex; flex-direction: column; gap: 10px; margin-bottom: 10px; }
+.op-msg-card.op-mine { border-color: var(--accent-line); }
+.op-msg { font-size: 12.5px; line-height: 1.65; }
+.op-msg p { margin: 0 0 8px; }
+.op-msg p:last-child { margin-bottom: 0; }
+.op-msg-user {
+  font-weight: 600; color: var(--ink-hi);
+  background: var(--accent-bg); border: 1px solid var(--accent-line);
+  border-radius: var(--r-sm); padding: 8px 10px; display: inline-block;
+}
+.op-msg-answer { color: var(--ink); white-space: normal; }
+.op-msg-answer .icon { width: 12px; height: 12px; vertical-align: -2px; }
+
+/* tool-activity chips under partner answers */
+.chip-ok { border-color: rgba(74, 222, 128, 0.25); color: #86efac; }
+.chip-err { border-color: rgba(248, 113, 113, 0.3); color: #fca5a5; }
+.chip-btn { cursor: pointer; background: var(--bg-2); }
+.chip-btn:hover { border-color: var(--accent-line); color: var(--accent-hi); }
+.chip .icon { flex: none; }

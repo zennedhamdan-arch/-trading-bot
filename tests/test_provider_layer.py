@@ -205,7 +205,15 @@ def _fresh(responder=None, model_ids=GROQ_MODELS):
 print("1. routing & configuration:")
 
 routes = llm_service.llm_routes()
-check("all 6 tasks routed", set(routes) == {"technical", "debate", "cio", "risk", "news", "fundamentals"})
+# 7 tasks: the 6 trading-pipeline tasks + the read-only "operator" task
+# (Trading Partner). The operator route NEVER joins the trading chain —
+# checked separately in tests/test_operator.py.
+check("all 7 tasks routed (6 pipeline + operator)",
+      set(routes) == {"technical", "debate", "cio", "risk", "news",
+                      "fundamentals", "operator"})
+check("operator routes via its own provider setting",
+      routes.get("operator", {}).get("provider")
+      == __import__("config").settings.OPERATOR_LLM_PROVIDER)
 check("technical/debate/risk/cio -> groq by default",
       all(routes[t]["provider"] == "groq" for t in ("technical", "debate", "risk", "cio")))
 check("tech+debate+risk use the verified 20b model, cio the 120b model",

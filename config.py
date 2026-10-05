@@ -92,19 +92,50 @@ class Settings:
     GROQ_FALLBACK_MODEL: str = _get_str("GROQ_FALLBACK_MODEL", "openai/gpt-oss-20b")
     UNOROUTER_DAILY_REQUEST_LIMIT: int = _get_int("UNOROUTER_DAILY_REQUEST_LIMIT", 0)
     UNOROUTER_QUOTA_BACKOFF_MINUTES: float = _get_float("UNOROUTER_QUOTA_BACKOFF_MINUTES", 10)
-    # Comma-separated application-level fallback models (tried in order).
-    # NOTE (verified 2026-09-11 against the live UnoRouter catalog):
-    # qwen3.8-flash-next:free is NOT in the catalog; it is skipped at runtime
-    # and the chain continues to glm-5.3-flash:free. The closest valid free
-    # Qwen3.8 id is qwen3.8-27b:free.
+    # Comma-separated APPLICATION-level fallback candidates (tried in this
+    # order). A candidate is ONLY selected if that exact id exists in the
+    # provider's LIVE /v1/models catalog at validation time — ids are never
+    # invented or substituted. (qwen3.8-flash-next:free was removed as a
+    # hardcoded fallback: reported absent from the live catalog by the
+    # running app; verified 2026-09-14 — the public catalog lists it again
+    # but at 7.8% uptime, and the runtime catalog is the only source of
+    # truth.)
     UNOROUTER_FALLBACK_MODELS: list = [
         m.strip() for m in os.getenv(
             "UNOROUTER_FALLBACK_MODELS",
-            "qwen3.8-flash-next:free,glm-5.3-flash:free",
+            "glm-5.3-flash:free,glm-5.3-flash-think-search:free,"
+            "glm-5.3-flash-search:free,ling-3.0-flash-fin:free",
         ).split(",") if m.strip()
     ]
+    # Model-catalog cache: /v1/models is fetched AT MOST once per provider
+    # per TTL window (5-10 minutes) no matter how many health checks,
+    # validations or chain resolutions run in between.
+    LLM_CATALOG_CACHE_TTL_MINUTES: float = _get_float("LLM_CATALOG_CACHE_TTL_MINUTES", 8.0)
+    # Bounded negative cache: a FAILED catalog fetch (timeout/network) is
+    # retried after this many seconds — never immediately (no hammering),
+    # never locked in for the full success TTL (a transient timeout must
+    # not blind model verification for 8 minutes).
+    LLM_CATALOG_FAILURE_TTL_SECONDS: float = _get_float("LLM_CATALOG_FAILURE_TTL_SECONDS", 60.0)
+    # Hard timeout for ONE provider's catalog fetch (a hanging provider,
+    # e.g. Gemini, must never block startup or a health-check cycle).
+    LLM_CATALOG_TIMEOUT_SECONDS: float = _get_float("LLM_CATALOG_TIMEOUT_SECONDS", 8.0)
     # Provider enable switches (a disabled provider is skipped in the chain).
     GROQ_ENABLED: bool = _get_bool("GROQ_ENABLED", True)
+
+    # --- Trading Partner / System Operator (observer layer) ---
+    # The operator is a READ-ONLY diagnostic layer that observes the trading
+    # system. It is NOT a required component: trading cycles run whether or
+    # not the operator (or its LLM provider) is available.
+    OPERATOR_ENABLED: bool = _get_bool("OPERATOR_ENABLED", True)
+    OPERATOR_LLM_PROVIDER: str = _get_str("OPERATOR_LLM_PROVIDER", "unorouter")
+    # Optional task-specific model override (empty = the provider's own
+    # default/chain). Never hard-coded to any vendor model.
+    OPERATOR_LLM_MODEL: str = _get_str("OPERATOR_LLM_MODEL", "")
+    # Tool-call loop limits (quota protection for the observer itself).
+    OPERATOR_MAX_TOOL_ROUNDS: int = _get_int("OPERATOR_MAX_TOOL_ROUNDS", 6)
+    OPERATOR_MAX_LLM_SENDS: int = _get_int("OPERATOR_MAX_LLM_SENDS", 8)
+    # Conversation history retention (days) in the shared memory DB.
+    OPERATOR_HISTORY_KEEP_DAYS: int = _get_int("OPERATOR_HISTORY_KEEP_DAYS", 30)
 
     # --- LLM routing (provider per task; resolved at call time) ---
     # Any task can be pointed at any configured provider. Defaults keep
@@ -180,6 +211,22 @@ class Settings:
     # Maximum model attempts per request across the fallback chain
     # (primary + fallback models; never unlimited model guessing).
     LLM_MAX_MODEL_ATTEMPTS: int = _get_int("LLM_MAX_MODEL_ATTEMPTS", 3)
+    # Quota management: a conservative MINIMUM INTERVAL between network
+    # requests to the SAME model. Free UnoRouter models default to 60s (a
+    # request that would arrive sooner is NOT sent — the chain fails over to
+    # the next model instantly instead of waiting; trading never blocks).
+    # Other providers default to 0 (their own rate limits + circuits apply).
+    LLM_MODEL_MIN_INTERVAL_SECONDS_UNOROUTER: float = _get_float(
+        "LLM_MODEL_MIN_INTERVAL_SECONDS_UNOROUTER", 60.0)
+    LLM_MODEL_MIN_INTERVAL_SECONDS: float = _get_float(
+        "LLM_MODEL_MIN_INTERVAL_SECONDS", 0.0)
+    # Global budget: maximum LLM NETWORK SENDS per trading cycle. Anything
+    # beyond fails fast (CYCLE_BUDGET_EXCEEDED) -> cached replay /
+    # deterministic fallback / HOLD. A normal 15-minute cycle over 5 symbols
+    # needs at most risk+cio per symbol = 10; 12 leaves headroom.
+    LLM_CYCLE_MAX_REQUESTS: int = _get_int("LLM_CYCLE_MAX_REQUESTS", 12)
+    # How long per-request usage rows (llm_request_log) are kept.
+    LLM_REQUEST_LOG_KEEP_DAYS: int = _get_int("LLM_REQUEST_LOG_KEEP_DAYS", 2)
     # Classic per-provider circuit breaker (CLOSED -> OPEN -> HALF_OPEN).
     LLM_CIRCUIT_BREAKER_ENABLED: bool = _get_bool("LLM_CIRCUIT_BREAKER_ENABLED", True)
     LLM_CIRCUIT_BREAKER_FAILURE_THRESHOLD: int = _get_int("LLM_CIRCUIT_BREAKER_FAILURE_THRESHOLD", 3)
@@ -224,6 +271,21 @@ class Settings:
     # technicals, news and risk. Providers are pluggable (implement
     # services/fundamentals_service.FundamentalsProvider); nothing scrapes
     # Yahoo Finance or relies on Yahoo cookies/crumbs. yfinance is GONE.
+    # "alphavantage": official Alpha Vantage HTTP API (fundamentals DATA
+    # provider only — the LLM interpretation of that data is routed
+    # separately via LLM_FUNDAMENTALS_PROVIDER; an LLM is never a data
+    # source). Never logged or exposed in health/config output.
+    ALPHAVANTAGE_API_KEY: str = os.getenv("ALPHAVANTAGE_API_KEY", "")
+    # Vendor free-tier courtesy limit: minimum spacing between consecutive
+    # Alpha Vantage HTTP requests (the vendor asks for <= 1 request/second).
+    # All AV requests are serialized through one throttle.
+    ALPHAVANTAGE_MIN_REQUEST_INTERVAL_SECONDS: float = _get_float(
+        "ALPHAVANTAGE_MIN_REQUEST_INTERVAL_SECONDS", 1.0)
+    # Bounded backoff: after a vendor rate-limit response, the negative
+    # result is held for this many seconds before another attempt (never an
+    # immediate retry, never a permanent lockout).
+    ALPHAVANTAGE_RATE_LIMIT_BACKOFF_SECONDS: float = _get_float(
+        "ALPHAVANTAGE_RATE_LIMIT_BACKOFF_SECONDS", 120.0)
     FUNDAMENTALS_PROVIDER: str = _get_str("FUNDAMENTALS_PROVIDER", "none").lower()
     FUNDAMENTALS_FALLBACK_PROVIDER: str = _get_str("FUNDAMENTALS_FALLBACK_PROVIDER", "").lower()
     # Seconds a fundamentals result (success or unavailability) is cached per
@@ -325,6 +387,8 @@ class Settings:
             warnings.append("NVIDIA_API_KEY is not set. NVIDIA LLM provider is not configured (optional).")
         if self.FUNDAMENTALS_PROVIDER == "none":
             warnings.append("No fundamentals provider configured (FUNDAMENTALS_PROVIDER=none); fundamentals analysis will report DATA_UNAVAILABLE.")
+        if self.FUNDAMENTALS_PROVIDER == "alphavantage" and not self.ALPHAVANTAGE_API_KEY:
+            warnings.append("FUNDAMENTALS_PROVIDER=alphavantage but ALPHAVANTAGE_API_KEY is not set; fundamentals data will be unavailable.")
         return warnings
 
 

@@ -275,7 +275,7 @@
      Router
      ========================================================================== */
 
-  var ROUTES = ["overview", "portfolio", "positions", "orders", "ai", "agents", "risk", "cycles", "health", "activity", "config"];
+  var ROUTES = ["overview", "portfolio", "positions", "orders", "ai", "agents", "risk", "cycles", "health", "activity", "config", "partner"];
 
   function parseHash() {
     var m = location.hash.match(/^#\/([a-z-]*)(?:\?(.*))?$/);
