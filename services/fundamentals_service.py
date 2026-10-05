@@ -44,6 +44,7 @@ it in _PROVIDER_CLASSES. Nothing else in the bot changes.
 import json
 import logging
 import socket
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -136,15 +137,30 @@ _AV_BASE_URL = "https://www.alphavantage.co/query"
 _AV_TIMEOUT_SECONDS = 10.0          # bounded, like LLM_REQUEST_TIMEOUT_SECONDS
 _AV_VENDOR_MESSAGE_MAX = 160        # excerpt cap for vendor messages in reasons
 
-# Module-level record of the most recent fetch outcome (for health_check;
-# provider instances are rebuilt per resolution, so state lives here).
-_av_last_fetch = {"status": None, "reason": None}
+# Free-tier request throttle: the vendor asks for <= 1 request/second.
+# EVERY Alpha Vantage HTTP request is serialized through one lock with at
+# least ALPHAVANTAGE_MIN_REQUEST_INTERVAL_SECONDS between consecutive
+# request starts (OVERVIEW -> BALANCE_SHEET included). Bounded by the
+# interval + the request timeout; never blocks other services.
+_av_http_lock = threading.Lock()
+_av_last_request_at = 0.0
 
 
 def _av_reset_state() -> None:
-    """Test hook: clears the last-fetch record."""
+    """Test hook: clears the last-fetch record and the throttle clock."""
+    global _av_last_request_at
     _av_last_fetch["status"] = None
     _av_last_fetch["reason"] = None
+    with _av_http_lock:
+        _av_last_request_at = 0.0
+
+
+def _av_min_interval_s() -> float:
+    return max(0.0, float(settings.ALPHAVANTAGE_MIN_REQUEST_INTERVAL_SECONDS or 0.0))
+
+# Module-level record of the most recent fetch outcome (for health_check;
+# provider instances are rebuilt per resolution, so state lives here).
+_av_last_fetch = {"status": None, "reason": None}
 
 
 def _to_float(value):
@@ -192,6 +208,19 @@ class AlphaVantageProvider(FundamentalsProvider):
             text = text.replace(key, "***")
         return text[:400]
 
+    def _throttled_query(self, function: str, symbol: str):
+        """One official-endpoint call THROUGH THE SHARED THROTTLE: requests
+        are serialized and spaced at least ALPHAVANTAGE_MIN_REQUEST_INTERVAL_
+        SECONDS apart (vendor free-tier limit), so OVERVIEW and BALANCE_SHEET
+        never fire back-to-back and concurrent consumers cannot burst."""
+        global _av_last_request_at
+        with _av_http_lock:
+            wait = _av_min_interval_s() - (time.monotonic() - _av_last_request_at)
+            if wait > 0:
+                time.sleep(wait)
+            _av_last_request_at = time.monotonic()
+            return self._query(function, symbol)
+
     def _query(self, function: str, symbol: str):
         """One official-endpoint call. Returns (data, None) or
         (None, normalized-DATA_UNAVAILABLE/ERROR-dict)."""
@@ -225,8 +254,11 @@ class AlphaVantageProvider(FundamentalsProvider):
             return "ERROR", ("VENDOR_ERROR: " + str(data["Error Message"])
                              [:_AV_VENDOR_MESSAGE_MAX])
         if "Note" in data:   # rate limit / call-frequency notice
-            return "DATA_UNAVAILABLE", ("RATE_LIMIT: " + str(data["Note"])
-                                        [:_AV_VENDOR_MESSAGE_MAX])
+            # DISTINCT status: the provider is NOT broken — we exceeded the
+            # free-tier call frequency. Bounded backoff follows; the fetch
+            # is never immediately retried.
+            return "RATE_LIMITED", ("RATE_LIMITED: " + str(data["Note"])
+                                    [:_AV_VENDOR_MESSAGE_MAX])
         if "Information" in data:   # invalid/entitled key guidance
             return "DATA_UNAVAILABLE", ("VENDOR_INFORMATION: "
                                         + str(data["Information"])
@@ -242,7 +274,7 @@ class AlphaVantageProvider(FundamentalsProvider):
                                reason=reason)
 
         # --- 1. OVERVIEW (primary: carries most contract fields) ----------
-        overview, failure = self._query("OVERVIEW", symbol)
+        overview, failure = self._throttled_query("OVERVIEW", symbol)
         if failure:
             status, reason = failure
             _av_last_fetch.update({"status": status, "reason": reason})
@@ -281,7 +313,7 @@ class AlphaVantageProvider(FundamentalsProvider):
         #        OVERVIEW data; a failure here never discards OVERVIEW) -----
         if fields["debt_to_equity"] is None and any(
                 v is not None for v in fields.values()):
-            balance, bs_failure = self._query("BALANCE_SHEET", symbol)
+            balance, bs_failure = self._throttled_query("BALANCE_SHEET", symbol)
             bs_refusal = self._vendor_refusal(balance) if balance else None
             if bs_failure:
                 logger.warning("alphavantage BALANCE_SHEET failed for %s: %s "
@@ -331,6 +363,20 @@ class AlphaVantageProvider(FundamentalsProvider):
                            "last fetch OK (LLM interpretation is routed "
                            "separately via LLM_FUNDAMENTALS_PROVIDER)"),
             }
+        if last_status == "RATE_LIMITED":
+            # The provider is NOT broken: we exceeded the vendor's free-tier
+            # call frequency. Distinct reason + bounded backoff, never a
+            # permanent-failure claim.
+            return {
+                "provider": self.name,
+                "status": "DATA_UNAVAILABLE",
+                "reason": "RATE_LIMITED",
+                "detail": ("provider=alphavantage — reason=RATE_LIMITED: "
+                           "free-tier call frequency exceeded; bounded "
+                           f"backoff {max(1.0, float(settings.ALPHAVANTAGE_RATE_LIMIT_BACKOFF_SECONDS or 120.0)):.0f}s "
+                           "before the next attempt (the provider itself is "
+                           "not marked broken)"),
+            }
         if last_status in ("DATA_UNAVAILABLE", "ERROR"):
             return {
                 "provider": self.name,
@@ -371,11 +417,29 @@ def _build(name: str) -> FundamentalsProvider:
 # ---------------------------------------------------------------------------
 
 _result_cache: dict = {}  # symbol -> (expires_at_monotonic, result)
+# Concurrent-consumer coalescing: one in-flight fetch per symbol. Everyone
+# else asking for the same symbol waits (bounded) and shares the result —
+# a cycle thread and an operator inspection can never double-fetch.
+_fetch_inflight: dict = {}          # symbol -> {"event", "result"}
+_fetch_inflight_lock = threading.Lock()
+_INFLIGHT_WAIT_S = 30.0             # bounded wait (fetch itself is <= ~11s)
 
 
 def reset_cache() -> None:
     """Test hook: clears the result cache."""
     _result_cache.clear()
+    with _fetch_inflight_lock:
+        _fetch_inflight.clear()
+
+
+def _result_ttl_s(result: dict) -> float:
+    """Cache lifetime for one result. Successful/normal results use the
+    configured freshness TTL; a vendor RATE_LIMITED result is held for the
+    BOUNDED BACKOFF window instead (never an immediate retry, never a
+    permanent lockout). Other failures keep the normal TTL."""
+    if isinstance(result, dict) and result.get("status") == "RATE_LIMITED":
+        return max(1.0, float(settings.ALPHAVANTAGE_RATE_LIMIT_BACKOFF_SECONDS or 120.0))
+    return max(0.0, float(settings.FUNDAMENTALS_RESULT_CACHE_TTL_SECONDS))
 
 
 def _fetch_once(symbol: str) -> dict:
@@ -418,18 +482,50 @@ def _fetch_once(symbol: str) -> dict:
 
 
 def get_fundamentals(symbol: str) -> dict:
-    """Normalized fundamentals for `symbol` (cached briefly per symbol so a
-    single cycle asks at most once). Never raises; failures carry status
-    DATA_UNAVAILABLE/ERROR with a reason."""
+    """Normalized fundamentals for `symbol`. Never raises; failures carry
+    status DATA_UNAVAILABLE/ERROR/RATE_LIMITED with a reason.
+
+    Free-tier protection (all three layers):
+      1. per-symbol result cache — a valid cached result is returned WITHOUT
+         any API call (rate-limited results are held for the bounded backoff
+         window, not the normal TTL);
+      2. per-symbol in-flight coalescing — simultaneous requests for the
+         same symbol share ONE fetch;
+      3. the provider-level throttle spaces every HTTP request.
+    """
     cached = _result_cache.get(symbol)
-    ttl = max(0.0, float(settings.FUNDAMENTALS_RESULT_CACHE_TTL_SECONDS))
-    now = time.monotonic()
-    if cached and cached[0] > now:
+    if cached and cached[0] > time.monotonic():
         return cached[1]
 
-    result = _fetch_once(symbol)
+    # --- single-flight: join an in-flight fetch for this symbol ----------
+    with _fetch_inflight_lock:
+        slot = _fetch_inflight.get(symbol)
+        if slot is None:
+            slot = {"event": threading.Event(), "result": None}
+            _fetch_inflight[symbol] = slot
+            fetcher = True
+        else:
+            fetcher = False
+    if not fetcher:
+        if slot["event"].wait(timeout=_INFLIGHT_WAIT_S) and slot["result"] is not None:
+            return slot["result"]
+        # pathological: the fetcher vanished without setting the event —
+        # fall through and fetch ourselves (still throttled + cached)
+
+    result = None
+    try:
+        result = _fetch_once(symbol)
+    finally:
+        # always publish + wake waiters, even on a pathological raise
+        with _fetch_inflight_lock:
+            slot["result"] = result
+            if _fetch_inflight.get(symbol) is slot:
+                _fetch_inflight.pop(symbol, None)
+        slot["event"].set()
+
+    ttl = _result_ttl_s(result)
     if ttl > 0:
-        _result_cache[symbol] = (now + ttl, result)
+        _result_cache[symbol] = (time.monotonic() + ttl, result)
     return result
 
 

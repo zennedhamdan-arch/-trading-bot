@@ -381,6 +381,95 @@ _last_validation = None  # report dict returned by validate_models()
 _catalog_cache = {}  # provider -> {"ids": set|None, "fetched_at": float,
 #                                "error": str|None, "timed_out": bool}
 _catalog_lock = threading.Lock()
+# Single-flight catalog fetches: concurrent health checks / validations /
+# operator inspections at a cache-expiry moment join ONE in-flight fetch
+# instead of stampeding the provider with duplicate /v1/models requests.
+_catalog_inflight = {}   # provider -> {"event": Event, "result": dict|None}
+
+
+def _catalog_failure_ttl_s() -> float:
+    """Bounded negative cache: a FAILED catalog fetch (timeout/network) is
+    retried after this period — short enough that a transient outage does
+    not blind model verification for a full TTL window, long enough that a
+    down provider is never hammered."""
+    return max(5.0, float(settings.LLM_CATALOG_FAILURE_TTL_SECONDS or 60.0))
+
+
+def _catalog_entry_ttl_s(entry: dict) -> float:
+    """Freshness window for one cached catalog entry: full TTL on success
+    and on not-configured/disabled states (a config fact, not a failure —
+    no churn), short bounded window on actual fetch failures."""
+    if not entry or entry.get("ids") is None:
+        if entry and entry.get("no_fetch"):
+            return _catalog_ttl_s()
+        return _catalog_failure_ttl_s()
+    return _catalog_ttl_s()
+
+
+def _catalog_fresh(entry: dict) -> bool:
+    return bool(entry and entry.get("fetched_at")
+                and (time.monotonic() - entry["fetched_at"]) < _catalog_entry_ttl_s(entry))
+
+
+# --- catalog vs inference status separation -----------------------------------
+#
+# A model-catalog (/v1/models) failure is a DISCOVERY problem, not proof
+# that inference is unavailable. The two concepts are reported separately:
+#
+#   catalog_status:   VERIFIED            live catalog fetched
+#                     UNAVAILABLE         fetch failed temporarily (timeout /
+#                                         network) — retry after the bounded
+#                                         failure TTL; inference NOT tested
+#                     UNAVAILABLE_AUTH    fetch failed with a credentials
+#                                         error — a real provider failure
+#                     NOT_CONFIGURED      no key / disabled (no fetch)
+#
+#   inference_status: the LIVE circuit state for actual completions:
+#                     READY / QUOTA_EXHAUSTED / AUTH_ERROR / MODEL_UNAVAILABLE /
+#                     NETWORK_ERROR / DEGRADED / NOT_CONFIGURED
+#                     UNKNOWN             no recent inference attempt — the
+#                                         catalog says nothing about inference
+#
+# Policy (unchanged): a temporarily unavailable catalog does NOT disable
+# configured models — the chain still uses them and the runtime 404/429
+# circuits protect every request. Legitimate validation (a fetched catalog
+# with zero matching models -> NO_USABLE_MODEL) is never bypassed.
+
+_CATALOG_AUTH_RE = re.compile(
+    r"\b40[13]\b|unauthorized|forbidden|invalid[ _-]?(api[ _-]?key|key|token|credential)"
+    r"|authentication|permission denied", re.IGNORECASE)
+_CATALOG_TEMPORARY_RE = re.compile(
+    r"timed?[ _-]?out|timeout|connection|network|unreachable|temporarily"
+    r"|read operation|reset by peer|broken pipe|ssl|eof|rate limit", re.IGNORECASE)
+
+
+def _classify_catalog_failure(error_text: str) -> str:
+    """'AUTH' for credentials-class failures (real provider failure),
+    'TEMPORARY' for timeout/network-class failures (discovery degraded)."""
+    text = str(error_text or "")
+    if _CATALOG_AUTH_RE.search(text):
+        return "AUTH"
+    return "TEMPORARY"   # unknown failures default to temporary/honest-DEGRADED
+
+
+def _inference_status(provider: str, states: dict) -> str:
+    """Honest inference-endpoint status from the live circuit, independent
+    of model discovery. An OPEN circuit (quota/auth/model/network) is itself
+    evidence of real inference attempts; READY is only claimed when a
+    request has actually been served — otherwise UNKNOWN (the catalog says
+    nothing about inference)."""
+    state = (states or {}).get(provider) or {}
+    circuit = state.get("state")
+    if circuit == "NOT_CONFIGURED":
+        return "NOT_CONFIGURED"
+    if circuit not in ("READY", None):
+        return circuit   # open circuits are evidence of attempts
+    with _state_lock:
+        attempted = bool(_request_times.get(provider)) or \
+            _last_failure.get(provider) is not None
+    if not attempted:
+        return "UNKNOWN"
+    return circuit or "UNKNOWN"
 # TWO disjoint pools so nested work can never starve itself:
 #   _catalog_pool  — runs RAW list_models() fetches (never submits anything)
 #   _validation_pool — runs whole get_model_catalog() wrappers in parallel
@@ -436,46 +525,73 @@ def get_model_catalog(provider: str, force: bool = False) -> dict:
     if not force:
         with _catalog_lock:
             entry = _catalog_cache.get(provider)
-            if entry and entry.get("fetched_at") \
-                    and (time.monotonic() - entry["fetched_at"]) < _catalog_ttl_s():
+            if _catalog_fresh(entry):
                 out = dict(entry)
                 out["cached"] = True
                 out["age_s"] = round(time.monotonic() - entry["fetched_at"], 1)
                 return out
 
+    # --- single-flight: join any in-flight fetch for this provider -------
+    with _catalog_lock:
+        slot = _catalog_inflight.get(provider)
+        if slot is None:
+            slot = {"event": threading.Event(), "result": None}
+            _catalog_inflight[provider] = slot
+            fetcher = True
+        else:
+            fetcher = False
+    if not fetcher:
+        # bounded wait: the fetching thread is itself bounded by the catalog
+        # timeout, so this can never hang indefinitely
+        if slot["event"].wait(timeout=max(2.0, float(settings.LLM_CATALOG_TIMEOUT_SECONDS)) + 5.0) \
+                and slot["result"] is not None:
+            out = dict(slot["result"])
+            out["cached"] = True
+            out["shared"] = True
+            out["age_s"] = round(time.monotonic() - out["fetched_at"], 1)
+            return out
+        # pathological: fetcher vanished — fall through and fetch ourselves
+
     fetched = {"ids": None, "fetched_at": time.monotonic(),
                "error": None, "timed_out": False}
-    inst = _PROVIDER_INSTANCES[provider]
-    if not _provider_enabled(provider) or not _provider_key(provider):
-        fetched["error"] = (f"disabled via {inst.enabled_attr}=false"
-                            if not _provider_enabled(provider)
-                            else f"{inst.key_attr} not configured")
-    else:
-        timeout_s = max(1.0, float(settings.LLM_CATALOG_TIMEOUT_SECONDS or 8))
-        try:
-            future = _catalog_pool().submit(inst.list_models)
+    try:
+        inst = _PROVIDER_INSTANCES[provider]
+        if not _provider_enabled(provider) or not _provider_key(provider):
+            fetched["no_fetch"] = True   # config state: cache for the full TTL
+            fetched["error"] = (f"disabled via {inst.enabled_attr}=false"
+                                if not _provider_enabled(provider)
+                                else f"{inst.key_attr} not configured")
+        else:
+            timeout_s = max(1.0, float(settings.LLM_CATALOG_TIMEOUT_SECONDS or 8))
             try:
-                ids = future.result(timeout=timeout_s)
-                fetched["ids"] = {_normalize_model_id(i) for i in (ids or set())}
-                _verified_models[provider] = set(fetched["ids"])
-            except _FutureTimeoutError:
-                fetched["timed_out"] = True
-                fetched["error"] = (f"model catalog fetch timed out after "
-                                    f"{timeout_s:.0f}s")
-                # Retrieve/swallow the late result so the abandoned worker
-                # thread never logs an unretrieved-exception warning.
-                future.add_done_callback(lambda f: f.exception() if f.done() else None)
-        except Exception as exc:  # noqa: BLE001 — catalog fetch must never raise
-            fetched["error"] = f"could not list models: {exc}"
+                future = _catalog_pool().submit(inst.list_models)
+                try:
+                    ids = future.result(timeout=timeout_s)
+                    fetched["ids"] = {_normalize_model_id(i) for i in (ids or set())}
+                    _verified_models[provider] = set(fetched["ids"])
+                except _FutureTimeoutError:
+                    fetched["timed_out"] = True
+                    fetched["error"] = (f"model catalog fetch timed out after "
+                                        f"{timeout_s:.0f}s")
+                    # Retrieve/swallow the late result so the abandoned worker
+                    # thread never logs an unretrieved-exception warning.
+                    future.add_done_callback(lambda f: f.exception() if f.done() else None)
+            except Exception as exc:  # noqa: BLE001 — catalog fetch must never raise
+                fetched["error"] = f"could not list models: {exc}"
 
-    # A fresh catalog starts a new warning period for this provider: a model
-    # that is STILL missing warns once for the new period (not zero times,
-    # not six times).
-    if fetched["ids"] is not None:
-        for key in [k for k in _model_warned if k[0] == provider]:
-            _model_warned.pop(key, None)
-    with _catalog_lock:
-        _catalog_cache[provider] = fetched
+        # A fresh catalog starts a new warning period for this provider: a model
+        # that is STILL missing warns once for the new period (not zero times,
+        # not six times).
+        if fetched["ids"] is not None:
+            for key in [k for k in _model_warned if k[0] == provider]:
+                _model_warned.pop(key, None)
+    finally:
+        with _catalog_lock:
+            _catalog_cache[provider] = fetched
+            if _catalog_inflight.get(provider) is slot:
+                _catalog_inflight.pop(provider, None)
+        slot["result"] = fetched
+        slot["event"].set()
     out = dict(fetched)
     out["cached"] = False
     out["age_s"] = 0.0
@@ -673,6 +789,9 @@ def reset_all_state() -> None:
     _verified_models.clear()
     with _catalog_lock:
         _catalog_cache.clear()
+        for slot in _catalog_inflight.values():
+            slot["event"].set()
+        _catalog_inflight.clear()
     _model_warned.clear()
     global _last_validation, _cycle_send_count
     _last_validation = None
@@ -1827,12 +1946,17 @@ def validate_models(refresh_if_stale: bool = False) -> dict:
       * ids are compared with EXACT normalization (trim + 'models/' prefix);
         nothing is assumed from public documentation.
 
-    Per-provider status:
-      READY            catalog fetched, all configured models matched
-      NO_USABLE_MODEL  catalog fetched but ZERO configured models matched
-      DEGRADED         catalog fetch timed out (provider kept, unverified)
-      ERROR            catalog fetch failed
-      NOT_CONFIGURED   no key / disabled — catalog not fetched
+    Per-provider status (back-compat label) plus the SEPARATED views:
+      status / catalog_status / inference_status
+      READY              catalog VERIFIED, all configured models matched
+      NO_USABLE_MODEL    catalog VERIFIED but ZERO configured models matched
+      DEGRADED           catalog UNAVAILABLE temporarily (timeout/network) —
+                         discovery degraded only; inference reported
+                         separately and configured models stay usable
+      ERROR              catalog UNAVAILABLE_AUTH (credentials-class failure)
+      NOT_CONFIGURED     no key / disabled — catalog not fetched
+      catalog_status:    VERIFIED | UNAVAILABLE | UNAVAILABLE_AUTH | NOT_CONFIGURED
+      inference_status:  live circuit state, or UNKNOWN when never exercised
 
     Returns: {"providers": {name: {"ok", "status", "models_found",
                                    "configured", "matched", "missing",
@@ -1850,19 +1974,17 @@ def validate_models(refresh_if_stale: bool = False) -> dict:
     #     each bounded by LLM_CATALOG_TIMEOUT_SECONDS) ----------------------
     to_fetch = [p for p in PROVIDERS
                 if _provider_enabled(p) and _provider_key(p)]
-    force_providers = set()
-    if refresh_if_stale:
-        now = time.monotonic()
-        with _catalog_lock:
-            for p in to_fetch:
-                entry = _catalog_cache.get(p)
-                if not entry or not entry.get("fetched_at") \
-                        or (now - entry["fetched_at"]) >= _catalog_ttl_s():
-                    force_providers.add(p)
+    # Catalog fetch policy: get_model_catalog(force=False) already serves a
+    # fresh entry from cache and refetches a STALE one (success TTL, or the
+    # short bounded failure TTL for failed fetches). No per-thread force
+    # flag is computed: a thread that decided "stale" while the cache was
+    # empty must NOT blindly refetch when another thread's fetch has since
+    # refreshed the entry (that was a duplicate-fetch race under concurrent
+    # health checks). refresh_if_stale therefore changes nothing here — it
+    # is kept for API compatibility; single-flight + TTLs do the work.
     futures = {}
     for p in to_fetch:
-        futures[p] = _validation_pool().submit(
-            get_model_catalog, p, p in force_providers)
+        futures[p] = _validation_pool().submit(get_model_catalog, p, False)
     catalogs = {}
     for p in to_fetch:
         try:
@@ -1871,6 +1993,7 @@ def validate_models(refresh_if_stale: bool = False) -> dict:
         except Exception:  # noqa: BLE001 — one provider never fails validation
             catalogs[p] = get_model_catalog(p)
 
+    states = provider_states()   # live inference circuits (no network)
     for provider in PROVIDERS:
         inst = _PROVIDER_INSTANCES[provider]
         configured = _configured_models_for(provider)
@@ -1880,14 +2003,17 @@ def validate_models(refresh_if_stale: bool = False) -> dict:
             "missing_models": [], "checked": {}, "selected_fallback": None,
             "catalog_age_s": None, "catalog_cached": False,
             "timed_out": False, "error": None,
+            "catalog_status": "NOT_CONFIGURED", "inference_status": "NOT_CONFIGURED",
         }
         report["providers"][provider] = entry
 
         if not _provider_enabled(provider):
             entry["error"] = f"disabled via {inst.enabled_attr}=false — catalog not fetched"
+            entry["inference_status"] = _inference_status(provider, states)
             continue
         if not _provider_key(provider):
             entry["error"] = f"{inst.key_attr} not configured — catalog not fetched"
+            entry["inference_status"] = _inference_status(provider, states)
             continue
 
         catalog = catalogs.get(provider) or get_model_catalog(provider)
@@ -1897,19 +2023,40 @@ def validate_models(refresh_if_stale: bool = False) -> dict:
         live_ids = catalog.get("ids")
 
         if live_ids is None:
+            # Catalog discovery failed — that is NOT proof inference is
+            # down. Temporary failures (timeout/network) degrade DISCOVERY
+            # only; only credentials-class failures are a real provider
+            # ERROR. Inference status is reported independently.
             entry["error"] = catalog.get("error") or "catalog unavailable"
-            if catalog.get("timed_out"):
-                entry["status"] = "DEGRADED"
-                logger.warning(
-                    f"LLM CATALOG {provider}: {entry['error']} — provider "
-                    f"marked DEGRADED, validation continues without it.")
-            else:
+            failure_class = ("TEMPORARY" if catalog.get("timed_out")
+                             else _classify_catalog_failure(entry["error"]))
+            entry["inference_status"] = _inference_status(provider, states)
+            # log the discovery failure ONCE per catalog period (a cached
+            # failure was already logged when it was fetched)
+            if not catalog.get("cached"):
+                if failure_class == "AUTH":
+                    logger.warning(
+                        f"LLM CATALOG {provider}: {entry['error']} — "
+                        f"credentials-class failure; provider marked ERROR.")
+                else:
+                    logger.warning(
+                        f"LLM CATALOG {provider}: {entry['error']} — catalog "
+                        f"temporarily unavailable (discovery degraded); "
+                        f"inference status: {entry['inference_status']} — "
+                        f"configured models remain usable per validation "
+                        f"policy.")
+            if failure_class == "AUTH":
+                entry["catalog_status"] = "UNAVAILABLE_AUTH"
                 entry["status"] = "ERROR"
-                logger.warning(f"LLM CATALOG {provider}: {entry['error']}")
+            else:
+                entry["catalog_status"] = "UNAVAILABLE"
+                entry["status"] = "DEGRADED"
             continue
 
         entry["ok"] = True
         entry["models_found"] = len(live_ids)
+        entry["catalog_status"] = "VERIFIED"
+        entry["inference_status"] = _inference_status(provider, states)
         matched = [m for m in configured if m in live_ids]
         missing = [m for m in configured if m not in live_ids]
         entry["matched"] = matched

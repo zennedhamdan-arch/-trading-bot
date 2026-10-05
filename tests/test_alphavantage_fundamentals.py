@@ -201,7 +201,7 @@ cases = [
      "ERROR", "VENDOR_ERROR"),
     ({"Note": "Thank you for using Alpha Vantage! Our standard API call "
               "frequency is 25 calls per day and 5 calls per minute."},
-     "DATA_UNAVAILABLE", "RATE_LIMIT"),
+     "RATE_LIMITED", "RATE_LIMITED"),
     ({"Information": "Thank you for using Alpha Vantage! Please claim your "
                      "free API key."},
      "DATA_UNAVAILABLE", "VENDOR_INFORMATION"),

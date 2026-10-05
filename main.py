@@ -1256,6 +1256,12 @@ async def api_providers_health():
             "last_failure": state.get("last_failure"),
             "detail": state.get("detail"),
             "validation_status": vstatus,
+            # Separated views: catalog DISCOVERY vs actual INFERENCE. A
+            # catalog timeout (catalog_status=UNAVAILABLE) is not proof the
+            # provider is down — inference_status reports the live circuit
+            # independently (UNKNOWN = not exercised recently).
+            "catalog_status": ventry.get("catalog_status"),
+            "inference_status": ventry.get("inference_status"),
             "catalog": {
                 "live_models": ventry.get("models_found", 0),
                 "configured": ventry.get("configured", []),

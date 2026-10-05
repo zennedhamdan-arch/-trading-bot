@@ -111,6 +111,11 @@ class Settings:
     # per TTL window (5-10 minutes) no matter how many health checks,
     # validations or chain resolutions run in between.
     LLM_CATALOG_CACHE_TTL_MINUTES: float = _get_float("LLM_CATALOG_CACHE_TTL_MINUTES", 8.0)
+    # Bounded negative cache: a FAILED catalog fetch (timeout/network) is
+    # retried after this many seconds — never immediately (no hammering),
+    # never locked in for the full success TTL (a transient timeout must
+    # not blind model verification for 8 minutes).
+    LLM_CATALOG_FAILURE_TTL_SECONDS: float = _get_float("LLM_CATALOG_FAILURE_TTL_SECONDS", 60.0)
     # Hard timeout for ONE provider's catalog fetch (a hanging provider,
     # e.g. Gemini, must never block startup or a health-check cycle).
     LLM_CATALOG_TIMEOUT_SECONDS: float = _get_float("LLM_CATALOG_TIMEOUT_SECONDS", 8.0)
@@ -271,6 +276,16 @@ class Settings:
     # separately via LLM_FUNDAMENTALS_PROVIDER; an LLM is never a data
     # source). Never logged or exposed in health/config output.
     ALPHAVANTAGE_API_KEY: str = os.getenv("ALPHAVANTAGE_API_KEY", "")
+    # Vendor free-tier courtesy limit: minimum spacing between consecutive
+    # Alpha Vantage HTTP requests (the vendor asks for <= 1 request/second).
+    # All AV requests are serialized through one throttle.
+    ALPHAVANTAGE_MIN_REQUEST_INTERVAL_SECONDS: float = _get_float(
+        "ALPHAVANTAGE_MIN_REQUEST_INTERVAL_SECONDS", 1.0)
+    # Bounded backoff: after a vendor rate-limit response, the negative
+    # result is held for this many seconds before another attempt (never an
+    # immediate retry, never a permanent lockout).
+    ALPHAVANTAGE_RATE_LIMIT_BACKOFF_SECONDS: float = _get_float(
+        "ALPHAVANTAGE_RATE_LIMIT_BACKOFF_SECONDS", 120.0)
     FUNDAMENTALS_PROVIDER: str = _get_str("FUNDAMENTALS_PROVIDER", "none").lower()
     FUNDAMENTALS_FALLBACK_PROVIDER: str = _get_str("FUNDAMENTALS_FALLBACK_PROVIDER", "").lower()
     # Seconds a fundamentals result (success or unavailability) is cached per

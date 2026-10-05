@@ -254,6 +254,18 @@ def _overall_from(account: dict, market: dict) -> dict:
             )
             continue
         if vstatus in ("DEGRADED", "ERROR"):
+            if (ventry.get("catalog_status") == "UNAVAILABLE"
+                    and ventry.get("inference_status") != "AUTH_ERROR"):
+                # Catalog DISCOVERY is temporarily unavailable — NOT proof
+                # the provider is down. The inference circuit is READY and
+                # configured models remain usable per validation policy
+                # (runtime 404/429 circuits protect requests). The system
+                # keeps trading; the discovery degradation stays visible on
+                # the provider row. Only credentials-class failures
+                # (catalog UNAVAILABLE_AUTH / circuit AUTH_ERROR) degrade
+                # the overall system.
+                usable_providers.append(provider)
+                continue
             status = "DEGRADED"
             reasons.append(
                 f"LLM provider {provider} model validation {vstatus}"
@@ -382,9 +394,22 @@ def run_startup_checks() -> dict:
                 f"ZERO configured models match: "
                 f"{', '.join(entry.get('missing_models') or []) or 'none configured'}"
             )
+        elif entry.get("catalog_status") == "UNAVAILABLE_AUTH":
+            status = "ERROR"
+            detail = (f"model catalog credentials failure: "
+                      f"{str(entry.get('error') or '')[:160]}")
         elif entry.get("status") in ("DEGRADED", "ERROR"):
-            status = entry["status"]
-            detail = str(entry.get("error") or entry["status"])
+            # Catalog DISCOVERY failed temporarily (timeout/network). This is
+            # NOT proof that inference is unavailable: inference status is
+            # reported separately and configured models remain usable per
+            # validation policy (runtime 404/429 circuits protect requests).
+            status = "DEGRADED"
+            detail = (
+                f"model catalog temporarily unavailable "
+                f"({str(entry.get('error') or '')[:120]}); "
+                f"inference: {entry.get('inference_status', 'UNKNOWN')} — "
+                f"configured models remain usable"
+            )
         elif state.get("state") != "READY":
             status, detail = state.get("state"), state.get("detail", "")
         else:
@@ -402,6 +427,8 @@ def run_startup_checks() -> dict:
         llm_providers[provider] = {
             "status": status, "detail": detail,
             "circuit": state.get("state"),
+            "catalog_status": entry.get("catalog_status"),
+            "inference_status": entry.get("inference_status"),
             "models_checked": entry.get("checked", {}),
             "catalog": {
                 "live_models": entry.get("models_found", 0),
