@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-def _get_bool(name: str, default: bool = False) -> bool:
+def _get_bool(name: str, default: bool) -> bool:
     val = os.getenv(name)
     if val is None:
         return default
@@ -39,25 +39,330 @@ def _get_int(name: str, default: int) -> int:
         return default
 
 
+def _get_str(name: str, default: str = "") -> str:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.strip()
+
+
 class Settings:
-    # --- Alpaca ---
+    # --- Alpaca (primary market data + paper execution) ---
     ALPACA_API_KEY: str = os.getenv("ALPACA_API_KEY", "")
     ALPACA_SECRET_KEY: str = os.getenv("ALPACA_SECRET_KEY", "")
-    ALPACA_BASE_URL: str = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
-    # This app is hardcoded to paper trading. Do not point it at a live endpoint.
+    # This app is hardcoded to PAPER trading. There is deliberately NO
+    # configuration that can enable live-money trading: an ALPACA_BASE_URL
+    # pointing at a live endpoint is ignored with a warning. PAPER_TRADING_ONLY
+    # is a display constant and cannot be turned off.
+    _PAPER_BASE_URL = "https://paper-api.alpaca.markets"
+    _env_base_url = os.getenv("ALPACA_BASE_URL", _PAPER_BASE_URL).strip()
+    if _env_base_url and "paper-api.alpaca.markets" not in _env_base_url:
+        import logging as _logging
+        _logging.getLogger("config").warning(
+            "ALPACA_BASE_URL points at a non-paper endpoint and was IGNORED — "
+            "this application is paper-trading only."
+        )
+    ALPACA_BASE_URL: str = _PAPER_BASE_URL
     ALPACA_PAPER: bool = True
+    PAPER_TRADING_ONLY: bool = True  # constant; env value never disables it
+    # Market-data feed. The free/paper subscription only permits IEX;
+    # requesting SIP fails with "subscription does not permit querying
+    # recent SIP data". The feed is NEVER switched silently: if a
+    # configured feed is not permitted, data calls fail honestly with
+    # DATA_UNAVAILABLE (SUBSCRIPTION_FEED_UNAVAILABLE).
+    ALPACA_DATA_FEED: str = os.getenv("ALPACA_DATA_FEED", "IEX").strip().upper() or "IEX"
 
-    # --- LLM Providers ---
+    # --- LLM provider credentials ---
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
     OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
+    NVIDIA_API_KEY: str = os.getenv("NVIDIA_API_KEY", "")
 
-    # --- Model identifiers ---
-    GEMINI_MODEL: str = "gemini-2.5-flash"
-    GROQ_TECH_MODEL: str = "llama-3.1-8b-instant"
-    GROQ_CIO_MODEL: str = "llama-3.3-70b-versatile"
-    OPENROUTER_RISK_MODEL: str = "deepseek/deepseek-r1:free"
-    OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
+    # --- UnoRouter (OpenAI-compatible gateway; the PRIMARY LLM provider) ---
+    # The application implements its OWN model fallback chain — UnoRouter
+    # never chooses models for us. Model ids are verified against the live
+    # catalog at startup; an id that no longer exists is skipped at runtime
+    # with LLM_MODEL_UNAVAILABLE and the next configured model is tried.
+    UNOROUTER_ENABLED: bool = _get_bool("UNOROUTER_ENABLED", True)
+    UNOROUTER_API_KEY: str = os.getenv("UNOROUTER_API_KEY", "")
+    UNOROUTER_BASE_URL: str = _get_str("UNOROUTER_BASE_URL", "https://api.unorouter.com/v1")
+    UNOROUTER_PRIMARY_MODEL: str = _get_str("UNOROUTER_PRIMARY_MODEL", "glm-5.3-flash-thinking:free")
+    # Generic Groq model used when the chain falls back to Groq for a task
+    # that has no task-specific Groq model configured.
+    GROQ_FALLBACK_MODEL: str = _get_str("GROQ_FALLBACK_MODEL", "openai/gpt-oss-20b")
+    UNOROUTER_DAILY_REQUEST_LIMIT: int = _get_int("UNOROUTER_DAILY_REQUEST_LIMIT", 0)
+    UNOROUTER_QUOTA_BACKOFF_MINUTES: float = _get_float("UNOROUTER_QUOTA_BACKOFF_MINUTES", 10)
+    # Comma-separated APPLICATION-level fallback candidates (tried in this
+    # order). A candidate is ONLY selected if that exact id exists in the
+    # provider's LIVE /v1/models catalog at validation time — ids are never
+    # invented or substituted. (qwen3.8-flash-next:free was removed as a
+    # hardcoded fallback: reported absent from the live catalog by the
+    # running app; verified 2026-09-14 — the public catalog lists it again
+    # but at 7.8% uptime, and the runtime catalog is the only source of
+    # truth.)
+    UNOROUTER_FALLBACK_MODELS: list = [
+        m.strip() for m in os.getenv(
+            "UNOROUTER_FALLBACK_MODELS",
+            "glm-5.3-flash:free,glm-5.3-flash-think-search:free,"
+            "glm-5.3-flash-search:free,ling-3.0-flash-fin:free",
+        ).split(",") if m.strip()
+    ]
+    # Model-catalog cache: /v1/models is fetched AT MOST once per provider
+    # per TTL window (5-10 minutes) no matter how many health checks,
+    # validations or chain resolutions run in between.
+    LLM_CATALOG_CACHE_TTL_MINUTES: float = _get_float("LLM_CATALOG_CACHE_TTL_MINUTES", 8.0)
+    # Bounded negative cache: a FAILED catalog fetch (timeout/network) is
+    # retried after this many seconds — never immediately (no hammering),
+    # never locked in for the full success TTL (a transient timeout must
+    # not blind model verification for 8 minutes).
+    LLM_CATALOG_FAILURE_TTL_SECONDS: float = _get_float("LLM_CATALOG_FAILURE_TTL_SECONDS", 60.0)
+    # Hard timeout for ONE provider's catalog fetch (a hanging provider,
+    # e.g. Gemini, must never block startup or a health-check cycle).
+    LLM_CATALOG_TIMEOUT_SECONDS: float = _get_float("LLM_CATALOG_TIMEOUT_SECONDS", 8.0)
+    # Provider enable switches (a disabled provider is skipped in the chain).
+    GROQ_ENABLED: bool = _get_bool("GROQ_ENABLED", True)
+
+    # --- Trading Partner / System Operator (observer layer) ---
+    # The operator is a READ-ONLY diagnostic layer that observes the trading
+    # system. It is NOT a required component: trading cycles run whether or
+    # not the operator (or its LLM provider) is available.
+    OPERATOR_ENABLED: bool = _get_bool("OPERATOR_ENABLED", True)
+    OPERATOR_LLM_PROVIDER: str = _get_str("OPERATOR_LLM_PROVIDER", "unorouter")
+    # Optional task-specific model override (empty = the provider's own
+    # default/chain). Never hard-coded to any vendor model.
+    OPERATOR_LLM_MODEL: str = _get_str("OPERATOR_LLM_MODEL", "")
+    # Tool-call loop limits (quota protection for the observer itself).
+    OPERATOR_MAX_TOOL_ROUNDS: int = _get_int("OPERATOR_MAX_TOOL_ROUNDS", 6)
+    OPERATOR_MAX_LLM_SENDS: int = _get_int("OPERATOR_MAX_LLM_SENDS", 8)
+    # Conversation history retention (days) in the shared memory DB.
+    OPERATOR_HISTORY_KEEP_DAYS: int = _get_int("OPERATOR_HISTORY_KEEP_DAYS", 30)
+
+    # --- LLM routing (provider per task; resolved at call time) ---
+    # Any task can be pointed at any configured provider. Defaults keep
+    # every reasoning task on Groq (verified models) except news/fundamentals
+    # interpretation, which stays on Gemini. OpenRouter became optional after
+    # its free risk model was withdrawn (404 MODEL_NOT_FOUND in production).
+    # V2: every reasoning task defaults to UnoRouter (primary model chain),
+    # with Groq as the final provider fallback in the unified chain.
+    LLM_TECH_PROVIDER: str = _get_str("LLM_TECH_PROVIDER", "unorouter").lower()
+    LLM_DEBATE_PROVIDER: str = _get_str("LLM_DEBATE_PROVIDER", "unorouter").lower()
+    LLM_RISK_PROVIDER: str = _get_str("LLM_RISK_PROVIDER", "unorouter").lower()
+    LLM_CIO_PROVIDER: str = _get_str("LLM_CIO_PROVIDER", "unorouter").lower()
+    LLM_NEWS_PROVIDER: str = _get_str("LLM_NEWS_PROVIDER", "unorouter").lower()
+    LLM_FUNDAMENTALS_PROVIDER: str = _get_str("LLM_FUNDAMENTALS_PROVIDER", "unorouter").lower()
+
+    # --- Model identifiers (all env-configurable; defaults verified against
+    # the providers' live catalogs in September 2026) ---
+    # Groq shut down llama-3.1-8b-instant / llama-3.3-70b-versatile on
+    # 2026-08-16 (Enterprise-only). The defaults below are Groq's recommended
+    # replacements (https://console.groq.com/docs/deprecations) and are
+    # re-verified against the live /models catalog at startup.
+    GROQ_TECH_MODEL: str = _get_str("GROQ_TECH_MODEL", "openai/gpt-oss-20b")
+    GROQ_DEBATE_MODEL: str = _get_str("GROQ_DEBATE_MODEL", "openai/gpt-oss-20b")
+    GROQ_RISK_MODEL: str = _get_str("GROQ_RISK_MODEL", "openai/gpt-oss-20b")
+    GROQ_CIO_MODEL: str = _get_str("GROQ_CIO_MODEL", "openai/gpt-oss-120b")
+    # OpenRouter: OPTIONAL. Only used when a model is EXPLICITLY configured
+    # and verified available for the account. Empty default = not routed.
+    # (OPENROUTER_RISK_MODEL is read as a legacy fallback.)
+    OPENROUTER_MODEL: str = _get_str("OPENROUTER_MODEL", "") or _get_str("OPENROUTER_RISK_MODEL", "")
+    OPENROUTER_BASE_URL: str = _get_str("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+    # NVIDIA: OPTIONAL secondary provider (OpenAI-compatible NIM endpoint;
+    # base URL overridable). Usable as fallback/alternative/selected tasks.
+    NVIDIA_MODEL: str = _get_str("NVIDIA_MODEL", "")
+    NVIDIA_BASE_URL: str = _get_str("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
+    # Gemini (news/fundamentals interpretation; NOT the high-frequency
+    # backbone — its free tier allows 20 requests/day, protected below).
+    GEMINI_MODEL: str = _get_str("GEMINI_MODEL", "gemini-3.6-flash")
+
+    # --- Global LLM fallback route (optional, explicit, verified) ---
+    # Used when a task's primary route fails with MODEL_NOT_FOUND /
+    # PROVIDER_ERROR / AUTH_ERROR / NETWORK_ERROR — never for quota errors
+    # (quota exhaustion is reported honestly, not routed around) and never
+    # as a silent switch. Both values must be set; the fallback model is
+    # verified against the fallback provider's live catalog at startup.
+    LLM_FALLBACK_PROVIDER: str = _get_str("LLM_FALLBACK_PROVIDER", "").lower()
+    LLM_FALLBACK_MODEL: str = _get_str("LLM_FALLBACK_MODEL", "")
+
+    # --- LLM quota protection (free-tier friendly) ---
+    # Local rolling-24h request budgets per provider. 0 disables the local
+    # cap. The observed Gemini free tier limit for gemini-3.6-flash is
+    # 20 requests/day (quota metric GenerateContentFreeTierRequests).
+    GEMINI_DAILY_REQUEST_LIMIT: int = _get_int("GEMINI_DAILY_REQUEST_LIMIT", 20)
+    GROQ_DAILY_REQUEST_LIMIT: int = _get_int("GROQ_DAILY_REQUEST_LIMIT", 0)
+    OPENROUTER_DAILY_REQUEST_LIMIT: int = _get_int("OPENROUTER_DAILY_REQUEST_LIMIT", 0)
+    NVIDIA_DAILY_REQUEST_LIMIT: int = _get_int("NVIDIA_DAILY_REQUEST_LIMIT", 0)
+    # Minutes to stop calling a provider after a server-side quota-exhausted
+    # (429) error that carries no usable retry delay.
+    GEMINI_QUOTA_BACKOFF_MINUTES: float = _get_float("GEMINI_QUOTA_BACKOFF_MINUTES", 60)
+    GROQ_QUOTA_BACKOFF_MINUTES: float = _get_float("GROQ_QUOTA_BACKOFF_MINUTES", 10)
+    OPENROUTER_QUOTA_BACKOFF_MINUTES: float = _get_float("OPENROUTER_QUOTA_BACKOFF_MINUTES", 60)
+    NVIDIA_QUOTA_BACKOFF_MINUTES: float = _get_float("NVIDIA_QUOTA_BACKOFF_MINUTES", 60)
+    # Retries ONLY for transient rate limits (429 with a short explicit
+    # retry delay); quota exhaustion is never retried. Default 0 per the V2
+    # no-long-retries policy — a failed attempt immediately moves to the
+    # next model/provider in the chain.
+    LLM_RATE_LIMIT_MAX_RETRIES: int = _get_int("LLM_RATE_LIMIT_MAX_RETRIES", 0)
+    LLM_RATE_LIMIT_MAX_WAIT_SECONDS: float = _get_float("LLM_RATE_LIMIT_MAX_WAIT_SECONDS", 30)
+    # Hard per-request timeout (seconds) applied to every LLM HTTP call, and
+    # the SDK-level retry count (0 = the SDK never retries; the application's
+    # own model/provider fallback handles failures instead of waiting).
+    LLM_REQUEST_TIMEOUT_SECONDS: float = _get_float("LLM_REQUEST_TIMEOUT_SECONDS", 10.0)
+    LLM_MAX_RETRIES: int = _get_int("LLM_MAX_RETRIES", 0)
+    # Maximum model attempts per request across the fallback chain
+    # (primary + fallback models; never unlimited model guessing).
+    LLM_MAX_MODEL_ATTEMPTS: int = _get_int("LLM_MAX_MODEL_ATTEMPTS", 3)
+    # Quota management: a conservative MINIMUM INTERVAL between network
+    # requests to the SAME model. Free UnoRouter models default to 60s (a
+    # request that would arrive sooner is NOT sent — the chain fails over to
+    # the next model instantly instead of waiting; trading never blocks).
+    # Other providers default to 0 (their own rate limits + circuits apply).
+    LLM_MODEL_MIN_INTERVAL_SECONDS_UNOROUTER: float = _get_float(
+        "LLM_MODEL_MIN_INTERVAL_SECONDS_UNOROUTER", 60.0)
+    LLM_MODEL_MIN_INTERVAL_SECONDS: float = _get_float(
+        "LLM_MODEL_MIN_INTERVAL_SECONDS", 0.0)
+    # Global budget: maximum LLM NETWORK SENDS per trading cycle. Anything
+    # beyond fails fast (CYCLE_BUDGET_EXCEEDED) -> cached replay /
+    # deterministic fallback / HOLD. A normal 15-minute cycle over 5 symbols
+    # needs at most risk+cio per symbol = 10; 12 leaves headroom.
+    LLM_CYCLE_MAX_REQUESTS: int = _get_int("LLM_CYCLE_MAX_REQUESTS", 12)
+    # How long per-request usage rows (llm_request_log) are kept.
+    LLM_REQUEST_LOG_KEEP_DAYS: int = _get_int("LLM_REQUEST_LOG_KEEP_DAYS", 2)
+    # Classic per-provider circuit breaker (CLOSED -> OPEN -> HALF_OPEN).
+    LLM_CIRCUIT_BREAKER_ENABLED: bool = _get_bool("LLM_CIRCUIT_BREAKER_ENABLED", True)
+    LLM_CIRCUIT_BREAKER_FAILURE_THRESHOLD: int = _get_int("LLM_CIRCUIT_BREAKER_FAILURE_THRESHOLD", 3)
+    LLM_CIRCUIT_BREAKER_BACKOFF_SECONDS: float = _get_float("LLM_CIRCUIT_BREAKER_BACKOFF_SECONDS", 600.0)
+    # Router-level response cache: identical (task, prompt) within the TTL is
+    # served from cache; on total chain failure the last cached response is
+    # the "cached result" stop before the deterministic fallback.
+    LLM_RESPONSE_CACHE_TTL_MINUTES: float = _get_float("LLM_RESPONSE_CACHE_TTL_MINUTES", 240.0)
+    LLM_RESPONSE_CACHE_MAX_ENTRIES: int = _get_int("LLM_RESPONSE_CACHE_MAX_ENTRIES", 500)
+
+    # --- LLM circuit breakers ---
+    # After a 404 MODEL_NOT_FOUND, the (provider, model) pair is short-
+    # circuited for this long — no repeated requests to a dead model.
+    MODEL_UNAVAILABLE_COOLDOWN_MINUTES: float = _get_float("MODEL_UNAVAILABLE_COOLDOWN_MINUTES", 30)
+    # After an authentication failure (401/403), the provider is short-
+    # circuited for this long — no repeated auth failures.
+    AUTH_COOLDOWN_MINUTES: float = _get_float("AUTH_COOLDOWN_MINUTES", 60)
+
+    # --- News Intelligence V2 (persistent, worker-driven) ---
+    NEWS_ENABLED: bool = _get_bool("NEWS_ENABLED", True)
+    # The independent news worker refresh interval. News processing NEVER
+    # runs inside a trading cycle; cycles read the persistent cache.
+    NEWS_REFRESH_MINUTES: float = _get_float("NEWS_REFRESH_MINUTES", 30.0)
+    # Intelligence older than this is still used but marked is_stale=true.
+    NEWS_CACHE_MAX_AGE_MINUTES: float = _get_float("NEWS_CACHE_MAX_AGE_MINUTES", 60.0)
+    # Only articles at/above this relevance level are sent to an LLM
+    # (HIGH | MEDIUM | LOW; IRRELEVANT is never analyzed).
+    NEWS_RELEVANCE_THRESHOLD: str = _get_str("NEWS_RELEVANCE_THRESHOLD", "MEDIUM").upper()
+    NEWS_MAX_ARTICLES_PER_SYMBOL: int = _get_int("NEWS_MAX_ARTICLES_PER_SYMBOL", 20)
+
+    # --- LLM analysis reuse (avoid re-sending identical context) ---
+    # The news and fundamentals agents cache their LLM analysis keyed by the
+    # exact input. While the input is unchanged, the cached analysis is
+    # reused and NO new request is sent. This is what keeps a 15-minute
+    # cycle cadence inside the Gemini free tier's 20 requests/day.
+    NEWS_ANALYSIS_CACHE_TTL_MINUTES: float = _get_float("NEWS_ANALYSIS_CACHE_TTL_MINUTES", 240)
+    FUNDAMENTALS_ANALYSIS_CACHE_TTL_MINUTES: float = _get_float("FUNDAMENTALS_ANALYSIS_CACHE_TTL_MINUTES", 480)
+
+    # --- Fundamentals data providers ---
+    # "none" (default): no fundamentals provider configured — the fundamentals
+    # agent reports DATA_UNAVAILABLE and the cycle continues on price data,
+    # technicals, news and risk. Providers are pluggable (implement
+    # services/fundamentals_service.FundamentalsProvider); nothing scrapes
+    # Yahoo Finance or relies on Yahoo cookies/crumbs. yfinance is GONE.
+    # "alphavantage": official Alpha Vantage HTTP API (fundamentals DATA
+    # provider only — the LLM interpretation of that data is routed
+    # separately via LLM_FUNDAMENTALS_PROVIDER; an LLM is never a data
+    # source). Never logged or exposed in health/config output.
+    ALPHAVANTAGE_API_KEY: str = os.getenv("ALPHAVANTAGE_API_KEY", "")
+    # Vendor free-tier courtesy limit: minimum spacing between consecutive
+    # Alpha Vantage HTTP requests (the vendor asks for <= 1 request/second).
+    # All AV requests are serialized through one throttle.
+    ALPHAVANTAGE_MIN_REQUEST_INTERVAL_SECONDS: float = _get_float(
+        "ALPHAVANTAGE_MIN_REQUEST_INTERVAL_SECONDS", 1.0)
+    # Bounded backoff: after a vendor rate-limit response, the negative
+    # result is held for this many seconds before another attempt (never an
+    # immediate retry, never a permanent lockout).
+    ALPHAVANTAGE_RATE_LIMIT_BACKOFF_SECONDS: float = _get_float(
+        "ALPHAVANTAGE_RATE_LIMIT_BACKOFF_SECONDS", 120.0)
+    FUNDAMENTALS_PROVIDER: str = _get_str("FUNDAMENTALS_PROVIDER", "none").lower()
+    FUNDAMENTALS_FALLBACK_PROVIDER: str = _get_str("FUNDAMENTALS_FALLBACK_PROVIDER", "").lower()
+    # Seconds a fundamentals result (success or unavailability) is cached per
+    # symbol so one cycle never asks twice.
+    FUNDAMENTALS_RESULT_CACHE_TTL_SECONDS: float = _get_float("FUNDAMENTALS_RESULT_CACHE_TTL_SECONDS", 60)
+    # Multi-provider evidence: when true AND a fallback provider is also
+    # configured, BOTH providers are fetched and their metrics are
+    # cross-validated (agreement / conflict per metric, reporting-period and
+    # currency checks, transparent confidence labels) before the fundamentals
+    # agent sees the evidence. Default false — a single deployment change
+    # (adding FMP_API_KEY) never changes the active provider or request
+    # behavior by itself.
+    FUNDAMENTALS_CROSS_VALIDATION: bool = _get_bool("FUNDAMENTALS_CROSS_VALIDATION", False)
+
+    # --- Financial Modeling Prep (FMP) — fundamentals DATA provider ------
+    # Official Stable API. A DATA provider only — the LLM interpretation is
+    # routed separately via LLM_FUNDAMENTALS_PROVIDER (an LLM is never a
+    # data source). Never logged or exposed in health/config output.
+    FMP_API_KEY: str = os.getenv("FMP_API_KEY", "")
+    FMP_BASE_URL: str = _get_str("FMP_BASE_URL", "https://financialmodelingprep.com/stable")
+    # Bounded timeout for ONE FMP HTTP request (like the AV/LLM timeouts).
+    FMP_REQUEST_TIMEOUT_SECONDS: float = _get_float("FMP_REQUEST_TIMEOUT_SECONDS", 10.0)
+    # FMP free tier: 250 requests/day. The bot keeps its OWN daily counter
+    # and stops issuing FMP requests (serving valid cached evidence) once
+    # the budget is spent — the provider's actual quota is never bypassed.
+    FMP_DAILY_REQUEST_BUDGET: int = _get_int("FMP_DAILY_REQUEST_BUDGET", 250)
+    # Per-symbol, per-endpoint cache for FMP responses. Financial statements
+    # / key metrics / ratios are stable between filings, so they are cached
+    # for the full TTL (default 6h); the profile (price-dependent marketCap)
+    # is cached for TTL/6 (default 1h). Statements are NOT re-fetched every
+    # trading cycle.
+    FMP_CACHE_TTL_SECONDS: float = _get_float("FMP_CACHE_TTL_SECONDS", 21600.0)
+    # Bounded exponential backoff after an HTTP 429 / rate-limit response:
+    # retry_after = FMP_RATE_LIMIT_BACKOFF_SECONDS * 2^(consecutive-1),
+    # capped at 24h. Never an immediate retry, never a permanent lockout.
+    FMP_RATE_LIMIT_BACKOFF_SECONDS: float = _get_float("FMP_RATE_LIMIT_BACKOFF_SECONDS", 300.0)
+
+    # --- Real-time market data (Alpaca WebSockets; optional) ---
+    # Trades + quotes + minute bars + news stream for the trade universe.
+    # Purely a dashboard/observability layer: ticks NEVER trigger LLM calls;
+    # the AI cycle stays on its scheduled interval.
+    REALTIME_ENABLED: bool = _get_bool("REALTIME_ENABLED", True)
+    # Base delay for the supervisor's reconnect backoff. The delay grows
+    # exponentially per consecutive failed attempt (2s, 4s, 8s, 16s, ...)
+    # with jitter, capped at REALTIME_RECONNECT_MAX_SECONDS — never a fixed
+    # every-N-seconds-forever loop.
+    REALTIME_RECONNECT_SECONDS: float = _get_float("REALTIME_RECONNECT_SECONDS", 2.0)
+    REALTIME_RECONNECT_MAX_SECONDS: float = _get_float("REALTIME_RECONNECT_MAX_SECONDS", 60.0)
+    # A live stream that receives no market tick for this many seconds
+    # WHILE THE MARKET IS OPEN is considered connected-but-silent and is
+    # recycled. Outside market hours IEX legitimately sends nothing, so no
+    # reconnect storm happens while the market is closed. 0 disables.
+    REALTIME_STALE_TICK_SECONDS: float = _get_float("REALTIME_STALE_TICK_SECONDS", 180.0)
+    # Optional opt-in passthrough to the SDK's own data_timeout (detects a
+    # silent socket at the transport level). Disabled by default: with no
+    # market data outside trading hours the SDK would otherwise force an
+    # endless reconnect cycle on quiet markets. The market-aware staleness
+    # check above is the default mechanism.
+    REALTIME_DATA_TIMEOUT_SECONDS: float = _get_float("REALTIME_DATA_TIMEOUT_SECONDS", 0.0)
+
+    # --- Evidence quality (decision-quality gate) ---
+    # Daily-bar analytics older than this many calendar days are STALE
+    # (long weekends/holidays fit comfortably below the threshold).
+    EVIDENCE_STALE_DAYS: int = _get_int("EVIDENCE_STALE_DAYS", 5)
+
+    # --- Deterministic risk engine (hard rules; LLM can never override) ---
+    # Total open-position exposure as a fraction of equity.
+    RISK_MAX_PORTFOLIO_EXPOSURE_PCT: float = _get_float("RISK_MAX_PORTFOLIO_EXPOSURE_PCT", 0.80)
+    # Reject all NEW buys when the day's P&L is at or below this fraction.
+    RISK_MAX_DAILY_LOSS_PCT: float = _get_float("RISK_MAX_DAILY_LOSS_PCT", 0.03)
+    # Maximum executed orders per calendar day (persisted across restarts).
+    RISK_MAX_TRADES_PER_DAY: int = _get_int("RISK_MAX_TRADES_PER_DAY", 10)
+    # Event-risk behavior: "reject" (no new trades on HIGH event risk),
+    # "reduce" (halve the allowed notional), or "ignore".
+    RISK_EVENT_RISK_ACTION: str = _get_str("RISK_EVENT_RISK_ACTION", "reduce").lower()
+    # Reject new BUYs while the market is verifiably closed.
+    RISK_REQUIRE_MARKET_OPEN: bool = _get_bool("RISK_REQUIRE_MARKET_OPEN", True)
 
     # --- Bot behavior ---
     TRADE_UNIVERSE: list = [
@@ -68,9 +373,24 @@ class Settings:
     CYCLE_INTERVAL_MINUTES: int = _get_int("CYCLE_INTERVAL_MINUTES", 15)
     MAX_POSITION_PCT: float = _get_float("MAX_POSITION_PCT", 0.10)
 
-    # --- New feature toggles (all free to run) ---
+    # --- Feature toggles ---
     ENABLE_FUNDAMENTALS_AGENT: bool = _get_bool("ENABLE_FUNDAMENTALS_AGENT", True)
-    ENABLE_DEBATE: bool = _get_bool("ENABLE_DEBATE", True)
+    # Debate is OFF by default (V2): it only runs on a valid setup with
+    # conflicting evidence and a healthy provider. Legacy env name
+    # ENABLE_DEBATE is still honored.
+    ENABLE_DEBATE: bool = _get_bool("DEBATE_AGENT_ENABLED",
+                                    _get_bool("ENABLE_DEBATE", False))
+    # Minimum technical confidence for the debate to run (when the technical
+    # report is deterministic and carries no LLM confidence, setup existence
+    # itself is the qualifier).
+    DEBATE_MIN_TECH_CONFIDENCE: float = _get_float("DEBATE_MIN_TECH_CONFIDENCE", 0.65)
+    DEBATE_REQUIRE_CONFLICT: bool = _get_bool("DEBATE_REQUIRE_CONFLICT", True)
+    # CIO AI review runs ONLY on a valid setup that passed the hard risk
+    # engine (the deterministic fail-safe below it never needs an LLM).
+    CIO_AGENT_ENABLED: bool = _get_bool("CIO_AGENT_ENABLED", True)
+    # Optional richer LLM interpretation of technicals (default off: the
+    # deterministic rule engine produces the setup verdict).
+    TECH_LLM_INTERPRETATION_ENABLED: bool = _get_bool("TECH_LLM_INTERPRETATION_ENABLED", False)
     ENABLE_MEMORY: bool = _get_bool("ENABLE_MEMORY", True)
     MEMORY_DB_PATH: str = os.getenv("MEMORY_DB_PATH", "data/memory.db")
     AGENT_ACCURACY_LOOKBACK: int = _get_int("AGENT_ACCURACY_LOOKBACK", 20)
@@ -83,11 +403,27 @@ class Settings:
         if not self.ALPACA_API_KEY or not self.ALPACA_SECRET_KEY:
             warnings.append("Alpaca API keys are not set. Trading functions will fail.")
         if not self.GEMINI_API_KEY:
-            warnings.append("GEMINI_API_KEY is not set. News/Sentiment agent will be disabled.")
+            warnings.append("GEMINI_API_KEY is not set. News sentiment interpretation will be unavailable.")
+        if self.UNOROUTER_ENABLED and not self.UNOROUTER_API_KEY:
+            warnings.append("UNOROUTER_API_KEY is not set. The primary LLM chain will skip UnoRouter and fall back to Groq.")
         if not self.GROQ_API_KEY:
-            warnings.append("GROQ_API_KEY is not set. Technical + CIO agents will be disabled.")
+            warnings.append("GROQ_API_KEY is not set. The Groq fallback (and any Groq-routed tasks) will be unavailable.")
+        if not self.GROQ_ENABLED and not (self.UNOROUTER_ENABLED and self.UNOROUTER_API_KEY):
+            warnings.append("No LLM provider available: Groq disabled and UnoRouter not configured. Agents will use cached/deterministic fallbacks.")
         if not self.OPENROUTER_API_KEY:
-            warnings.append("OPENROUTER_API_KEY is not set. Risk agent will be disabled.")
+            warnings.append("OPENROUTER_API_KEY is not set. OpenRouter will be unavailable (optional provider).")
+        if self.OPENROUTER_API_KEY and not self.OPENROUTER_MODEL:
+            warnings.append("OPENROUTER_API_KEY is set but OPENROUTER_MODEL is not; OpenRouter is not routed to any task.")
+        if not self.NVIDIA_API_KEY:
+            warnings.append("NVIDIA_API_KEY is not set. NVIDIA LLM provider is not configured (optional).")
+        if self.FUNDAMENTALS_PROVIDER == "none":
+            warnings.append("No fundamentals provider configured (FUNDAMENTALS_PROVIDER=none); fundamentals analysis will report DATA_UNAVAILABLE.")
+        if self.FUNDAMENTALS_PROVIDER == "alphavantage" and not self.ALPHAVANTAGE_API_KEY:
+            warnings.append("FUNDAMENTALS_PROVIDER=alphavantage but ALPHAVANTAGE_API_KEY is not set; fundamentals data will be unavailable.")
+        if self.FUNDAMENTALS_PROVIDER == "fmp" and not self.FMP_API_KEY:
+            warnings.append("FUNDAMENTALS_PROVIDER=fmp but FMP_API_KEY is not set; fundamentals data will be unavailable.")
+        if self.FUNDAMENTALS_CROSS_VALIDATION and not self.FUNDAMENTALS_FALLBACK_PROVIDER:
+            warnings.append("FUNDAMENTALS_CROSS_VALIDATION=true but FUNDAMENTALS_FALLBACK_PROVIDER is not set; cross-validation needs a second provider and is inactive.")
         return warnings
 
 

@@ -1,105 +1,143 @@
 """
 agents/news_agent.py
 
-Sentiment/News Agent powered by Google Gemini (gemini-2.5-flash).
-Analyzes market news headlines for a given ticker and returns a
-structured sentiment assessment used by the CIO agent.
+News Agent V2 — a thin adapter over the persistent News Intelligence
+System (services/news_intelligence.py). The EXPENSIVE work (fetching,
+normalizing, deduplicating, relevance-filtering and LLM analysis) happens
+in the independent News Worker on its own schedule; this agent only READS
+the cached intelligence and shapes it into the report the pipeline expects.
+
+Consequences:
+  * a trading cycle NEVER waits on UnoRouter, Groq or the Alpaca News API
+  * the same article is NEVER analyzed twice (persistent fingerprints)
+  * fresh intelligence is used as-is; stale intelligence is used but marked
+    is_stale=true; when no intelligence exists the deterministic fallback
+    applies (reduced confidence, source "deterministic_fallback")
+  * an LLM is never called from this agent's cycle path
+
+Report semantics (unchanged from V1): NEUTRAL sentiment only ever means a
+genuine directionally-neutral read. A missing/failed news source yields
+UNAVAILABLE with null sentiment and null confidence — never a fake NEUTRAL.
 """
 
-import json
 import logging
-import re
 
 from config import settings
+from services import llm_service, news_intelligence
 
 logger = logging.getLogger("news_agent")
 
-SYSTEM_INSTRUCTIONS = """You are a financial news sentiment analyst.
-You will be given a stock ticker and a list of recent news headlines.
-Analyze the overall sentiment and its likely short-term impact on the stock price.
-
-Respond ONLY with a single valid JSON object, no markdown fences, no preamble, in this exact shape:
-{
-  "sentiment": "BULLISH" | "BEARISH" | "NEUTRAL",
-  "confidence": <float 0.0 to 1.0>,
-  "summary": "<one to two sentence explanation>",
-  "key_headline": "<the single most impactful headline, or empty string if none provided>"
-}
-"""
+# Retained for backwards compatibility with tests/direct callers (the
+# analysis prompt now lives in news_intelligence._ANALYSIS_INSTRUCTIONS).
+SYSTEM_INSTRUCTIONS = news_intelligence._ANALYSIS_INSTRUCTIONS
 
 
 def _extract_json(text: str) -> dict:
-    """Best-effort extraction of a JSON object from a model response,
-    tolerating stray markdown fences or extra text around the JSON."""
-    text = text.strip()
-    text = re.sub(r"^```(json)?", "", text).strip()
-    text = re.sub(r"```$", "", text).strip()
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if not match:
-        raise ValueError("No JSON object found in model response.")
-    return json.loads(match.group(0))
+    """Tolerant JSON extraction — kept for local use/testing."""
+    return llm_service.extract_json(text)
 
 
-def analyze_news(symbol: str, headlines: list) -> dict:
-    """
-    Args:
-        symbol: ticker symbol, e.g. "AAPL"
-        headlines: list of recent headline strings for this ticker
+def reset_news_analysis_cache() -> None:
+    """Test/introspection hook (the intelligence cache lives in SQLite)."""
+    news_intelligence.init_db()
+
+
+def analyze_news(symbol: str, headlines: list = None) -> dict:
+    """Builds the news report for one symbol from the persistent News
+    Intelligence cache. `headlines` is accepted for signature compatibility
+    with the V1 pipeline; the intelligence record is the source of truth.
 
     Returns a dict:
         {
           "agent": "news",
           "symbol": symbol,
-          "sentiment": "BULLISH"/"BEARISH"/"NEUTRAL",
-          "confidence": float,
+          "evidence_status": "AVAILABLE"|"UNAVAILABLE",
+          "sentiment": "BULLISH"/"BEARISH"/"NEUTRAL" | None,
+          "confidence": float | None,
           "summary": str,
           "key_headline": str,
-          "error": str | None
+          "importance": "HIGH"|"MEDIUM"|"LOW"|None,
+          "impact_horizon": "SHORT_TERM"|"LONG_TERM"|None,
+          "event_risk": bool, "event_type": str|None,
+          "event_risk_level": str|None,
+          "headline_count": int, "new_headline_count": int,
+          "is_stale": bool, "cache_age_minutes": float|None,
+          "error": str | null,
+          "provider": str, "model": str, "llm_status": str,
+          "latency_ms": float | null, "cached": bool
         }
     """
+    intel = news_intelligence.get_cached_news_intelligence(symbol)
+
+    route = llm_service.route_info("news")
+    source = str(intel.get("source") or "")
+    provider = source if source else route["provider"]
+    model = intel.get("model")
+
     base_result = {
         "agent": "news",
         "symbol": symbol,
-        "sentiment": "NEUTRAL",
-        "confidence": 0.0,
+        "evidence_status": None,
+        "sentiment": None,
+        "confidence": None,
         "summary": "",
-        "key_headline": "",
+        "key_headline": intel.get("key_headline") or "",
+        "importance": intel.get("importance"),
+        "impact_horizon": intel.get("impact_horizon"),
+        "event_risk": bool(intel.get("event_risk")),
+        "event_type": intel.get("event_type"),
+        "event_risk_level": intel.get("event_risk_level"),
+        "headline_count": int(intel.get("headline_count") or 0),
+        "new_headline_count": int(intel.get("new_headline_count") or 0),
+        "is_stale": bool(intel.get("is_stale")),
+        "cache_age_minutes": intel.get("cache_age_minutes"),
         "error": None,
+        "provider": provider,
+        "model": model,
+        "llm_status": "OK",
+        "latency_ms": 0.0,
+        "cached": True,
     }
 
-    if not settings.GEMINI_API_KEY:
-        base_result["error"] = "GEMINI_API_KEY not configured."
-        base_result["summary"] = "News agent disabled: missing API key."
-        return base_result
+    has_intelligence = (
+        intel.get("last_updated") is not None
+        and (intel.get("sentiment") is not None or int(intel.get("headline_count") or 0) > 0)
+    )
 
-    if not headlines:
-        base_result["summary"] = "No recent headlines available for this symbol."
-        return base_result
-
-    try:
-        from google import genai
-
-        client = genai.Client(api_key=settings.GEMINI_API_KEY)
-
-        headlines_block = "\n".join(f"- {h}" for h in headlines[:15])
-        prompt = f"{SYSTEM_INSTRUCTIONS}\n\nTicker: {symbol}\nHeadlines:\n{headlines_block}"
-
-        response = client.models.generate_content(
-            model=settings.GEMINI_MODEL,
-            contents=prompt,
+    if not has_intelligence:
+        # Nothing cached yet (worker has not run / no news ever fetched).
+        base_result["llm_status"] = "SKIPPED_NO_DATA"
+        base_result["evidence_status"] = "UNAVAILABLE"
+        base_result["confidence"] = None
+        base_result["sentiment"] = None
+        base_result["summary"] = (
+            "No news intelligence cached yet — no news verdict "
+            "(the news worker fills this cache on its own schedule)."
         )
-
-        raw_text = response.text or ""
-        parsed = _extract_json(raw_text)
-
-        base_result["sentiment"] = str(parsed.get("sentiment", "NEUTRAL")).upper()
-        base_result["confidence"] = float(parsed.get("confidence", 0.0))
-        base_result["summary"] = str(parsed.get("summary", ""))
-        base_result["key_headline"] = str(parsed.get("key_headline", ""))
+        base_result["provider"] = route["provider"]
         return base_result
 
-    except Exception as e:
-        logger.error(f"News agent failed for {symbol}: {e}")
-        base_result["error"] = str(e)
-        base_result["summary"] = "News agent encountered an error; defaulting to NEUTRAL."
-        return base_result
+    # Fresh or stale cached intelligence: used as-is (stale is marked).
+    sentiment = intel.get("sentiment")
+    base_result["sentiment"] = sentiment if sentiment in ("BULLISH", "BEARISH", "NEUTRAL") else None
+    base_result["confidence"] = intel.get("confidence")
+    base_result["summary"] = intel.get("summary") or ""
+    base_result["evidence_status"] = "AVAILABLE"
+
+    if source and "deterministic_fallback" in source:
+        # Honest labeling: a crude keyword read (in whole or in part), never
+        # presented as advanced AI reasoning.
+        base_result["llm_status"] = "DETERMINISTIC_FALLBACK"
+    elif intel.get("is_stale"):
+        base_result["llm_status"] = "STALE_CACHE"
+    else:
+        base_result["llm_status"] = "OK"
+
+    if base_result["is_stale"]:
+        base_result["summary"] = (
+            (base_result["summary"] + " " if base_result["summary"] else "")
+            + f"[News intelligence {intel.get('cache_age_minutes')} minutes old — "
+              f"marked stale, used with reduced confidence.]"
+        ).strip()
+
+    return base_result

@@ -1,28 +1,44 @@
 """
 agents/fundamentals_agent.py
 
-Fundamentals Analyst -- adapted from TradingAgents' fundamentals analyst
-role. Pulls basic company financials via yfinance (free, no API key)
-and has an LLM (Gemini, same free tier already used by news_agent)
-interpret them into a directional signal for the CIO.
+Fundamentals Analyst. Consumes the NORMALIZED fundamentals from the
+FundamentalsProvider abstraction (services/fundamentals_service.py) and has
+an LLM interpret them into a directional signal for the CIO.
+
+yfinance is gone: no Yahoo scraping, no cookies/crumbs, no unofficial
+endpoints, and no trading decision depends on Yahoo being available. When
+no fundamentals provider is configured (FUNDAMENTALS_PROVIDER=none, the
+default) the agent returns an explicit DATA_UNAVAILABLE result and the
+cycle continues on price data, technicals, news and risk.
+
+Provider/model for the interpretation: routed via services/llm_service.py
+(LLM_FUNDAMENTALS_PROVIDER, default Gemini / GEMINI_MODEL).
+
+LLM-call reduction: the interpretation is cached per (symbol, exact
+metrics); unchanged metrics are never re-sent (labeled "cached": true).
 """
 
+import hashlib
 import json
 import logging
-import re
+import time
 
 from config import settings
+from services import llm_service
 
 logger = logging.getLogger("fundamentals_agent")
 
 SYSTEM_INSTRUCTIONS = """You are a fundamentals analyst for equities.
-You will be given basic financial metrics for a company: P/E ratio,
-revenue growth, profit margins, and debt-to-equity ratio.
+You will be given the fundamental metrics available for a company (any
+metric may be missing/unavailable — treat missing data as unknown, never
+as zero): P/E ratio, EPS, revenue, profit margin, return on equity, and
+debt-to-equity ratio, plus market capitalization for scale.
 
 Judge whether the company's fundamentals support a bullish, bearish, or
 neutral medium-term outlook. High debt with weak revenue growth is a
 bearish signal. Strong revenue growth with reasonable valuation is bullish.
-An extremely high P/E with slowing growth is a caution flag.
+An extremely high P/E with slowing growth is a caution flag. If most
+metrics are unavailable, say so and lean NEUTRAL rather than guessing.
 
 Respond ONLY with a single valid JSON object, no markdown fences, no preamble:
 {
@@ -34,108 +50,166 @@ Respond ONLY with a single valid JSON object, no markdown fences, no preamble:
 
 
 def _extract_json(text: str) -> dict:
-    text = text.strip()
-    text = re.sub(r"^```(json)?", "", text).strip()
-    text = re.sub(r"```$", "", text).strip()
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if not match:
-        raise ValueError("No JSON object found in model response.")
-    return json.loads(match.group(0))
+    """Tolerant JSON extraction — kept for local use/testing; the live path
+    parses through services.llm_service (same logic)."""
+    return llm_service.extract_json(text)
 
 
-def get_fundamentals(symbol: str) -> dict:
-    """Fetches basic fundamentals via yfinance. Free, no API key required."""
-    try:
-        import yfinance as yf
+# (symbol, metrics_hash) -> (expires_at_monotonic, report_fields, stored_at)
+_analysis_cache: dict = {}
 
-        ticker = yf.Ticker(symbol)
-        info = ticker.info or {}
 
-        return {
-            "symbol": symbol,
-            "pe_ratio": info.get("trailingPE"),
-            "forward_pe": info.get("forwardPE"),
-            "revenue_growth": info.get("revenueGrowth"),
-            "profit_margin": info.get("profitMargins"),
-            "debt_to_equity": info.get("debtToEquity"),
-            "return_on_equity": info.get("returnOnEquity"),
-            "error": None,
-        }
-    except Exception as e:
-        logger.error(f"get_fundamentals failed for {symbol}: {e}")
-        return {"symbol": symbol, "error": str(e)}
+def reset_fundamentals_cache() -> None:
+    """Test/introspection hook: clears the LLM analysis cache."""
+    _analysis_cache.clear()
+
+
+def _is_unavailable(fundamentals: dict) -> bool:
+    """True when the normalized fundamentals payload says the data is not
+    available (handles both the new normalized shape and the legacy
+    {"error": ...} shape used by older tests)."""
+    if not fundamentals:
+        return True
+    if fundamentals.get("error"):
+        return True
+    status = fundamentals.get("status")
+    if status and status != "OK":
+        return True
+    return False
 
 
 def analyze_fundamentals(symbol: str, fundamentals: dict) -> dict:
     """
     Args:
         symbol: ticker symbol
-        fundamentals: output of get_fundamentals()
+        fundamentals: normalized output of fundamentals_service.get_fundamentals()
 
     Returns:
         {
           "agent": "fundamentals",
           "symbol": symbol,
-          "signal": "BULLISH"/"BEARISH"/"NEUTRAL",
-          "confidence": float,
+          "evidence_status": "AVAILABLE"|"UNAVAILABLE"|"ERROR",
+          "signal": "BULLISH"/"BEARISH"/"NEUTRAL" | None (None unless AVAILABLE),
+          "confidence": float | None,
           "summary": str,
-          "error": str | None
+          "error": str | None,
+          "provider": str, "model": str, "llm_status": str,
+          "latency_ms": float | null, "cached": bool
         }
+
+    NEUTRAL is only ever a verdict on successfully analyzed data; an
+    unavailable provider yields UNAVAILABLE with null signal/confidence
+    (never a fake NEUTRAL), and an LLM failure yields ERROR.
     """
+    route = llm_service.route_info("fundamentals")
     base_result = {
         "agent": "fundamentals",
         "symbol": symbol,
-        "signal": "NEUTRAL",
-        "confidence": 0.0,
+        "evidence_status": None,
+        "signal": None,
+        "confidence": None,
         "summary": "",
         "error": None,
+        "provider": route["provider"],
+        "model": route["model"],
+        "llm_status": "NOT_CONFIGURED",
+        "latency_ms": None,
+        "cached": False,
     }
 
     if not settings.ENABLE_FUNDAMENTALS_AGENT:
+        base_result["llm_status"] = "SKIPPED_DISABLED"
+        base_result["evidence_status"] = "OFF"  # disabled by configuration, not a failure
         base_result["summary"] = "Fundamentals agent disabled via config."
         return base_result
 
-    if fundamentals.get("error"):
-        base_result["error"] = fundamentals["error"]
-        base_result["summary"] = "No usable fundamentals data available."
-        return base_result
-
-    if not settings.GEMINI_API_KEY:
-        base_result["error"] = "GEMINI_API_KEY not configured."
-        base_result["summary"] = "Fundamentals agent disabled: missing API key."
-        return base_result
-
-    try:
-        from google import genai
-
-        client = genai.Client(api_key=settings.GEMINI_API_KEY)
-
-        metrics_text = (
-            f"Symbol: {symbol}\n"
-            f"P/E ratio: {fundamentals.get('pe_ratio')}\n"
-            f"Forward P/E: {fundamentals.get('forward_pe')}\n"
-            f"Revenue growth (YoY): {fundamentals.get('revenue_growth')}\n"
-            f"Profit margin: {fundamentals.get('profit_margin')}\n"
-            f"Debt-to-equity: {fundamentals.get('debt_to_equity')}\n"
-            f"Return on equity: {fundamentals.get('return_on_equity')}\n"
+    if _is_unavailable(fundamentals):
+        base_result["llm_status"] = "SKIPPED_NO_DATA"
+        reason = (
+            fundamentals.get("reason")
+            or fundamentals.get("error")
+            or f"status={fundamentals.get('status', 'MISSING')}"
         )
-        prompt = f"{SYSTEM_INSTRUCTIONS}\n\n{metrics_text}"
-
-        response = client.models.generate_content(
-            model=settings.GEMINI_MODEL,
-            contents=prompt,
+        # FUNDAMENTALS_PROVIDER=none is off-by-configuration (acceptable,
+        # does not degrade evidence quality); a configured provider that
+        # failed is genuinely UNAVAILABLE evidence.
+        base_result["evidence_status"] = (
+            "OFF" if reason == "NO_PROVIDER_CONFIGURED" else "UNAVAILABLE"
         )
-
-        raw_text = response.text or ""
-        parsed = _extract_json(raw_text)
-
-        base_result["signal"] = str(parsed.get("signal", "NEUTRAL")).upper()
-        base_result["confidence"] = float(parsed.get("confidence", 0.0))
-        base_result["summary"] = str(parsed.get("summary", ""))
+        base_result["error"] = f"DATA_UNAVAILABLE: {reason}"
+        base_result["summary"] = "No usable fundamentals data available — no fundamentals verdict."
         return base_result
 
-    except Exception as e:
-        logger.error(f"Fundamentals agent failed for {symbol}: {e}")
-        base_result["error"] = str(e)
-        base_result["summary"] = "Fundamentals agent encountered an error; defaulting to NEUTRAL."
+    # 1. Reuse the previous LLM interpretation while the exact metrics are
+    # unchanged — fundamentals change at most daily. The cache key hashes
+    # ONLY the metric values the LLM actually sees (never the result's
+    # timestamp / provenance / evidence block, which change on every
+    # retrieval while the values stay identical).
+    _key_fields = {f: fundamentals.get(f) for f in (
+        "market_cap", "pe_ratio", "eps", "revenue",
+        "profit_margin", "roe", "debt_to_equity")}
+    _key_fields["provider"] = fundamentals.get("provider")
+    metrics_payload = json.dumps(_key_fields, sort_keys=True, default=str)
+    key = (symbol, hashlib.sha1(metrics_payload.encode("utf-8")).hexdigest())
+    ttl = max(0.0, float(settings.FUNDAMENTALS_ANALYSIS_CACHE_TTL_MINUTES) * 60.0)
+    cached = _analysis_cache.get(key)
+    if cached and cached[0] > time.monotonic():
+        report = dict(cached[1])
+        report["cached"] = True
+        return report
+
+    # 2. Build the evidence text from PRESENT fields only; unavailable
+    # metrics are labeled as such — never fabricated, never defaulted.
+    def _fmt(label, value, fmt="{}"):
+        return f"{label}: " + (fmt.format(value) if value is not None else "not available")
+
+    metrics_text = (
+        f"Symbol: {symbol}\n"
+        f"Data provider: {fundamentals.get('provider', 'unknown')}\n"
+        + "\n".join([
+            _fmt("Market cap", fundamentals.get("market_cap"), "{:,.0f}"),
+            _fmt("P/E ratio", fundamentals.get("pe_ratio")),
+            _fmt("EPS", fundamentals.get("eps")),
+            _fmt("Revenue", fundamentals.get("revenue"), "{:,.0f}"),
+            _fmt("Profit margin", fundamentals.get("profit_margin")),
+            _fmt("Return on equity", fundamentals.get("roe")),
+            _fmt("Debt-to-equity", fundamentals.get("debt_to_equity")),
+        ])
+        + "\n"
+    )
+
+    result = llm_service.call_json(
+        "fundamentals",
+        system=SYSTEM_INSTRUCTIONS,
+        user=metrics_text,
+        temperature=0.2,
+        max_tokens=400,
+        symbol=symbol,
+        reason="fundamentals_interpretation",)
+
+    base_result["llm_status"] = result.status
+    base_result["model"] = result.model
+    base_result["latency_ms"] = result.latency_ms
+
+    if not result.ok:
+        logger.error(f"Fundamentals agent failed for {symbol}: {result.error}")
+        from services.evidence import state_for_llm_status
+        base_result["evidence_status"] = state_for_llm_status(result.status)
+        base_result["error"] = result.error
+        base_result["summary"] = (
+            "Fundamentals agent disabled: missing API key — no fundamentals verdict."
+            if result.status == "NOT_CONFIGURED"
+            else "Fundamentals agent encountered an error — no fundamentals verdict."
+        )
         return base_result
+
+    parsed = result.parsed
+    base_result["evidence_status"] = "AVAILABLE"
+    base_result["signal"] = str(parsed.get("signal", "NEUTRAL")).upper()
+    base_result["confidence"] = float(parsed.get("confidence", 0.0))
+    base_result["summary"] = str(parsed.get("summary", ""))
+
+    if ttl > 0:
+        stored = dict(base_result)
+        _analysis_cache[key] = (time.monotonic() + ttl, stored, time.monotonic())
+    return base_result
