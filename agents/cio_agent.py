@@ -83,12 +83,15 @@ def _extract_json(text: str) -> dict:
 def _stable_view(report):
     """A prompt-stable view of an agent report: identical decisions must
     produce identical prompts so the LLM response cache can serve them.
-    Drops display-only volatile fields (latency/cache age); the full report
-    still goes to logs/API unchanged."""
+    Drops display-only volatile fields (latency/cache age/report timestamps);
+    the full report still goes to logs/API unchanged. A ticking `timestamp`
+    (seconds granularity) would change the prompt between identical cycles,
+    defeat the LLM response cache, and cause duplicate real provider calls."""
     if not isinstance(report, dict):
         return report
     return {k: v for k, v in report.items()
-            if k not in ("latency_ms", "cache_age_minutes")}
+            if k not in ("latency_ms", "cache_age_minutes", "timestamp",
+                         "duration_ms")}
 
 
 def make_decision(symbol: str, news_report: dict, tech_report: dict, risk_report: dict,

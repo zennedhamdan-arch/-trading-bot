@@ -72,7 +72,9 @@ settings.LLM_RISK_PROVIDER = "groq"
 settings.LLM_CIO_PROVIDER = "groq"
 settings.LLM_DEBATE_PROVIDER = "groq"
 settings.LLM_NEWS_PROVIDER = "gemini"
-settings.TECH_LLM_INTERPRETATION_ENABLED = False
+settings.TECH_LLM_INTERPRETATION_ENABLED = True   # debate needs a verifiable
+# technical confidence (DEBATE_MIN_TECH_CONFIDENCE); the deterministic engine
+# emits none, which now correctly makes debate NOT eligible (fail-closed)
 settings.ENABLE_DEBATE = True
 settings.DEBATE_REQUIRE_CONFLICT = False          # debate runs in these tests
 settings.DEBATE_MIN_TECH_CONFIDENCE = 0.65
@@ -137,12 +139,18 @@ class _Completion:
         self.choices = [_Choice(content)]
 
 
+TECH_LLM = {"signal": "BULLISH", "confidence": 0.82,
+            "summary": "Trend up: above SMA50/SMA200, MACD above signal."}
+
+
 class _Completions:
     def __init__(self):
         self.calls = []
     def create(self, **kwargs):
         self.calls.append(kwargs)
         sys_prompt = str(kwargs.get("messages", [{}])[0].get("content", ""))
+        if "technical analysis expert" in sys_prompt:
+            return _Completion(json.dumps(TECH_LLM))
         if "bull vs. bear debate" in sys_prompt:
             if "debate" in FAIL_NEXT:
                 raise FAIL_NEXT.pop("debate")
@@ -419,14 +427,25 @@ check("4a. held position gets risk MONITORING with no setup",
 check("4b. monitoring records exposure facts (not a proposed order)",
       rd["data"]["position_exposure"]["monitoring_only"] is True
       and rd["data"]["proposed_order_exposure"] is None)
+check("4b2. monitoring is deterministic (no LLM call, not a rejected trade)",
+      rd["data"]["llm_status"] == "SKIPPED_DETERMINISTIC"
+      and rd["data"]["provider"] == "deterministic"
+      and "approved" not in rd["data"]
+      and "max_notional_usd" not in rd["data"]
+      and rd["data"]["position_facts"]["qty"] == 10
+      and rd["data"]["position_facts"]["avg_entry_price"] == 100.0
+      and rd["data"]["market_data_freshness"]["status"] == "FRESH")
+check("4b3. no-setup downstream stages carry the reason (not generic SKIPPED)",
+      stD["news"] == "SKIPPED_NO_SETUP" and stD["debate"] == "SKIPPED_NO_SETUP"
+      and recD["agent_status"]["AAPL"]["execution"] == "SKIPPED_NO_SETUP")
 check("4c. monitoring is analysis, never execution (no order)",
-      tcD.submitted == [] and stD["execution"] == "SKIPPED")
+      tcD.submitted == [] and stD["execution"] == "SKIPPED_NO_SETUP")
 check("4d. no-setup decision is the deterministic HOLD",
       stD["cio"] == "SKIPPED"
       and "No technical setup" in _last("cio", "AAPL", recD["started_at"])["data"]["reasoning"])
 ms = _last("risk", "MSFT", recD["started_at"])
 check("4e. symbols WITHOUT a position are not monitored (honest skip)",
-      ms is None and recD["agent_status"]["MSFT"]["risk"] == "SKIPPED")
+      ms is None and recD["agent_status"]["MSFT"]["risk"] == "SKIPPED_NO_SETUP")
 
 print("\n== position-size semantics ==")
 

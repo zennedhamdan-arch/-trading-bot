@@ -139,7 +139,11 @@
       return d.approved ? v("APPROVED", "bull", null) : d.approved === false ? v("REJECTED", "bear", null) : v(d.risk_level || "—", "neutral", null);
     }
     if (a === "debate") {
-      if (evidenceStateOf(log) === "ERROR") return v("ERROR", "none", null);
+      var dbState = evidenceStateOf(log);
+      if (dbState === "ERROR") return v("ERROR", "none", null);
+      // A RECORDED skip is a skip — never dressed up as a debate verdict.
+      if (dbState === "OFF" || String(d.llm_status || "").indexOf("SKIPPED_") === 0)
+        return v("OFF", "none", null);
       var cons = String(d.consensus || "").toUpperCase();
       if (cons === "INSUFFICIENT_EVIDENCE") return v("INSUFFICIENT", "none", d.confidence != null ? d.confidence : null);
       if (cons === "BULLISH") return v("BULLISH", "bull", d.confidence != null ? d.confidence : Math.max(d.bull_strength || 0, 0.5));
@@ -360,6 +364,16 @@
       return stateHTML({ icon: "scale", title: "No debate recorded", msg: "The bull/bear debate either did not run for this decision or is disabled in configuration." });
     }
     var d = debateLog.data;
+    // A recorded skip explains itself — it is never shown as "no record"
+    // (which would imply the event is missing) and never as a debate verdict.
+    if (d.evidence_status === "OFF" || String(d.llm_status || "").indexOf("SKIPPED_") === 0) {
+      return stateHTML({
+        icon: "scale",
+        title: "Debate skipped",
+        msg: U.esc(d.skip_reason || d.reasoning || "Debate eligibility conditions were not met."),
+        compact: false,
+      });
+    }
     var bull = Math.round((d.bull_strength || 0) * 100);
     var bear = Math.round((d.bear_strength || 0) * 100);
     var edge = d.edge || 0;
@@ -680,6 +694,7 @@
     pipelineHTML: pipelineHTML,
     pipelineStages: PIPELINE_STAGES,
     debateHTML: debateHTML,
+    debateDetailHTML: debateDetailHTML,
     feedItemHTML: feedItemHTML,
     positionsTableHTML: positionsTableHTML,
     ordersTableHTML: ordersTableHTML,

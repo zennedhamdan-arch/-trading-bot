@@ -96,13 +96,41 @@ check("overview: live market strip present", /Live Market/.test(overviewHTML));
 check("overview: live prices rendered (AAPL)", /175\.25/.test(overviewHTML));
 check("overview: ticks-never-trigger-AI note", /never trigger AI/.test(overviewHTML));
 
-// --- AI page: debate card with structured consensus + uncertainty ------------
+// --- risk verdicts: MONITORING is never REJECTED -----------------------------
+(function () {
+  var mk = function (agent, data) { return { agent: agent, level: "INFO", timestamp: "2026-10-25T14:00:00Z", symbol: "NVDA", data: data }; };
+  var vm = w.C.verdictOf(mk("risk", { risk_status: "MONITORING", risk_score: 31, risk_level: "LOW" }));
+  check("verdictOf: monitoring risk event -> MONITORING (not REJECTED)", vm && vm.label === "MONITORING");
+  var vr = w.C.verdictOf(mk("risk", { approved: false, risk_status: "VETOED", risk_level: "HIGH" }));
+  check("verdictOf: vetoed proposed trade -> REJECTED", vr && vr.label === "REJECTED");
+  var vs = w.C.verdictOf(mk("debate", { skip_reason: "technical confidence unavailable", llm_status: "SKIPPED_DEBATE_NOT_ELIGIBLE", evidence_status: "OFF" }));
+  check("verdictOf: debate not-eligible skip is OFF, never FAILED", vs && vs.label === "OFF");
+})();
+
+// --- AI page: newest decision shows the debate SKIP honestly -----------------
 w.App.renderPage("ai", {});
 const aiDebateHTML = doc.querySelector("#page").innerHTML;
-check("ai: debate consensus + confidence rendered", /Consensus/.test(aiDebateHTML) && /confidence/.test(aiDebateHTML));
-check("ai: debate unresolved uncertainty + evidence lists rendered",
-      /Unresolved uncertainty/.test(aiDebateHTML) && /Supporting evidence/.test(aiDebateHTML) && /Contradicting evidence/.test(aiDebateHTML));
-check("ai: debate data sources with honest states", /Data sources:/.test(aiDebateHTML) && /fundamentals=AVAILABLE/.test(aiDebateHTML));
+check("ai: debate skip reason rendered (never 'no record', never a verdict)",
+      /Debate skipped/.test(aiDebateHTML) && /high-confidence requirement cannot be verified/.test(aiDebateHTML));
+
+// --- structured debate card: a decision where the debate DID run -------------
+// (the AAPL CIO event from cycle 1842 — its window contains the full debate)
+(function () {
+  var logs = (w.App.store.data.logs && w.App.store.data.logs.logs) || [];
+  var cio = null;
+  // logs are newest-first: the LAST MSFT cio is the cycle-1842 decision whose
+  // window contains the full structured debate (MSFT has no cycle-1843
+  // events, so the window cannot be polluted by the newer skip event)
+  logs.forEach(function (l) { if (l.agent === "cio" && l.symbol === "MSFT") cio = l; });
+  w.App.openDecisionDrawer(cio.timestamp, "cio");
+  var dhtml = doc.querySelector("#drawer-root").innerHTML;
+  check("decision drawer (debate ran): consensus + confidence rendered",
+        /Consensus/.test(dhtml) && /confidence/.test(dhtml));
+  check("decision drawer (debate ran): unresolved uncertainty + evidence lists",
+        /Unresolved uncertainty/.test(dhtml) && /Supporting evidence/.test(dhtml) && /Contradicting evidence/.test(dhtml));
+  check("decision drawer (debate ran): data sources with honest states",
+        /Data sources:/.test(dhtml) && /fundamentals=AVAILABLE/.test(dhtml));
+})();
 
 // --- health page: startup table + circuits + cards ---------------------------
 w.App.renderPage("health", {});
@@ -138,6 +166,22 @@ check("cycle drawer opens", drawerHTML.length > 500);
 check("drawer: agent execution matrix", /Agent Execution \(per symbol\)/.test(drawerHTML));
 check("drawer: agent results chips (ok/attempted)", /Agent Results \(ok \/ attempted\)/.test(drawerHTML));
 check("drawer: agent chip values (Technical 5/5)", /Technical 5\/5/.test(drawerHTML));
+// --- cycle 1843 drawer: conditional pipeline statuses ------------------------
+w.App.openCycleDrawer(1843);
+const drawer1843 = doc.querySelector("#drawer-root").innerHTML;
+check("drawer 1843: NO SETUP skip reason shown (not a failure)",
+      /NO SETUP/.test(drawer1843) && /title="No technical setup[^"]*"/.test(drawer1843));
+check("drawer 1843: MONITORING distinguishable from REJECTED",
+      /MONITOR/.test(drawer1843) && /title="Existing position monitored[^"]*"/.test(drawer1843));
+check("drawer 1843: debate NOT ELIGIBLE with reason",
+      /NOT ELIG/.test(drawer1843) && /title="Debate eligibility not met[^"]*"/.test(drawer1843));
+check("drawer 1843: skipped stages never render as ERROR", !/badge-error">\s*NO SETUP/.test(drawer1843));
+check("drawer 1843: monitoring not counted as an order", /Risk 3\/5/.test(drawer1843));
+w.App.openCycleDrawer(1842);
+const drawer1842b = doc.querySelector("#drawer-root").innerHTML;
+check("historical drawer 1842 still renders (NO SETUP did not break it)",
+      /Agent Execution \(per symbol\)/.test(drawer1842b) && /Technical 5\/5/.test(drawer1842b));
+
 check("drawer: fundamentals chip 0/5 (no provider)", /Fundamentals 0\/5/.test(drawerHTML));
 check("drawer: LLM calls table", /LLM Calls \(per provider\)/.test(drawerHTML));
 check("drawer: provider state chips", /groq: READY/.test(drawerHTML) && /nvidia: NOT_CONFIGURED/.test(drawerHTML));

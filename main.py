@@ -236,7 +236,14 @@ def _debate_eligible(tech_report: dict, news_report: dict) -> tuple:
     if not settings.ENABLE_DEBATE:
         return False, "disabled (DEBATE_AGENT_ENABLED=false)"
     conf = tech_report.get("confidence") if tech_report else None
-    if conf is not None and float(conf) < float(settings.DEBATE_MIN_TECH_CONFIDENCE):
+    if conf is None:
+        # Fail closed: the deterministic technical engine emits no confidence,
+        # so the documented "high-confidence technical read" requirement
+        # cannot be verified — debate must not be forced to run.
+        return False, ("technical confidence unavailable (deterministic engine "
+                       "emits no confidence) — the high-confidence requirement "
+                       "cannot be verified")
+    if float(conf) < float(settings.DEBATE_MIN_TECH_CONFIDENCE):
         return False, f"technical confidence {conf} < {settings.DEBATE_MIN_TECH_CONFIDENCE}"
     if settings.DEBATE_REQUIRE_CONFLICT:
         tech_signal = str((tech_report or {}).get("signal") or "").upper()
@@ -503,16 +510,19 @@ async def _run_trading_cycle_inner(triggered_by: str = "scheduler") -> dict:
                 # order-eligibility rules).
                 held_position = positions_by_symbol.get(symbol)
                 if held_position:
+                    # Deterministic monitoring ONLY (risk_agent.monitor_position
+                    # makes no LLM call): routine oversight of held positions
+                    # must not add per-symbol, per-cycle provider requests.
                     _t0 = time.monotonic()
-                    monitor_report = risk_agent.assess_risk(
-                        symbol, None, account_summary, held_position,
+                    monitor_report = risk_agent.monitor_position(
+                        symbol, account_summary, held_position,
                         indicators, evidence=evidence,
                     )
                     # Duration is metadata, NOT evidence: it never enters the
                     # report that downstream prompts are built from (a timing
                     # jitter would change cache keys and defeat replay).
                     _monitor_ms = int((time.monotonic() - _t0) * 1000)
-                    status["risk"] = _stage_status(monitor_report)
+                    status["risk"] = "MONITORING"
                     if monitor_report.get("error"):
                         _add_error(monitor_report.get("provider", "llm"),
                                    _llm_error_type(monitor_report.get("llm_status")),
@@ -523,6 +533,15 @@ async def _run_trading_cycle_inner(triggered_by: str = "scheduler") -> dict:
                         "message": monitor_report["reasoning"],
                         "data": {**monitor_report, "duration_ms": _monitor_ms},
                     })
+                else:
+                    status["risk"] = "SKIPPED_NO_SETUP"
+                # Conditional pipeline, honestly recorded: every downstream
+                # stage that did not run carries the REASON (no setup), so the
+                # dashboard never shows these as failures or silent holes.
+                status["news"] = "SKIPPED_NO_SETUP"
+                status["fundamentals"] = "SKIPPED_NO_SETUP"
+                status["debate"] = "SKIPPED_NO_SETUP"
+                status["execution"] = "SKIPPED_NO_SETUP"
                 # The no-setup HOLD is a real (deterministic) CIO decision:
                 # persisted to the live buffer like every other outcome.
                 _log_event({
@@ -649,7 +668,7 @@ async def _run_trading_cycle_inner(triggered_by: str = "scheduler") -> dict:
                                 "data": {**debate_report, "duration_ms": _debate_ms}})
                 else:
                     logger.info(f"Debate skipped for {symbol}: {debate_reason}")
-                    status["debate"] = "SKIPPED"
+                    status["debate"] = "SKIPPED_DEBATE_NOT_ELIGIBLE"
                     _log_event({
                         "agent": "debate", "symbol": symbol, "level": "INFO",
                         "message": f"Debate skipped: {debate_reason}",
@@ -659,7 +678,7 @@ async def _run_trading_cycle_inner(triggered_by: str = "scheduler") -> dict:
                             "skip_reason": debate_reason,
                             "provider": "deterministic",
                             "model": "eligibility-gate",
-                            "llm_status": "SKIPPED_INELIGIBLE",
+                            "llm_status": "SKIPPED_DEBATE_NOT_ELIGIBLE",
                             "duration_ms": 0,   # deterministic gate, no LLM call
                             "latency_ms": None,
                             "bull_strength": 0.0, "bear_strength": 0.0, "edge": 0.0,
@@ -864,6 +883,10 @@ async def _run_trading_cycle_inner(triggered_by: str = "scheduler") -> dict:
             decision_report.setdefault(
                 "duration_ms", int((time.monotonic() - _cio_t0) * 1000))
             status["cio"] = _stage_status(decision_report)
+            if decision_report.get("llm_status") == "SKIPPED_DISABLED":
+                # The LLM CIO did not run — the deterministic fail-safe
+                # decided. Honest stage status, never shown as a failure.
+                status["cio"] = "SKIPPED_DISABLED"
             if decision_report.get("error"):
                 _add_error(decision_report.get("provider", "llm"), _llm_error_type(decision_report.get("llm_status")),
                            "cio", symbol, decision_report["error"])
@@ -1149,6 +1172,11 @@ def _compute_agent_results(cycle_record: dict) -> dict:
             value = symbol_status.get(stage, "SKIPPED")
             counts["total"] += 1
             if value == "OK":
+                counts["ok"] += 1
+            elif value == "MONITORING":
+                # The risk stage ran — in existing-position monitoring mode
+                # (deterministic, no order proposed). Counted as ok: the
+                # agent executed and produced a result.
                 counts["ok"] += 1
             elif value == "UNAVAILABLE":
                 counts["unavailable"] += 1

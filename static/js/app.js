@@ -841,6 +841,15 @@
     }
 
     var logs = [
+      // ---- cycle 1843: conditional pipeline (2 min ago) ----
+      L("execution", "AAPL", "INFO", "Order submitted: BUY AAPL", 0.4, { success: true, order_id: "ord-9f33", symbol: "AAPL", side: "buy", qty: 14, notional_usd: 2100, status: "filled", execution_status: "SUBMITTED", cycle_id: 1843, error: null }),
+      L("cio", "AAPL", "INFO", "BUY: Momentum intact above the 50-day with supportive news; risk approved a $2,100 position.", 0.8, { agent: "cio", symbol: "AAPL", decision: "BUY", confidence: 0.81, notional_usd: 2100, reasoning: "Momentum intact above the 50-day with supportive news; risk approved a $2,100 position.", execution_status: "ELIGIBLE", cycle_id: 1843, error: null }),
+      L("risk", "AAPL", "INFO", "Approved. Position size within the configured 10% limit; buying power sufficient.", 1.1, { agent: "risk", symbol: "AAPL", approved: true, risk_status: "APPROVED", max_notional_usd: 2548, risk_level: "LOW", risk_score: 22, reasoning: "Approved. Position size within the configured 10% limit; buying power sufficient.", cycle_id: 1843, error: null }),
+      L("debate", "AAPL", "INFO", "Debate skipped: technical confidence unavailable (deterministic engine emits no confidence) — the high-confidence requirement cannot be verified", 1.4, { agent: "debate", symbol: "AAPL", evidence_status: "OFF", skip_reason: "technical confidence unavailable (deterministic engine emits no confidence)", provider: "deterministic", model: "eligibility-gate", llm_status: "SKIPPED_DEBATE_NOT_ELIGIBLE", cycle_id: 1843, error: null }),
+      L("news", "AAPL", "INFO", "BULLISH: Coverage constructive into the product cycle.", 1.7, { agent: "news", symbol: "AAPL", sentiment: "BULLISH", confidence: 0.68, summary: "Coverage constructive into the product cycle.", cached: true, cycle_id: 1843, error: null }),
+      L("risk", "NVDA", "INFO", "Position monitoring (deterministic, no LLM call): existing exposure 8.4% of equity, cap 10.0%; no order proposed.", 1.9, { agent: "risk", symbol: "NVDA", risk_status: "MONITORING", risk_score: 31, risk_level: "LOW", reasoning: "Position monitoring (deterministic, no LLM call): existing exposure 8.4% of equity, cap 10.0%; no order proposed.", position_facts: { symbol: "NVDA", side: "long", qty: 48, avg_entry_price: 118.4, current_price: 121.1, market_value: 5812.8, account_equity: 69104.0, exposure_pct_of_equity: 0.084, max_position_pct: 0.1 }, position_exposure: { existing_position_value: 5812.8, existing_position_pct_of_equity: 0.084, max_position_pct: 0.1, monitoring_only: true }, proposed_order_exposure: null, market_data_freshness: { status: "FRESH", last_bar_date: "2026-10-24" }, exit_protection: { stop_loss: null, take_profit: null, status: "NOT_TRACKED" }, missing_inputs: [], provider: "deterministic", model: "risk-gate", llm_status: "SKIPPED_DETERMINISTIC", cycle_id: 1843, error: null }),
+      L("cio", "NVDA", "INFO", "No technical setup — deterministic engine signal is NEUTRAL (components: trend NEUTRAL, momentum NEUTRAL). HOLD without AI review.", 2.2, { agent: "cio", symbol: "NVDA", decision: "HOLD", confidence: 0.0, notional_usd: 0, reasoning: "No technical setup — deterministic engine signal is NEUTRAL. HOLD without AI review.", provider: "deterministic", model: "rule-engine", llm_status: "SKIPPED_NO_SETUP", execution_status: "SKIPPED_NO_SETUP", cycle_id: 1843, error: null }),
+      L("technical", "NVDA", "INFO", "NEUTRAL: Price between SMA50 and SMA200; MACD flat; RSI 49.8.", 2.4, { agent: "technical", symbol: "NVDA", signal: "NEUTRAL", confidence: null, summary: "Price between SMA50 and SMA200; MACD flat; RSI 49.8.", provider: "deterministic", cycle_id: 1843, error: null }),
       // ---- latest cycle (6-10 min ago) ----
       L("cio", "NVDA", "INFO", "BUY: Technicals show a clean momentum continuation above the 50-day average and news sentiment is strongly positive post-earnings. The bull case clearly outweighs the bear case, and risk has approved a $2,100 position.", 6.1, { agent: "cio", symbol: "NVDA", decision: "BUY", confidence: 0.84, notional_usd: 2100, reasoning: "Technicals show a clean momentum continuation above the 50-day average and news sentiment is strongly positive post-earnings. The bull case clearly outweighs the bear case, and risk has approved a $2,100 position.", error: null }),
       L("execution", "NVDA", "INFO", "Order submitted: BUY NVDA", 6.0, { success: true, order_id: "ord-9f21", symbol: "NVDA", side: "buy", qty: 12, notional_usd: 2100, status: "filled", error: null }),
@@ -897,6 +906,7 @@
 
     var cycles = [];
     var cycDefs = [
+      { id: 1843, minAgo: 2.6, dur: 12.1, status: "OK", trig: "scheduler", orders: 1 },
       { id: 1842, minAgo: 11.8, dur: 18.4, status: "OK", trig: "scheduler", orders: 1 },
       { id: 1841, minAgo: 26.8, dur: 21.2, status: "PARTIAL_ERROR", trig: "scheduler", orders: 1 },
       { id: 1840, minAgo: 41.9, dur: 16.7, status: "OK", trig: "scheduler", orders: 0 },
@@ -915,7 +925,13 @@
         triggered_by: c.trig,
         status: c.status,
         symbols_processed: ["AAPL", "MSFT", "NVDA", "TSLA", "SPY"],
-        decisions: [
+        decisions: c.id === 1843 ? [
+          { symbol: "AAPL", decision: "BUY", confidence: 0.81, notional_usd: 2100, execution_status: "ELIGIBLE", evidence_quality: "SUFFICIENT" },
+          { symbol: "MSFT", decision: "HOLD", confidence: 0.58, notional_usd: 0, execution_status: "ELIGIBLE", evidence_quality: "SUFFICIENT" },
+          { symbol: "NVDA", decision: "HOLD", confidence: 0.0, notional_usd: 0, blocked_reason: "NO_TECHNICAL_SETUP", execution_status: "SKIPPED_NO_SETUP", evidence_quality: "DEGRADED" },
+          { symbol: "TSLA", decision: "HOLD", confidence: 0.0, notional_usd: 0, blocked_reason: "NO_TECHNICAL_SETUP", execution_status: "SKIPPED_NO_SETUP", evidence_quality: "DEGRADED" },
+          { symbol: "SPY", decision: "HOLD", confidence: 0.0, notional_usd: 0, blocked_reason: "NO_TECHNICAL_SETUP", execution_status: "SKIPPED_NO_SETUP", evidence_quality: "DEGRADED" },
+        ] : [
           { symbol: "NVDA", decision: c.id === 1842 ? "BUY" : "HOLD", confidence: c.id === 1842 ? 0.84 : 0.52, notional_usd: c.id === 1842 ? 2100 : 0, evidence_quality: "SUFFICIENT" },
           { symbol: "AAPL", decision: "HOLD", confidence: 0.55, notional_usd: 0, evidence_quality: "SUFFICIENT" },
           { symbol: "MSFT", decision: "HOLD", confidence: 0.58, notional_usd: 0, evidence_quality: "SUFFICIENT" },
@@ -940,17 +956,29 @@
           });
           return ev;
         })(),
-        orders: c.id === 1842 ? [{ symbol: "NVDA", side: "buy", order_id: "ord-9f21", status: "filled", success: true, notional_usd: 2100 }]
+        orders: c.id === 1843 ? [{ symbol: "AAPL", side: "buy", order_id: "ord-9f33", status: "filled", success: true, notional_usd: 2100 }]
+             : c.id === 1842 ? [{ symbol: "NVDA", side: "buy", order_id: "ord-9f21", status: "filled", success: true, notional_usd: 2100 }]
              : c.id === 1841 ? [{ symbol: "TSLA", side: "sell", order_id: "ord-9f20", status: "filled", success: true, qty: 6 }]
              : [],
-        agent_status: {
+        agent_status: c.id === 1843 ? {
+          AAPL: { market_data: "OK", technical: "OK", news: "OK", fundamentals: "SKIPPED", debate: "SKIPPED_DEBATE_NOT_ELIGIBLE", risk: "OK", cio: "OK", execution: "OK", memory: "SKIPPED" },
+          MSFT: { market_data: "OK", technical: "OK", news: "OK", fundamentals: "SKIPPED", debate: "SKIPPED_DEBATE_NOT_ELIGIBLE", risk: "OK", cio: "OK", execution: "SKIPPED", memory: "SKIPPED" },
+          NVDA: { market_data: "OK", technical: "OK", news: "SKIPPED_NO_SETUP", fundamentals: "SKIPPED_NO_SETUP", debate: "SKIPPED_NO_SETUP", risk: "MONITORING", cio: "OK", execution: "SKIPPED_NO_SETUP", memory: "SKIPPED" },
+          TSLA: { market_data: "OK", technical: "OK", news: "SKIPPED_NO_SETUP", fundamentals: "SKIPPED_NO_SETUP", debate: "SKIPPED_NO_SETUP", risk: "SKIPPED_NO_SETUP", cio: "OK", execution: "SKIPPED_NO_SETUP", memory: "SKIPPED" },
+          SPY: { market_data: "OK", technical: "OK", news: "SKIPPED_NO_SETUP", fundamentals: "SKIPPED_NO_SETUP", debate: "SKIPPED_NO_SETUP", risk: "SKIPPED_NO_SETUP", cio: "OK", execution: "SKIPPED_NO_SETUP", memory: "SKIPPED" },
+        } : {
           AAPL: { market_data: "OK", technical: "OK", news: "OK", fundamentals: "SKIPPED", debate: "OK", risk: "OK", cio: "OK", execution: "SKIPPED", memory: "SKIPPED" },
           MSFT: { market_data: "OK", technical: "OK", news: "OK", fundamentals: "SKIPPED", debate: "OK", risk: "OK", cio: "OK", execution: "SKIPPED", memory: "SKIPPED" },
           NVDA: { market_data: "OK", technical: "OK", news: "OK", fundamentals: "SKIPPED", debate: "OK", risk: "OK", cio: "OK", execution: c.id === 1842 ? "OK" : "SKIPPED", memory: c.id === 1842 ? "OK" : "SKIPPED" },
           TSLA: { market_data: "OK", technical: "OK", news: "ERROR", fundamentals: "SKIPPED", debate: "OK", risk: "OK", cio: "OK", execution: c.id === 1841 ? "OK" : "SKIPPED", memory: "SKIPPED" },
           SPY: { market_data: "OK", technical: "OK", news: "OK", fundamentals: "SKIPPED", debate: "OK", risk: "OK", cio: "OK", execution: "SKIPPED", memory: "SKIPPED" },
         },
-        llm_usage: {
+        llm_usage: c.id === 1843 ? {
+          groq: { requests: 4, ok: 4, errors: {},
+                  by_agent: { risk: { requests: 2, ok: 2, errors: {} }, cio: { requests: 2, ok: 2, errors: {} } },
+                  by_symbol: {} },
+          gemini: { requests: 0, ok: 0, errors: {}, by_agent: {}, by_symbol: {} },
+        } : {
           groq: { requests: 15, ok: c.status === "PARTIAL_ERROR" ? 14 : 15,
                   errors: c.status === "PARTIAL_ERROR" ? { PROVIDER_ERROR: 1 } : {},
                   by_agent: { technical: { requests: 5, ok: 5, errors: {} }, debate: { requests: 5, ok: 5, errors: {} }, cio: { requests: 5, ok: c.status === "PARTIAL_ERROR" ? 4 : 5, errors: c.status === "PARTIAL_ERROR" ? { PROVIDER_ERROR: 1 } : {} } },
@@ -962,7 +990,17 @@
                   by_agent: { risk: { requests: 5, ok: 5, errors: {} } },
                   by_symbol: {} },
         },
-        agent_results: {
+        agent_results: c.id === 1843 ? {
+          market_data: { ok: 5, unavailable: 0, error: 0, skipped: 0, total: 5 },
+          technical: { ok: 5, unavailable: 0, error: 0, skipped: 0, total: 5 },
+          news: { ok: 2, unavailable: 0, error: 0, skipped: 3, total: 5 },
+          fundamentals: { ok: 0, unavailable: 0, error: 0, skipped: 5, total: 5 },
+          debate: { ok: 0, unavailable: 0, error: 0, skipped: 5, total: 5 },
+          risk: { ok: 3, unavailable: 0, error: 0, skipped: 2, total: 5 },
+          cio: { ok: 5, unavailable: 0, error: 0, skipped: 0, total: 5 },
+          execution: { ok: 1, unavailable: 0, error: 0, skipped: 4, total: 5 },
+          memory: { ok: 0, unavailable: 0, error: 0, skipped: 5, total: 5 },
+        } : {
           market_data: { ok: 5, unavailable: 0, error: 0, skipped: 0, total: 5 },
           technical: { ok: 5, unavailable: 0, error: 0, skipped: 0, total: 5 },
           news: c.status === "PARTIAL_ERROR" ? { ok: 4, unavailable: 1, error: 0, skipped: 0, total: 5 } : { ok: 5, unavailable: 0, error: 0, skipped: 0, total: 5 },

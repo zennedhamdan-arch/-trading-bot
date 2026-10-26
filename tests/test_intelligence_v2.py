@@ -695,10 +695,11 @@ check("no setup -> every decision HOLD with NO_TECHNICAL_SETUP",
 check("no setup -> ZERO CIO LLM calls (deterministic HOLD, no AI review)",
       h["cio"]["n"] == 0 and h["risk_llm"]["n"] == 0)
 st = record["agent_status"]["AAPL"]
-check("no setup: technical OK, news/risk/cio/debate SKIPPED",
-      st["technical"] == "OK" and st["news"] == "SKIPPED"
-      and st["risk"] == "SKIPPED" and st["cio"] == "SKIPPED"
-      and st["debate"] == "SKIPPED")
+check("no setup: technical OK, downstream stages carry the skip REASON",
+      st["technical"] == "OK" and st["news"] == "SKIPPED_NO_SETUP"
+      and st["risk"] == "SKIPPED_NO_SETUP" and st["cio"] == "SKIPPED"
+      and st["debate"] == "SKIPPED_NO_SETUP"
+      and st["execution"] == "SKIPPED_NO_SETUP")
 check("no-setup cycle is a clean OK (not an error, not partial)",
       record["status"] == "OK")
 

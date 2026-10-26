@@ -70,7 +70,7 @@
           ["Last CIO decision", dec ? '<span class="' + dec.badge + '">' + dec.label + "</span>" : "—"],
           ["Decision time", ctx && ctx.cio ? U.fmtDateTime(ctx.cio.timestamp) : "—"],
           ["Debate bias", bias ? '<span class="' + bias[1] + '">' + bias[0] + "</span>" : "—"],
-          ["Risk status", ctx && ctx.risk && ctx.risk.data ? (ctx.risk.data.approved ? '<span class="badge badge-approved">APPROVED</span>' : '<span class="badge badge-rejected">REJECTED</span>') : "—"],
+          ["Risk status", ctx && ctx.risk && ctx.risk.data ? (ctx.risk.data.risk_status === "MONITORING" ? '<span class="badge badge-ai">MONITORING</span>' : ctx.risk.data.approved ? '<span class="badge badge-approved">APPROVED</span>' : ctx.risk.data.approved === false ? '<span class="badge badge-rejected">REJECTED</span>' : '<span class="badge badge-neutral">' + U.esc(ctx.risk.data.risk_status || "—") + "</span>") : "—"],
         ]) +
         (ctx && ctx.cio
           ? '<div class="note" style="margin-top:8px">' + ICON("info") + "<span>" + U.esc(ctx.cio.message) + "</span></div>" +
@@ -208,7 +208,7 @@
           ["Decision", v ? '<span class="' + v.badge + '" style="font-size:13px">' + v.label + "</span>" : "—"],
           ["Confidence", conf != null ? conf + "%" : "—"],
           ["Position recommendation", d.notional_usd ? U.fmtMoney(d.notional_usd, { dec: 0 }) + " notional" : "No new position"],
-          ["Risk assessment", risk && risk.data ? (risk.data.approved ? '<span class="badge badge-approved">APPROVED</span>' : '<span class="badge badge-rejected">REJECTED</span>') + " · " + U.esc(risk.data.risk_level || "") + (risk.data.max_notional_usd ? " · max " + U.fmtMoney(risk.data.max_notional_usd, { dec: 0 }) : "") : "Not in buffer"],
+          ["Risk assessment", risk && risk.data ? ((risk.data.risk_status === "MONITORING" ? '<span class="badge badge-ai">MONITORING</span>' : risk.data.approved ? '<span class="badge badge-approved">APPROVED</span>' : risk.data.approved === false ? '<span class="badge badge-rejected">REJECTED</span>' : '<span class="badge badge-neutral">' + U.esc(risk.data.risk_status || "—") + "</span>") + " · " + U.esc(risk.data.risk_level || "") + (risk.data.max_notional_usd ? " · max " + U.fmtMoney(risk.data.max_notional_usd, { dec: 0 }) : "")) : "Not in buffer"],
           ["Execution result", exec ? (exec.data && exec.data.success ? '<span class="badge badge-filled">ORDER SUBMITTED</span>' : '<span class="badge badge-failed">FAILED</span>') : "No order required"],
         ]) +
       "</div>" +
@@ -224,6 +224,13 @@
           C.reasonHTML("db", "Fundamental Analysis", fund, fund ? U.esc(fund.message) : "No fundamentals report in the live buffer for this decision window.") +
           C.reasonHTML("trend-up", "Bull Case", debate ? { data: null, agent: "x" } : null, debate && debate.data ? '<div class="pos" style="font-weight:600;margin-bottom:4px">Strength ' + Math.round((debate.data.bull_strength || 0) * 100) + "%</div>" + U.esc(debate.data.bull_summary || "—") : "No debate record for this decision window.") +
           C.reasonHTML("trend-down", "Bear Case", debate ? { data: null, agent: "x" } : null, debate && debate.data ? '<div class="neg" style="font-weight:600;margin-bottom:4px">Strength ' + Math.round((debate.data.bear_strength || 0) * 100) + "%</div>" + U.esc(debate.data.bear_summary || "—") : "No debate record for this decision window.") +
+          // Structured debate detail (consensus, evidence lists, data sources)
+          // — and an honest skip explanation when the debate did not run.
+          (debate && debate.data
+            ? (debate.data.evidence_status === "OFF" || String(debate.data.llm_status || "").indexOf("SKIPPED_") === 0
+                ? '<div class="note" style="margin:6px 0">' + ICON("info") + "<span>Debate skipped: " + U.esc(debate.data.skip_reason || "eligibility conditions not met") + "</span></div>"
+                : C.debateDetailHTML(debate.data))
+            : "") +
           C.reasonHTML("shield", "Risk Assessment", risk, risk ? U.esc(risk.message) + (risk.data ? statlinesHTMLSafe([["Risk level", U.esc(risk.data.risk_level || "—")], ["Max notional", risk.data.max_notional_usd ? U.fmtMoney(risk.data.max_notional_usd, { dec: 0 }) : "—"]]) : "") : "No risk report in the live buffer for this decision window.") +
           C.reasonHTML("gavel", "Final CIO Reasoning", log, U.esc(d.reasoning || log.message), true) +
           C.reasonHTML("zap", "Execution Result", exec, exec ? U.esc(exec.message) + (exec.data && exec.data.order_id ? statlinesHTMLSafe([["Order ID", U.esc(exec.data.order_id)]]) : "") : d.notional_usd > 0 ? "The CIO recommended a trade but no execution record is present in the live buffer." : "No order was required for this decision (HOLD).") +
@@ -278,6 +285,12 @@
         if (status === "UNAVAILABLE") return '<span class="badge badge-warning">' + ICON("alert") + "N/A</span>";
         if (status === "DEFERRED_MARKET_CLOSED") return '<span class="badge badge-warning">' + ICON("clock") + 'DEFER</span>';
         if (status === "BLOCKED") return '<span class="badge badge-sell">' + ICON("shield") + "BLOCK</span>";
+        // Skips carry their REASON (title tooltip + short label) — a skip is
+        // never rendered as a failure, and monitoring is not a rejection.
+        if (status === "MONITORING") return '<span class="badge badge-ai" title="Existing position monitored (deterministic, no order proposed)">MONITOR</span>';
+        if (status === "SKIPPED_NO_SETUP") return '<span class="badge badge-neutral" title="No technical setup — downstream analysis not run (credit-saving conditional pipeline)">NO SETUP</span>';
+        if (status === "SKIPPED_DEBATE_NOT_ELIGIBLE") return '<span class="badge badge-neutral" title="Debate eligibility not met (confidence / conflict / provider health)">NOT ELIG</span>';
+        if (status === "SKIPPED_DISABLED") return '<span class="badge badge-neutral" title="Agent disabled via configuration — deterministic fail-safe decided">OFF</span>';
         return '<span class="badge badge-neutral">—</span>';
       }
       var head = "<tr><th>Symbol</th>" + stages.map(function (s) { return "<th class='c'>" + stageNames[s] + "</th>"; }).join("") + "</tr>";
@@ -291,7 +304,7 @@
       return (
         '<div class="dsec">' + C.sectionTitle("cpu", "Agent Execution (per symbol)") +
           '<div class="tbl-wrap"><table class="tbl"><thead>' + head + "</thead><tbody>" + rows + "</tbody></table></div>" +
-          '<div class="note" style="margin-top:8px">' + ICON("info") + "<span>OK = stage ran cleanly · N/A = data source or LLM provider unavailable · — = stage not required or disabled · ERROR = stage failed. A cycle is only OK when every enabled stage succeeded.</span></div>" +
+          '<div class="note" style="margin-top:8px">' + ICON("info") + "<span>OK = stage ran cleanly · MONITOR = existing position monitored (no order proposed) · NO SETUP = skipped because no technical setup existed · NOT ELIG = debate eligibility not met · OFF = disabled via configuration · N/A = data source or LLM provider unavailable · — = stage not required · ERROR = stage failed. A cycle is only OK when every enabled stage succeeded.</span></div>" +
         "</div>"
       );
     }

@@ -229,22 +229,37 @@ results in the capability registry shown on the dashboard Health page.
   status is computed from those records — the scheduler completing a job never
   implies the trading cycle was healthy. See the cycle drawer's
   "Agent Execution" matrix.
-- **Debate & risk-agent visibility**: the Bull/Bear debate (when eligible) and
-  the risk agent run **before** the hard risk engine, so their records exist in
-  the live buffer even when the engine rejects the trade. A hard rejection
-  produces a deterministic CIO HOLD (no LLM CIO review — an LLM can never
-  unblock what the engine blocked); `MARKET_CLOSED` defers only the *order*
+- **Conditional, credit-efficient pipeline**: the technical engine gates every
+  expensive step. With **no setup**, news/fundamentals/debate/risk/CIO LLM
+  calls do not happen at all — downstream stage statuses record
+  `SKIPPED_NO_SETUP` with the reason, and a deterministic HOLD decision is
+  persisted (no fabricated agent events). With a setup, the Bull/Bear debate
+  (when eligible) and the risk agent run **before** the hard risk engine, so
+  their records exist in the live buffer even when the engine rejects the
+  trade. Debate eligibility fails closed: the deterministic technical engine
+  emits no confidence, so the documented high-confidence requirement cannot be
+  verified and debate is skipped (`SKIPPED_DEBATE_NOT_ELIGIBLE`) unless LLM
+  technical interpretation provides a verifiable confidence.
+- **Debate & risk-agent visibility**: a hard rejection produces a deterministic
+  CIO HOLD (no LLM CIO review — an LLM can never unblock what the engine
+  blocked); `MARKET_CLOSED` defers only the *order*
   (`DEFERRED_MARKET_CLOSED`, next session recorded) while analysis and the CIO
   review still run. Held positions with no new setup get a risk `MONITORING`
-  report every cycle — including outside market hours. Existing-position
-  exposure is reported separately from proposed-order sizing
-  (`existing_position_ok` vs `proposed_order_sizing_ok`, with the binding limit
-  and exact calculated values), so a position is never flagged invalid because
-  a *new* order would exceed the cap. Every persisted event carries
-  `cycle_id`, and agent events carry `duration_ms` / `execution_status` /
-  `error_reason` where they apply. Duration is metadata, never evidence: it is
-  kept out of the reports downstream LLM prompts are built from, so identical
-  cycles still hit the LLM response cache.
+  report every cycle — including outside market hours — and that monitoring is
+  **purely deterministic** (`risk_agent.monitor_position`): no per-symbol,
+  per-cycle LLM call, full position facts (quantity, entry, current price,
+  market value, equity, exposure, data freshness, stop/take availability),
+  and structured `missing_inputs` reasons instead of zero-filled values. A
+  monitoring result carries no `approved`/`max_notional` verdict — it is never
+  a rejected trade. Existing-position exposure is reported separately from
+  proposed-order sizing (`existing_position_ok` vs
+  `proposed_order_sizing_ok`, with the binding limit and exact calculated
+  values), so a position is never flagged invalid because a *new* order would
+  exceed the cap. Every persisted event carries `cycle_id`, and agent events
+  carry `duration_ms` / `execution_status` / `error_reason` where they apply.
+  Timestamps and durations are metadata, never evidence: they are kept out of
+  the reports downstream LLM prompts are built from (`_stable_view`), so
+  identical cycles hit the LLM response cache instead of re-billing.
 
 ## Running the tests
 
@@ -253,6 +268,7 @@ results in the capability registry shown on the dashboard Health page.
 .venv/bin/python tests/test_production_fixes.py   # httpx/proxies, IEX, history, 429, cycle integrity
 .venv/bin/python tests/test_full_pipeline.py      # full cycle, real agents, stubbed transports
 .venv/bin/python tests/test_debate_risk_pipeline.py  # debate/risk/monitoring/deferral/sizing contracts
+.venv/bin/python tests/test_conditional_pipeline.py  # conditional execution, zero-LLM no-setup path, gating
 .venv/bin/python tests/test_alphavantage_fundamentals.py   # AV provider (mocked HTTP)
 .venv/bin/python tests/test_fmp_fundamentals.py   # FMP provider + evidence merger (mocked HTTP)
 .venv/bin/python tests/test_external_request_hardening.py  # no request storms, rate-limit semantics

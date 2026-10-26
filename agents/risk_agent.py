@@ -13,6 +13,13 @@ If no risk model is configured, the agent runs in pure deterministic mode
 If the LLM call fails, the deterministic result stands (reported honestly
 with the error) and the cycle degrades to PARTIAL_ERROR — never a fake
 verdict, never an unvalidated trade.
+
+EXISTING-POSITION MONITORING is a separate path (monitor_position): pure
+deterministic, NO LLM call — routine monitoring of held positions must not
+add per-symbol, per-cycle provider requests. A monitoring result is NOT a
+rejected proposed trade: it carries no approved/max_notional fields at all,
+only risk_status=MONITORING, the position facts, exposure math, and honest
+missing-input reasons for anything unavailable.
 """
 
 import json
@@ -96,6 +103,221 @@ def _risk_score(gate: dict, indicators: dict, evidence: dict) -> int:
     return max(0, min(100, score))
 
 
+def _monitor_missing(position: dict, account_summary: dict,
+                     indicators: dict) -> list:
+    """Structured missing-input reasons for monitoring. Required inputs that
+    are unavailable are NAMED — never silently replaced with zero."""
+    missing = []
+
+    def _need(value, field, why):
+        try:
+            if value is None or value == "":
+                raise ValueError
+            float(value)
+            return True
+        except (TypeError, ValueError):
+            missing.append({"field": field, "reason": why})
+            return False
+
+    if not position:
+        missing.append({"field": "position", "reason": "no position record"})
+    else:
+        _need(position.get("qty"), "position.qty", "quantity unavailable")
+        _need(position.get("avg_entry_price"), "position.avg_entry_price",
+              "average entry price unavailable")
+        if not (_need(position.get("market_value"), "position.market_value",
+                      "market value unavailable")
+                or _need(position.get("current_price"), "position.current_price",
+                         "current price unavailable (market value also missing)")):
+            pass
+    _need((account_summary or {}).get("equity"), "account.equity",
+          "account equity unavailable — exposure cannot be computed")
+    if not indicators:
+        missing.append({"field": "indicators",
+                        "reason": "deterministic indicators unavailable"})
+    elif indicators.get("error"):
+        missing.append({"field": "indicators",
+                        "reason": f"indicator error: {indicators.get('error')}"})
+    return missing
+
+
+def monitor_position(symbol: str, account_summary: dict, position: dict,
+                     indicators: dict = None, evidence: dict = None) -> dict:
+    """Deterministic existing-position monitoring. NO LLM CALL — routine
+    monitoring uses the deterministic risk math only (credit-saving; deeper
+    LLM reasoning belongs to the proposed-trade path, where a decision is
+    actually being made).
+
+    Receives the real available evidence: symbol, quantity, average entry,
+    current price, market value, account equity, portfolio exposure, market
+    data freshness, and the deterministic risk calculations. Anything
+    unavailable is reported in `missing_inputs` — never zero-filled, never
+    fabricated. This is NOT a proposed-trade assessment: there is no
+    approved / max_notional verdict here, and hard risk controls remain in
+    services.risk_engine / risk_gate (an exit order still goes through the
+    full engine when one is ever proposed).
+    """
+    indicators = indicators or {}
+    position = position or {}
+    account_summary = account_summary or {}
+    missing_inputs = _monitor_missing(position, account_summary, indicators)
+
+    def _num(value):
+        try:
+            if value is None or value == "":
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    qty = _num(position.get("qty"))
+    avg_entry = _num(position.get("avg_entry_price"))
+    current_price = _num(position.get("current_price"))
+    market_value = _num(position.get("market_value"))
+    value_source = "position.market_value"
+    if market_value is None and qty is not None and current_price is not None:
+        market_value = qty * current_price          # documented derivation
+        value_source = "derived: qty * current_price"
+    equity = _num(account_summary.get("equity"))
+    exposure_pct = (market_value / equity
+                    if market_value is not None and equity else None)
+
+    # Deterministic gate facts (exposure math only — the gate's proposed-buy
+    # approval is meaningless here because no order is proposed).
+    gate = risk_gate.assess(symbol, "buy", account_summary, position, indicators)
+    max_pct = float(gate.get("max_position_pct") or 0.0)
+    # NOTE: the gate's own position_pct is NOT used as a fallback here — the
+    # gate zero-fills a missing position value, and a silent 0.0 exposure is
+    # a fabrication. Exposure stays None and missing_inputs names the gap.
+    vol = gate.get("volatility")
+    dd = gate.get("max_drawdown")
+    stale = bool(indicators.get("error")) or not indicators
+
+    # Deterministic monitoring score (explanatory only, never a gate):
+    #   +0..30 volatility (scaled at 0.60 annualized)
+    #   +0..20 drawdown   (scaled at -40% over 1y)
+    #   +10 near the position cap (>= 80% of cap), +25 at/over the cap
+    #   +10 stale or missing deterministic indicators
+    score = 0
+    if isinstance(vol, (int, float)) and float(vol) > 0:
+        score += int(min(30.0, (float(vol) / 0.60) * 30.0))
+    if isinstance(dd, (int, float)) and float(dd) < 0:
+        score += int(min(20.0, (abs(float(dd)) / 0.40) * 20.0))
+    if exposure_pct is not None and max_pct > 0:
+        if exposure_pct >= max_pct:
+            score += 25
+        elif exposure_pct >= 0.8 * max_pct:
+            score += 10
+    if stale:
+        score += 10
+    score = max(0, min(100, score))
+    risk_level = "HIGH" if score >= 60 else "MEDIUM" if score >= 35 else "LOW"
+
+    warnings = []
+    recommendations = []
+    if exposure_pct is not None and max_pct > 0:
+        if exposure_pct >= max_pct:
+            warnings.append(f"existing exposure {exposure_pct*100:.1f}% of equity "
+                            f"is at/over the {max_pct*100:.1f}% position cap")
+            recommendations.append("no additional exposure recommended while at the cap")
+        elif exposure_pct >= 0.8 * max_pct:
+            warnings.append(f"existing exposure {exposure_pct*100:.1f}% of equity "
+                            f"is near the {max_pct*100:.1f}% position cap")
+    if isinstance(vol, (int, float)) and float(vol) > 0.35:
+        warnings.append(f"elevated volatility ({float(vol):.2f} annualized)")
+    if isinstance(dd, (int, float)) and float(dd) < -0.20:
+        warnings.append(f"meaningful drawdown ({float(dd)*100:.1f}% over 1y)")
+    if stale:
+        warnings.append("market-data indicators stale or unavailable")
+        recommendations.append("await fresh market data before acting on exits")
+    if missing_inputs:
+        warnings.append(f"{len(missing_inputs)} required input(s) unavailable "
+                        f"(see missing_inputs)")
+
+    facts = {
+        "symbol": symbol,
+        "side": (position.get("side") or "").value
+        if hasattr(position.get("side"), "value") else position.get("side"),
+        "qty": qty,
+        "avg_entry_price": avg_entry,
+        "current_price": current_price,
+        "market_value": market_value,
+        "market_value_source": value_source,
+        "unrealized_pl": _num(position.get("unrealized_pl")),
+        "unrealized_pl_pct": _num(position.get("unrealized_plpc")),
+        "account_equity": equity,
+        "exposure_pct_of_equity": (round(exposure_pct, 4)
+                                   if exposure_pct is not None else None),
+        "max_position_pct": max_pct,
+    }
+
+    exposure_txt = (f"{exposure_pct*100:.1f}% of equity"
+                    if exposure_pct is not None else "UNAVAILABLE (equity or value missing)")
+    reasoning = (f"Position monitoring (deterministic, no LLM call): existing "
+                 f"exposure {exposure_txt}"
+                 + (f", cap {max_pct*100:.1f}%" if max_pct else "")
+                 + "; no order proposed."
+                 + (f" {len(missing_inputs)} input(s) unavailable."
+                    if missing_inputs else ""))
+
+    return {
+        "agent": "risk",
+        "symbol": symbol,
+        "risk_status": "MONITORING",
+        "risk_score": score,
+        "risk_level": risk_level,
+        "reasoning": reasoning,
+        "error": None,
+        "position_facts": facts,
+        "position_exposure": {
+            "existing_position_value": round(market_value, 2)
+            if market_value is not None else None,
+            "existing_position_pct_of_equity": (round(exposure_pct, 4)
+                                                if exposure_pct is not None else None),
+            "max_position_pct": max_pct,
+            "monitoring_only": True,
+        },
+        "proposed_order_exposure": None,   # no order is proposed
+        "market_data_freshness": {
+            "status": "STALE" if stale else "FRESH",
+            "last_bar_date": indicators.get("last_bar_date"),
+            "indicator_error": indicators.get("error"),
+        },
+        "exit_protection": {
+            "stop_loss": None,
+            "take_profit": None,
+            "status": "NOT_TRACKED",
+            "note": ("orders are submitted without bracket orders; this "
+                     "architecture does not track per-position stops — exit "
+                     "risk is re-evaluated every cycle and any exit order "
+                     "still passes the full hard risk engine"),
+        },
+        "deterministic": gate,
+        "risk_factors": (["monitoring existing position (no order proposed)"]
+                         + list(gate.get("reasons") or [])),
+        "warnings": warnings,
+        "blocking_reasons": [],   # monitoring blocks nothing — nothing is proposed
+        "recommendations": recommendations,
+        "missing_inputs": missing_inputs,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "evidence_sources": [
+            {"source": "alpaca_account", "fact": "equity/cash/buying_power"},
+            {"source": "alpaca_positions", "fact": "existing position exposure"},
+            {"source": "deterministic_indicators",
+             "fact": "volatility/drawdown/staleness",
+             "fresh": bool(not stale)},
+        ] + ([{"source": "evidence_service",
+               "fact": "agent evidence states",
+               "quality": evidence.get("quality")}] if evidence else []),
+        "provider": "deterministic",
+        "model": "risk-gate",
+        "llm_status": "SKIPPED_DETERMINISTIC",
+        "skip_reason": ("routine position monitoring is deterministic — "
+                        "no LLM call (credit-saving conditional pipeline)"),
+        "latency_ms": None,
+    }
+
+
 def _extract_json(text: str) -> dict:
     """Tolerant JSON extraction — kept for local use/testing; the live path
     parses through services.llm_service (same logic)."""
@@ -136,9 +358,14 @@ def assess_risk(symbol: str, proposed_side: str, account_summary: dict,
     proposed_side = str(proposed_side).lower() if proposed_side else None
     monitoring = proposed_side is None
 
+    # MONITORING (no proposed order) is its own deterministic path: no LLM
+    # call, no approved/max_notional verdict, full position facts, honest
+    # missing-input reasons. A monitoring result is never a rejected trade.
+    if monitoring:
+        return monitor_position(symbol, account_summary, existing_position,
+                                indicators, evidence=evidence)
+
     # 1. Deterministic gate — always runs, never depends on any LLM.
-    #    Monitoring mode (no proposed order): the gate still computes the
-    #    exposure facts for the EXISTING position; nothing is proposed.
     gate = risk_gate.assess(
         symbol, proposed_side or "buy", account_summary,
         existing_position, indicators)
@@ -178,23 +405,18 @@ def assess_risk(symbol: str, proposed_side: str, account_summary: dict,
     base_result = {
         "agent": "risk",
         "symbol": symbol,
-        "approved": (False if monitoring else gate["approved"]),
-        "max_notional_usd": (0.0 if monitoring else gate["max_notional_usd"]),
+        "approved": gate["approved"],
+        "max_notional_usd": gate["max_notional_usd"],
         "risk_level": gate["risk_level"],
         "reasoning": ("; ".join(gate["reasons"]) or (
             f"deterministic gate: within {gate['max_position_pct']*100:.1f}% "
             f"concentration cap and available cash"
-        )) if not monitoring else (
-            f"position monitoring: existing exposure "
-            f"{float(gate.get('position_pct') or 0.0)*100:.1f}% of equity "
-            f"(cap {max_pct*100:.1f}%); no order proposed"
-        ),
+        )),
         "error": None,
         "deterministic": gate,
         # --- structured risk output (explanatory; hard checks stay in
         #     services.risk_engine / risk_gate and are NEVER overridden) ---
-        "risk_status": _risk_status(gate["approved"], False,
-                                    None if monitoring else proposed_side),
+        "risk_status": _risk_status(gate["approved"], False, proposed_side),
         "risk_score": _risk_score(gate, indicators or {}, evidence),
         "risk_factors": risk_factors,
         "position_exposure": {
@@ -209,7 +431,7 @@ def assess_risk(symbol: str, proposed_side: str, account_summary: dict,
             "max_position_pct": max_pct,
         }),
         "warnings": warnings,
-        "blocking_reasons": ([] if monitoring or gate["approved"]
+        "blocking_reasons": ([] if gate["approved"]
                              else list(gate.get("reasons") or [])),
         "recommendations": [],
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -227,31 +449,24 @@ def assess_risk(symbol: str, proposed_side: str, account_summary: dict,
         base_result["summary_mode"] = "deterministic-only"
         return base_result
 
-    if monitoring:
-        context_text = (
-            f"Symbol: {symbol}\n"
-            f"Mode: POSITION MONITORING (no order is proposed; evaluate the "
-            f"existing position's exposure and exit risks)\n"
-        )
-    else:
-        context_text = (
-            f"Symbol: {symbol}\n"
-            f"Proposed side: {proposed_side}\n"
-            f"Portfolio equity: ${gate['equity']:.2f}\n"
-            f"Available cash: ${gate['cash']:.2f}\n"
-            f"Buying power: ${gate['buying_power']:.2f}\n"
-            f"Max position percent allowed: {gate['max_position_pct'] * 100:.1f}%\n"
-            f"Existing position in {symbol}: {json.dumps(existing_position) if existing_position else 'None'}\n"
-            f"Existing position value: ${gate.get('existing_position_value', 0):.2f} "
-            f"({gate['position_pct'] * 100:.1f}% of equity)\n"
-            f"Annualized volatility: {gate.get('volatility')}\n"
-            f"Max drawdown (1y): {gate.get('max_drawdown')}\n"
-            f"--- DETERMINISTIC RISK GATE (hard constraints, cannot be raised) ---\n"
-            f"Gate approved: {gate['approved']}\n"
-            f"Gate max notional: ${gate['max_notional_usd']:.2f}\n"
-            f"Gate risk level: {gate['risk_level']}\n"
-            f"Gate checks: {json.dumps(gate['checks'])}\n"
-        )
+    context_text = (
+        f"Symbol: {symbol}\n"
+        f"Proposed side: {proposed_side}\n"
+        f"Portfolio equity: ${gate['equity']:.2f}\n"
+        f"Available cash: ${gate['cash']:.2f}\n"
+        f"Buying power: ${gate['buying_power']:.2f}\n"
+        f"Max position percent allowed: {gate['max_position_pct'] * 100:.1f}%\n"
+        f"Existing position in {symbol}: {json.dumps(existing_position) if existing_position else 'None'}\n"
+        f"Existing position value: ${gate.get('existing_position_value', 0):.2f} "
+        f"({gate['position_pct'] * 100:.1f}% of equity)\n"
+        f"Annualized volatility: {gate.get('volatility')}\n"
+        f"Max drawdown (1y): {gate.get('max_drawdown')}\n"
+        f"--- DETERMINISTIC RISK GATE (hard constraints, cannot be raised) ---\n"
+        f"Gate approved: {gate['approved']}\n"
+        f"Gate max notional: ${gate['max_notional_usd']:.2f}\n"
+        f"Gate risk level: {gate['risk_level']}\n"
+        f"Gate checks: {json.dumps(gate['checks'])}\n"
+    )
     if evidence:
         from services import evidence as evidence_service
         context_text += (
@@ -279,9 +494,6 @@ def assess_risk(symbol: str, proposed_side: str, account_summary: dict,
         logger.error(f"Risk agent LLM reasoning failed for {symbol}: {result.error}")
         base_result["error"] = result.error
         base_result["reasoning"] = (
-            (f"position monitoring (existing exposure "
-             f"{float(gate.get('position_pct') or 0.0)*100:.1f}% of equity); "
-             if monitoring else "") +
             f"deterministic gate applied (LLM reasoning unavailable: {result.status})"
         )
         return base_result
@@ -292,14 +504,12 @@ def assess_risk(symbol: str, proposed_side: str, account_summary: dict,
     llm_approved = bool(parsed.get("approved", False))
     llm_notional = float(parsed.get("max_notional_usd", 0.0))
     final_notional = max(0.0, min(llm_notional, gate["max_notional_usd"]))
-    approved = (False if monitoring
-                else gate["approved"] and llm_approved and final_notional > 0)
+    approved = gate["approved"] and llm_approved and final_notional > 0
 
     base_result["approved"] = approved
-    base_result["max_notional_usd"] = 0.0 if monitoring else round(final_notional, 2)
+    base_result["max_notional_usd"] = round(final_notional, 2)
     base_result["risk_status"] = _risk_status(
-        gate["approved"], not llm_approved and not monitoring,
-        None if monitoring else proposed_side)
+        gate["approved"], not llm_approved, proposed_side)
     for key in ("risk_factors", "warnings", "recommendations"):
         extra = parsed.get(key)
         if isinstance(extra, list) and extra:

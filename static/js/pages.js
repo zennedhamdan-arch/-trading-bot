@@ -899,11 +899,12 @@
     Object.keys(latestRiskBySym).sort().forEach(function (s) {
       var l = latestRiskBySym[s];
       var d = l.data || {};
+      var monitoring = d.risk_status === "MONITORING";   // oversight of a held position, not a verdict
       var approved = d.approved === true;
       monitorChecks +=
-        '<div class="check ' + (l.level === "WARNING" ? "warn" : approved ? "ok" : "err") + '">' +
-          '<div class="c-ico">' + ICON(l.level === "WARNING" ? "alert" : approved ? "check" : "x") + "</div>" +
-          '<div class="c-body">' + U.esc(d.reasoning || l.message) +
+        '<div class="check ' + (l.level === "WARNING" ? "warn" : monitoring ? "ok" : approved ? "ok" : d.approved == null ? "" : "err") + '">' +
+          '<div class="c-ico">' + ICON(l.level === "WARNING" ? "alert" : monitoring ? "eye" : approved ? "check" : d.approved == null ? "info" : "x") + "</div>" +
+          '<div class="c-body">' + (monitoring ? '<span class="badge badge-ai" style="margin-bottom:4px">MONITORING</span> ' : "") + U.esc(d.reasoning || l.message) +
             '<div class="c-sub">' + U.esc(s) + " · " + U.fmtDateTime(l.timestamp) + (d.risk_level ? " · risk level " + d.risk_level : "") + "</div>" +
           "</div>" +
         "</div>";

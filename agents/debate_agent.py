@@ -97,9 +97,13 @@ def _build_context(symbol: str, tech_report: dict, news_report: dict,
         return (f" [market data through {ind.get('last_bar_date')}]"
                 if ind.get("last_bar_date") else "")
 
+    # NOTE: no wall-clock "debate timestamp" line here. Each evidence line
+    # carries the REPORT's own timestamp (_stamp) — the shared, stable
+    # evidence clock. A live now() in the prompt would change it every
+    # second, defeat the LLM response cache between identical cycles, and
+    # cause duplicate real provider calls. The debate OUTPUT still records
+    # its own analysis timestamp.
     parts = [f"Symbol: {symbol}"]
-    parts.append("Debate timestamp: "
-                 + time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
     parts.append(f"Technical evidence{_bar_date()}: {_entry('technical', tech_report, 'signal')}")
     parts.append(f"News evidence{_stamp(news_report)}: {_entry('news', news_report, 'sentiment')}")
     if fundamentals_report is not None:
