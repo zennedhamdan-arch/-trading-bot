@@ -911,6 +911,7 @@ def reset_all_state() -> None:
     budgets, usage and validation cache. Does NOT touch settings."""
     _clients.clear()
     _verified_models.clear()
+    _inference_probes.clear()
     with _catalog_lock:
         _catalog_cache.clear()
         for slot in _catalog_inflight.values():
