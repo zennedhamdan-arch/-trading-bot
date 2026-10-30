@@ -227,6 +227,11 @@ class Settings:
     LLM_CYCLE_MAX_REQUESTS: int = _get_int("LLM_CYCLE_MAX_REQUESTS", 12)
     # How long per-request usage rows (llm_request_log) are kept.
     LLM_REQUEST_LOG_KEEP_DAYS: int = _get_int("LLM_REQUEST_LOG_KEEP_DAYS", 2)
+    # Opt-in bounded inference health probe: ONE tiny non-trading request per
+    # ACTIVE-CHAIN provider at startup, to tell "catalog lists the model"
+    # apart from "the model actually answers". Default OFF — zero extra
+    # provider requests unless explicitly enabled.
+    LLM_INFERENCE_PROBE_ENABLED: bool = _get_bool("LLM_INFERENCE_PROBE_ENABLED", False)
     # Classic per-provider circuit breaker (CLOSED -> OPEN -> HALF_OPEN).
     LLM_CIRCUIT_BREAKER_ENABLED: bool = _get_bool("LLM_CIRCUIT_BREAKER_ENABLED", True)
     LLM_CIRCUIT_BREAKER_FAILURE_THRESHOLD: int = _get_int("LLM_CIRCUIT_BREAKER_FAILURE_THRESHOLD", 3)

@@ -1058,9 +1058,9 @@
     var startupRows = (health.startup && health.startup.rows) || [];
 
     function statusBadge(status) {
-      var tone = status === "READY" || status === "CONNECTED" ? "badge-ok"
-        : status === "NOT_CONFIGURED" || status === "DATA_UNAVAILABLE" || status === "OFF" ? "badge-neutral"
-        : status === "STALE" || status === "CONNECTING" || status === "DEGRADED" ? "badge-warning"
+      var tone = status === "READY" || status === "CONNECTED" || status === "READY_VERIFIED" ? "badge-ok"
+        : status === "NOT_CONFIGURED" || status === "DATA_UNAVAILABLE" || status === "OFF" || status === "DISABLED" ? "badge-neutral"
+        : status === "STALE" || status === "CONNECTING" || status === "DEGRADED" || status === "CATALOG_UNAVAILABLE" ? "badge-warning"
         : "badge-error";
       return '<span class="badge ' + tone + '">' + U.esc(status) + "</span>";
     }

@@ -20,7 +20,7 @@ ISSUE 2 — catalog vs inference status separation:
   1.  catalog fetch success -> catalog_status VERIFIED
   2.  catalog timeout -> provider DEGRADED (not ERROR), catalog UNAVAILABLE,
       inference UNKNOWN — configured models remain usable
-  3.  catalog network error -> temporary class -> DEGRADED / UNAVAILABLE
+  3.  catalog network error -> temporary class -> CATALOG_UNAVAILABLE
   3b. catalog credentials error -> UNAVAILABLE_AUTH / ERROR (real failure
       is NOT hidden)
   4.  configured model confirmed present -> matched / READY
@@ -304,8 +304,10 @@ settings.UNOROUTER_PRIMARY_MODEL = "glm-5.3-flash-thinking:free"
 uno = _uno(_CountingModels(["glm-5.3-flash-thinking:free", "other-model"]))
 v = llm_service.validate_models()
 e = v["providers"]["unorouter"]
-check("1. catalog success -> catalog_status VERIFIED, provider READY",
-      e["catalog_status"] == "VERIFIED" and e["status"] == "READY"
+check("1. catalog success -> catalog_status VERIFIED, provider DEGRADED "
+      "(primary matched; the default fallback ids are absent from this "
+      "2-model fixture catalog)",
+      e["catalog_status"] == "VERIFIED" and e["status"] == "DEGRADED"
       and e["matched"] == ["glm-5.3-flash-thinking:free"])
 
 # 4. configured model confirmed present
@@ -323,9 +325,10 @@ _llm_reset()
 uno = _uno(_CountingModels(delay=3.0))     # exceeds the 1s catalog timeout
 v = llm_service.validate_models()
 e = v["providers"]["unorouter"]
-check("2. catalog timeout -> provider DEGRADED (not ERROR), catalog "
-      "UNAVAILABLE, inference UNKNOWN",
-      e["status"] == "DEGRADED" and e["catalog_status"] == "UNAVAILABLE"
+check("2. catalog timeout -> provider CATALOG_UNAVAILABLE (not ERROR), "
+      "inference UNKNOWN",
+      e["status"] == "CATALOG_UNAVAILABLE"
+      and e["catalog_status"] == "UNAVAILABLE"
       and e["inference_status"] == "UNKNOWN" and e["timed_out"] is True)
 
 # 7. catalog failure while inference is available -> inference READY
@@ -335,7 +338,7 @@ e = v["providers"]["unorouter"]
 check("7. catalog failure + working inference -> catalog UNAVAILABLE, "
       "inference READY (separated views)",
       e["catalog_status"] == "UNAVAILABLE" and e["inference_status"] == "READY"
-      and e["status"] == "DEGRADED")
+      and e["status"] == "CATALOG_UNAVAILABLE")
 
 # overall system is NOT degraded by a discovery-only failure
 from services.health_service import _overall_from                 # noqa: E402
@@ -355,9 +358,9 @@ _llm_reset()
 uno = _uno(_CountingModels(error=ConnectionError("connection reset by peer")))
 v = llm_service.validate_models()
 e = v["providers"]["unorouter"]
-check("3. catalog network error -> DEGRADED / catalog UNAVAILABLE "
-      "(temporary class)",
-      e["status"] == "DEGRADED" and e["catalog_status"] == "UNAVAILABLE")
+check("3. catalog network error -> CATALOG_UNAVAILABLE (temporary class)",
+      e["status"] == "CATALOG_UNAVAILABLE"
+      and e["catalog_status"] == "UNAVAILABLE")
 
 # 3b. catalog credentials error -> real failure NOT hidden
 _llm_reset()
@@ -462,9 +465,10 @@ _llm_reset()
 uno = _uno(_CountingModels(delay=3.0))
 report = health_service.run_startup_checks()
 row = next(r for r in report["rows"] if r["component"] == "UNOROUTER")
-check("+ startup row: catalog timeout -> DEGRADED with inference note "
-      "(not ERROR)",
-      row["status"] == "DEGRADED" and "inference: UNKNOWN" in row["detail"]
+check("+ startup row: catalog timeout -> CATALOG_UNAVAILABLE with "
+      "inference note (not ERROR)",
+      row["status"] == "CATALOG_UNAVAILABLE"
+      and "inference: UNKNOWN" in row["detail"]
       and "remain usable" in row["detail"])
 llm_entry = report["llm"]["providers"]["unorouter"]
 check("+ startup llm_providers payload carries catalog_status/"

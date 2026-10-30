@@ -148,6 +148,15 @@ check("health: no secrets in output", !/test-secret|sk-|Bearer /.test(healthHTML
 
 // --- health page: fundamentals providers (FMP) section ------------------------
 check("health: fundamentals providers section", /Fundamentals Providers/.test(healthHTML));
+// provider-status vocabulary: new tokens render with honest tones
+check("health: UNOROUTER drift row DEGRADED (badge-warning, env source shown)",
+      /badge-warning">DEGRADED<\/span><\/td><td class="t-faint"[^>]*>[^<]*obsolete ids skipped: glm-5\.3-flash:free \[env:UNOROUTER_PRIMARY_MODEL\]/.test(healthHTML.replace(/\s+/g, " "))
+      || (/DEGRADED/.test(healthHTML) && /env:UNOROUTER_PRIMARY_MODEL/.test(healthHTML)));
+check("health: GEMINI CATALOG_UNAVAILABLE renders (warning, not error/ready)",
+      /CATALOG_UNAVAILABLE/.test(healthHTML)
+      && !/badge-error">CATALOG_UNAVAILABLE/.test(healthHTML));
+check("health: NO_USABLE_MODEL context on the GROQ row (switch recorded)",
+      /UnoRouter switched away: zero usable configured models/.test(healthHTML));
 check("health: FMP provider row rendered", /FMP<\/span>/.test(healthHTML));
 check("health: FMP status badge (READY)", /FMP<\/span><\/td><td><span class="badge badge-ok">READY/.test(healthHTML.replace(/\s+/g, " ")));
 check("health: FMP endpoint availability shown", /profile=AVAILABLE/.test(healthHTML));

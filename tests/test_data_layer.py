@@ -582,8 +582,9 @@ check("GROQ READY (models verified)",
 check("NVIDIA NOT_CONFIGURED (optional)", rows["NVIDIA"]["status"] == "NOT_CONFIGURED")
 check("OPENROUTER NOT_CONFIGURED (optional)", rows["OPENROUTER"]["status"] == "NOT_CONFIGURED")
 check("GEMINI keyed -> catalog actually attempted; honest failure statuses "
-      "(ERROR/DEGRADED) allowed, never silently READY",
-      rows["GEMINI"]["status"] in ("NOT_CONFIGURED", "READY", "ERROR", "DEGRADED"))
+      "(ERROR/CATALOG_UNAVAILABLE) allowed, never silently READY",
+      rows["GEMINI"]["status"] in ("NOT_CONFIGURED", "READY", "ERROR",
+                                   "DEGRADED", "CATALOG_UNAVAILABLE"))
 check("no secrets in the report",
       all("test-secret" not in str(v) and "test-key" not in str(v) for v in rows.values()))
 check("startup rows cover all required components",

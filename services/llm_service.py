@@ -318,24 +318,121 @@ def _task_model(provider: str, task: str) -> str:
     return model
 
 
-def route_info(agent: str) -> dict:
-    """Resolves a task's (provider, model) plus the global fallback route
-    from settings at call time. The provider is returned exactly as
-    configured — an unknown provider name surfaces as a PROVIDER_ERROR in
-    call() rather than being silently normalized."""
+# Alternates tried (in order) when a routed provider is VERIFIED to have
+# zero usable configured models. Groq is the chain-final fallback by design;
+# NVIDIA is the secondary verified alternative. An alternate is only used
+# when it is enabled, keyed, and its task model is verified in its LIVE
+# catalog — ids are never invented.
+_ROUTE_ALTERNATES = ("groq", "nvidia")
+
+
+def _provider_has_usable_models(provider: str, task: str) -> "bool | None":
+    """True/False when the live catalog VERIFIES the provider's configured
+    task models; None when the catalog is not verified right now (a missing
+    catalog is 'unverified', never 'empty' — no switch decision on it)."""
+    live = _catalog_verified_models(provider)
+    if live is None:
+        return None
+    live = {_normalize_model_id(m) for m in live}
+    if provider == "unorouter":
+        # the application's explicit model chain (primary + fallbacks)
+        usable = [m for m in unorouter_model_chain()
+                  if _normalize_model_id(m) in live]
+        return bool(usable)
+    model = _task_model(provider, task)
+    return bool(model) and _normalize_model_id(model) in live
+
+
+def effective_route(agent: str) -> dict:
+    """The route a task ACTUALLY uses, with the switch RECORDED.
+
+    A provider whose live catalog is VERIFIED to contain NONE of its
+    configured models (NO_USABLE_MODEL — a permanent configuration problem,
+    not a transient failure) is routed around: the first verified alternate
+    (groq, then nvidia) serves the task. The switch is never silent — it is
+    visible in route_info / health / startup diagnostics with its reason,
+    and it self-heals when the catalog verification changes.
+
+    Transient failures (catalog unreachable, open breakers, quota) NEVER
+    trigger the switch: the provider stays routed and its failure is
+    reported honestly as a degradation.
+    """
     provider_attr = _TASK_PROVIDERS[agent]
-    provider = str(getattr(settings, provider_attr, "") or "").strip().lower()
-    return {
-        "provider": provider,
-        "model": _task_model(provider, agent) if provider in _PROVIDER_INSTANCES else "",
+    configured_provider = str(getattr(settings, provider_attr, "") or "").strip().lower()
+    configured_model = (_task_model(configured_provider, agent)
+                        if configured_provider in _PROVIDER_INSTANCES else "")
+    route = {
+        "provider": configured_provider,
+        "model": configured_model,
+        "configured_provider": configured_provider,
+        "configured_model": configured_model,
+        "switched": False,
+        "switch_reason": None,
         "fallback_provider": settings.LLM_FALLBACK_PROVIDER,
         "fallback_model": settings.LLM_FALLBACK_MODEL,
     }
+    if configured_provider not in _PROVIDER_INSTANCES:
+        return route
+    usable = _provider_has_usable_models(configured_provider, agent)
+    if usable is not False:
+        return route
+    # Verified zero usable models -> try the alternates, verified only.
+    for alt in _ROUTE_ALTERNATES:
+        if alt == configured_provider:
+            continue
+        if not (_provider_enabled(alt) and _provider_key(alt)):
+            continue
+        alt_live = _catalog_verified_models(alt)
+        if alt_live is None:
+            continue   # unverified alternate is never selected
+        alt_live = {_normalize_model_id(m) for m in alt_live}
+        # Groq serves ANY task through its chain-final fallback model when
+        # no task-specific Groq model is configured (news/fundamentals have
+        # none) — the same resolution _candidate_chain uses.
+        alt_model = (_groq_chain_model(agent) if alt == "groq"
+                     else _task_model(alt, agent))
+        if not alt_model or _normalize_model_id(alt_model) not in alt_live:
+            continue
+        route.update({
+            "provider": alt,
+            "model": alt_model,
+            "switched": True,
+            "switch_reason": (
+                f"{configured_provider} has zero usable configured models in "
+                f"its live catalog (NO_USABLE_MODEL); tasks served by verified "
+                f"{alt} {alt_model}"),
+        })
+        return route
+    # No verified alternate either: keep the configured route; health will
+    # report NO_USABLE_MODEL on the active chain (nothing hidden).
+    route["switch_reason"] = (
+        f"{configured_provider} has zero usable configured models and no "
+        f"verified alternate is available")
+    return route
+
+
+def route_info(agent: str) -> dict:
+    """Resolves a task's EFFECTIVE (provider, model) plus the configured
+    route and the global fallback, from settings + verified catalogs at
+    call time (catalog reads are cache peeks — never a network call). The
+    provider is returned exactly as configured unless a VERIFIED
+    NO_USABLE_MODEL state switched the task to a verified alternate (the
+    switch is recorded in `switched`/`switch_reason`). An unknown provider
+    name surfaces as a PROVIDER_ERROR in call() rather than being silently
+    normalized."""
+    return effective_route(agent)
 
 
 def llm_routes() -> dict:
     """All task routes (for /api/config and startup validation)."""
     return {agent: route_info(agent) for agent in sorted(_TASK_PROVIDERS)}
+
+
+def provider_enabled(provider: str) -> bool:
+    """Public read-only view: is the provider's ENABLE SWITCH on? (Distinct
+    from having a key configured — health distinguishes DISABLED from
+    NOT_CONFIGURED.)"""
+    return bool(_provider_enabled(provider))
 
 
 def _provider_key(provider: str) -> str:
@@ -508,6 +605,33 @@ def _normalize_model_id(model_id) -> str:
     """Exact-match normalization: trim whitespace and strip a 'models/'
     prefix (Gemini convention). Case is NOT mangled — ids match exactly."""
     return str(model_id or "").strip().removeprefix("models/")
+
+
+def peek_model_catalog(provider: str) -> dict:
+    """The provider's FRESH cached catalog WITHOUT ever fetching: ids is a
+    set when a fresh (TTL-valid) catalog entry exists, else None. Used by
+    route-level decisions (effective_route / active_chain_providers) so
+    resolving a route never triggers a network call — the switch engages
+    only once a validation/health check has actually verified the catalog.
+    ids=None here means 'unverified', NEVER 'empty'."""
+    with _catalog_lock:
+        entry = _catalog_cache.get(provider)
+        if _catalog_fresh(entry):
+            out = dict(entry)
+            out["cached"] = True
+            out["age_s"] = round(time.monotonic() - entry["fetched_at"], 1)
+            return out
+    return {"ids": None, "fetched_at": 0.0, "error": None,
+            "timed_out": False, "cached": False, "age_s": None}
+
+
+def _catalog_verified_models(provider: str) -> "set | None":
+    """Live-catalog ids for a provider when a FRESH VERIFIED catalog exists
+    (ids is a set). None = catalog not verified right now (never fetches)."""
+    if not (_provider_enabled(provider) and _provider_key(provider)):
+        return None
+    ids = peek_model_catalog(provider).get("ids")
+    return ids if isinstance(ids, (set, list)) else None
 
 
 def get_model_catalog(provider: str, force: bool = False) -> dict:
@@ -1875,6 +1999,30 @@ def unorouter_effective_chain(catalog_ids=None) -> dict:
             "catalog_available": True}
 
 
+def _model_env_source(provider: str, model: str) -> str:
+    """'env:VAR_NAME' when the configured model id came from an environment
+    override, 'default' when it is the repository default. Never returns a
+    value — only the variable NAME (no secrets)."""
+    import os as _os
+    model = _normalize_model_id(model)
+    if provider == "unorouter":
+        chain = unorouter_model_chain()
+        if model in chain:
+            idx = chain.index(model)
+            var = ("UNOROUTER_PRIMARY_MODEL" if idx == 0
+                   else "UNOROUTER_FALLBACK_MODELS")
+            return f"env:{var}" if _os.getenv(var) is not None else "default"
+        return "default"
+    for (p, _task), attr in _TASK_MODELS.items():
+        if p != provider:
+            continue
+        if _normalize_model_id(str(getattr(settings, attr, "") or "")) == model \
+                or (p == "groq" and model == _normalize_model_id(
+                    str(settings.GROQ_FALLBACK_MODEL or ""))):
+            return f"env:{attr}" if _os.getenv(attr) is not None else "default"
+    return "default"
+
+
 def _configured_models_for(provider: str) -> list:
     """The model ids this deployment actually uses on a provider (ordered,
     unique, normalized). unorouter: primary + fallback candidates. groq:
@@ -1918,17 +2066,37 @@ def _configured_models_for(provider: str) -> list:
 
 
 def active_chain_providers() -> list:
-    """Providers the ACTIVE request chain depends on: every provider a task
-    is routed to, plus Groq when any task is UnoRouter-routed (Groq is the
-    chain-final provider fallback). Used by health to decide which LLM
-    providers are REQUIRED."""
-    routed = {str(getattr(settings, attr, "") or "").lower()
-              for attr in _TASK_PROVIDERS.values()}
+    """Providers the ACTIVE request chain depends on, computed from the
+    EFFECTIVE routes: every provider a task actually runs on (after a
+    verified NO_USABLE_MODEL switch), plus Groq when any task still runs on
+    UnoRouter (Groq is the chain-final provider fallback). Used by health
+    to decide which LLM providers are REQUIRED.
+
+    A provider that was routed around by a VERIFIED NO_USABLE_MODEL switch
+    is NOT required: its failure must not degrade the overall system while
+    every active task route has a verified working provider and fallback."""
+    routed = set()
+    for agent, attr in _TASK_PROVIDERS.items():
+        if agent == "operator":
+            continue   # observer layer: never a required provider
+        try:
+            routed.add(str(effective_route(agent)["provider"] or "").lower())
+        except Exception:  # noqa: BLE001 — health must never crash
+            routed.add(str(getattr(settings, attr, "") or "").lower())
     routed.discard("")
-    routed.discard("operator")   # observer layer: never a required provider
     if "unorouter" in routed:
+        # Groq is the chain-final provider fallback for every UnoRouter-
+        # routed task — including when UnoRouter is disabled or dead (the
+        # request chain serves those tasks on Groq).
         routed.add("groq")
-    return sorted(p for p in routed if p in _PROVIDER_INSTANCES)
+    # A provider that is disabled or has no key cannot serve anything — it
+    # is not REQUIRED (the request chain already skips it at runtime; e.g.
+    # a disabled UnoRouter leaves every task on Groq, so Groq alone is
+    # required and the system is HEALTHY).
+    routed = {p for p in routed
+              if p in _PROVIDER_INSTANCES
+              and _provider_enabled(p) and _provider_key(p)}
+    return sorted(routed)
 
 
 def validate_models(refresh_if_stale: bool = False) -> dict:
@@ -1994,6 +2162,10 @@ def validate_models(refresh_if_stale: bool = False) -> dict:
             catalogs[p] = get_model_catalog(p)
 
     states = provider_states()   # live inference circuits (no network)
+
+    def _inference_view(provider: str) -> str:
+        return _probe_view(provider, _inference_status(provider, states))
+
     for provider in PROVIDERS:
         inst = _PROVIDER_INSTANCES[provider]
         configured = _configured_models_for(provider)
@@ -2008,12 +2180,16 @@ def validate_models(refresh_if_stale: bool = False) -> dict:
         report["providers"][provider] = entry
 
         if not _provider_enabled(provider):
+            # DISABLED is distinct from NOT_CONFIGURED: the deployment turned
+            # the provider off on purpose — it is not a missing credential.
+            entry["status"] = "DISABLED"
             entry["error"] = f"disabled via {inst.enabled_attr}=false — catalog not fetched"
-            entry["inference_status"] = _inference_status(provider, states)
+            entry["inference_status"] = _inference_view(provider)
             continue
         if not _provider_key(provider):
+            entry["status"] = "NOT_CONFIGURED"
             entry["error"] = f"{inst.key_attr} not configured — catalog not fetched"
-            entry["inference_status"] = _inference_status(provider, states)
+            entry["inference_status"] = _inference_view(provider)
             continue
 
         catalog = catalogs.get(provider) or get_model_catalog(provider)
@@ -2030,7 +2206,7 @@ def validate_models(refresh_if_stale: bool = False) -> dict:
             entry["error"] = catalog.get("error") or "catalog unavailable"
             failure_class = ("TEMPORARY" if catalog.get("timed_out")
                              else _classify_catalog_failure(entry["error"]))
-            entry["inference_status"] = _inference_status(provider, states)
+            entry["inference_status"] = _inference_view(provider)
             # log the discovery failure ONCE per catalog period (a cached
             # failure was already logged when it was fetched)
             if not catalog.get("cached"):
@@ -2049,14 +2225,17 @@ def validate_models(refresh_if_stale: bool = False) -> dict:
                 entry["catalog_status"] = "UNAVAILABLE_AUTH"
                 entry["status"] = "ERROR"
             else:
+                # CATALOG_UNAVAILABLE is its own status (discovery degraded
+                # ONLY — never proof that inference is down; that is reported
+                # separately in inference_status).
                 entry["catalog_status"] = "UNAVAILABLE"
-                entry["status"] = "DEGRADED"
+                entry["status"] = "CATALOG_UNAVAILABLE"
             continue
 
         entry["ok"] = True
         entry["models_found"] = len(live_ids)
         entry["catalog_status"] = "VERIFIED"
-        entry["inference_status"] = _inference_status(provider, states)
+        entry["inference_status"] = _inference_view(provider)
         matched = [m for m in configured if m in live_ids]
         missing = [m for m in configured if m not in live_ids]
         entry["matched"] = matched
@@ -2071,8 +2250,20 @@ def validate_models(refresh_if_stale: bool = False) -> dict:
         if configured and not matched:
             # Endpoint works but NOTHING configured is usable — never READY.
             entry["status"] = "NO_USABLE_MODEL"
+        elif missing:
+            # Catalog verified, some models usable, but configured ids have
+            # DRIFTED (obsolete ids in the deployment configuration). The
+            # provider still serves its matched models: DEGRADED, with the
+            # obsolete ids named — never silently substituted.
+            entry["status"] = "DEGRADED"
         else:
             entry["status"] = "READY"
+
+    # --- recorded inference probes (when enabled) ----------------------------
+    for provider in PROVIDERS:
+        entry = report["providers"][provider]
+        probe = _inference_probes.get(provider)
+        entry["inference_probe"] = dict(probe) if probe else None
 
     # --- per-task route checks (back-compat label mapping) ------------------
     def _mark(provider, model, label):
@@ -2092,13 +2283,19 @@ def validate_models(refresh_if_stale: bool = False) -> dict:
 
     for agent in sorted(_TASK_PROVIDERS):
         route = route_info(agent)
-        if route["provider"] == "unorouter":
+        if route["configured_provider"] == "unorouter":
             for i, model in enumerate(unorouter_model_chain()):
                 _mark("unorouter", model, "primary" if i == 0 else f"fallback[{i - 1}]")
-        elif route["provider"] in report["providers"]:
-            _mark(route["provider"], route["model"], f"{agent}.model")
+        elif route["configured_provider"] in report["providers"]:
+            _mark(route["configured_provider"], route["configured_model"],
+                  f"{agent}.model")
+        if route["provider"] in report["providers"] and route["provider"] != route["configured_provider"]:
+            _mark(route["provider"], route["model"], f"{agent}.effective")
         if route["fallback_provider"] in report["providers"] and route["fallback_model"]:
             _mark(route["fallback_provider"], route["fallback_model"], f"{agent}.fallback")
+        chain, _r = _candidate_chain(agent)
+        route["chain"] = [f"{p}:{m}" for p, m in chain]
+        route["operational"] = bool(chain)
         report["routes"][agent] = dict(route)
 
     # --- ONE warning per missing model per period + safe diagnostics --------
@@ -2107,13 +2304,30 @@ def validate_models(refresh_if_stale: bool = False) -> dict:
         configured = entry.get("configured") or []
         # warnings: the provider's OWN missing configured models — exactly
         # ONE warning per model per catalog period (never 6 identical lines)
+        if entry["ok"]:
+            entry["model_sources"] = {
+                m: _model_env_source(provider, m)
+                for m in (entry.get("matched") or []) + (entry.get("missing_models") or [])
+            }
         if entry["ok"] and entry.get("missing_models"):
             for model in entry["missing_models"]:
+                source = _model_env_source(provider, model)
                 _warn_model_unavailable(
                     provider, model,
                     "is configured but not in the live /v1/models catalog "
                     f"({entry['models_found']} live models); it is skipped "
-                    f"and the next valid configured model is used.")
+                    f"and the next valid configured model is used "
+                    f"[source: {source}]")
+                if source.startswith("env:"):
+                    # Configuration DRIFT: the deployment environment
+                    # overrides the repository default with an id the
+                    # provider no longer serves. Never silently replaced —
+                    # the operator must fix the environment variable.
+                    logger.warning(
+                        "LLM_CONFIG_DRIFT: %s (from %s) is not served by %s "
+                        "— update the deployment environment variable to a "
+                        "catalog-verified model id (never auto-substituted).",
+                        model, source, provider)
         # safe diagnostics line (NEVER any key/header/secret)
         if entry["status"] != "NOT_CONFIGURED":
             def shown(ids):
@@ -2130,6 +2344,208 @@ def validate_models(refresh_if_stale: bool = False) -> dict:
 
     _last_validation = report
     return report
+
+
+# --- bounded, non-trading inference health probe ---------------------------
+# One tiny request per provider, explicitly labeled (reason="inference_probe")
+# and recorded separately. NEVER run automatically unless
+# LLM_INFERENCE_PROBE_ENABLED=true — the default keeps zero extra provider
+# requests. A probe result NEVER changes routing by itself; it only makes
+# the inference dimension VERIFIED / INFERENCE_FAILED instead of UNKNOWN.
+_inference_probes: dict = {}
+_PROBE_FRESH_S = 600.0
+
+
+def inference_probe(provider: str, task: str = "cio") -> dict:
+    """Sends ONE bounded, non-trading inference request to the provider's
+    task model: verifies that a catalog-listed model can actually serve a
+    completion (a catalog match is not proof of inference). Respects the
+    per-request timeout and the no-retry policy; records the outcome for
+    health/diagnostics. Never raises, never exposes secrets."""
+    result = {"provider": provider, "ok": False, "model": None,
+              "status": None, "latency_ms": None, "error": None,
+              "at": datetime.now(timezone.utc).isoformat(),
+              # monotonic stamp for freshness (wall-clock epochs and
+              # time.monotonic() are different scales — never mixed)
+              "at_monotonic": time.monotonic()}
+    try:
+        if provider not in _PROVIDER_INSTANCES:
+            result["error"] = f"unknown provider '{provider}'"
+            result["status"] = "NOT_CONFIGURED"
+            return result
+        if not (_provider_enabled(provider) and _provider_key(provider)):
+            result["status"] = "NOT_CONFIGURED"
+            result["error"] = "provider disabled or key not configured"
+            return result
+        model = _task_model(provider, task)
+        if provider == "unorouter":
+            usable = _provider_has_usable_models(provider, task)
+            if usable:
+                model = unorouter_effective_chain()["chain"][0]
+        if not model:
+            result["status"] = "NO_USABLE_MODEL"
+            result["error"] = "no task model configured for this provider"
+            return result
+        result["model"] = model
+        t0 = time.monotonic()
+        status, error, text, _retry = _attempt(
+            provider, model,
+            system="You are a health probe. Reply with exactly: OK",
+            user="health probe", temperature=0.0, max_tokens=8)
+        result["status"] = status
+        result["latency_ms"] = round((time.monotonic() - t0) * 1000, 1)
+        result["ok"] = status == "OK"
+        result["error"] = error
+        _log_request("send", provider=provider, model=model, agent="probe",
+                     symbol=None, reason="inference_probe", ok=result["ok"],
+                     status=status, latency_ms=result["latency_ms"])
+    except Exception as exc:  # noqa: BLE001 — a probe never crashes anything
+        result["ok"] = False
+        result["error"] = str(exc)[:200]
+        result["status"] = result["status"] or "PROVIDER_ERROR"
+    _inference_probes[provider] = result
+    logger.info("LLM INFERENCE PROBE %s: %s (model=%s, %sms)%s",
+                provider, "OK" if result["ok"] else result["status"],
+                result.get("model"), result.get("latency_ms"),
+                f" — {result['error']}" if result.get("error") else "")
+    return result
+
+
+def probe_active_chain() -> dict:
+    """Runs the bounded inference probe once per ACTIVE-CHAIN provider
+    (effective routes only — optional providers are not probed). Explicitly
+    opt-in via LLM_INFERENCE_PROBE_ENABLED; never called by a trading
+    cycle."""
+    out = {}
+    if not getattr(settings, "LLM_INFERENCE_PROBE_ENABLED", False):
+        return out
+    for provider in active_chain_providers():
+        representative = next(
+            (a for a in ("cio", "risk", "technical", "news", "fundamentals",
+                         "debate")
+             if effective_route(a)["provider"] == provider), "cio")
+        out[provider] = inference_probe(provider, representative)
+    return out
+
+
+def inference_probe_results() -> dict:
+    """Recorded probe outcomes (no secrets), for /api/providers/health."""
+    return {p: dict(r) for p, r in _inference_probes.items()}
+
+
+def _probe_view(provider: str, inference_status: str) -> str:
+    """Merges a fresh probe outcome into the inference status: a successful
+    probe turns UNKNOWN into VERIFIED; a failed probe is INFERENCE_FAILED.
+    Live circuits always take precedence over an older probe."""
+    probe = _inference_probes.get(provider)
+    if not probe:
+        return inference_status
+    try:
+        age = time.monotonic() - float(probe["at_monotonic"])
+    except Exception:  # noqa: BLE001
+        return inference_status
+    if age > _PROBE_FRESH_S or age < 0:
+        return inference_status
+    if probe.get("ok"):
+        # A successful probe upgrades READY/UNKNOWN to VERIFIED. A circuit
+        # that already recorded a specific failure (quota/auth/model) keeps
+        # its more specific verdict even against one good probe.
+        if inference_status in ("READY", "UNKNOWN", None):
+            return "VERIFIED"
+        return inference_status
+    # A FAILED probe is direct evidence of inference failure: READY/UNKNOWN
+    # (never exercised) and the generic DEGRADED window both yield to it.
+    # Specific circuit states (quota/auth/model) stay — they name the cause.
+    if inference_status in ("READY", "UNKNOWN", None, "DEGRADED"):
+        return "INFERENCE_FAILED"
+    return inference_status
+
+
+# --- startup configuration diagnostics --------------------------------------
+def startup_diagnostics(log: bool = True) -> dict:
+    """One structured, secret-free snapshot of the EFFECTIVE LLM
+    configuration, logged at startup (and available via
+    /api/providers/health): per task — configured provider/model with its
+    source (default or env override), live-catalog match, effective route
+    after any verified NO_USABLE_MODEL switch, chain, fallback, and
+    inference verification state."""
+    routes = {}
+    for agent in sorted(_TASK_PROVIDERS):
+        route = route_info(agent)
+        provider, model = route["provider"], route["model"]
+        live = _catalog_verified_models(route["configured_provider"])
+        configured_match = (
+            None if live is None
+            else _normalize_model_id(route["configured_model"]) in
+            {_normalize_model_id(m) for m in live})
+        routes[agent] = {
+            "configured_provider": route["configured_provider"],
+            "configured_model": route["configured_model"],
+            "configured_model_source": _model_env_source(
+                route["configured_provider"], route["configured_model"]),
+            "configured_model_in_catalog": configured_match,
+            "provider": provider,
+            "model": model,
+            "switched": route["switched"],
+            "switch_reason": route["switch_reason"],
+            "chain": None,
+            "fallback": (f"{route['fallback_provider']}:{route['fallback_model']}"
+                         if route["fallback_provider"] and route["fallback_model"]
+                         else None),
+        }
+        try:
+            chain, _r = _candidate_chain(agent)
+            routes[agent]["chain"] = [f"{p}:{m}" for p, m in chain]
+        except Exception:  # noqa: BLE001
+            pass
+    states = provider_states()
+    providers = {}
+    for provider in PROVIDERS:
+        providers[provider] = {
+            "enabled": _provider_enabled(provider),
+            "key_configured": bool(_provider_key(provider)),
+            "circuit": states.get(provider, {}).get("state"),
+            "inference_status": _probe_view(
+                provider, _inference_status(provider, states)),
+        }
+        if provider == "unorouter":
+            providers[provider]["configured_chain"] = unorouter_model_chain()
+            eff = unorouter_effective_chain()
+            providers[provider]["effective_chain"] = eff["chain"]
+            providers[provider]["catalog_available"] = eff["catalog_available"]
+    diag = {
+        "active_chain_providers": active_chain_providers(),
+        "routes": routes,
+        "providers": providers,
+        "inference_probes": inference_probe_results(),
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+    # Log the human-readable table ONCE at startup (INFO; no keys/secrets).
+    # API callers pass log=False — dashboard polling never spams the log.
+    if not log:
+        return diag
+    logger.info("LLM ROUTING DIAGNOSTICS — active chain: %s",
+                ", ".join(diag["active_chain_providers"]) or "none")
+    for agent, r in routes.items():
+        logger.info(
+            "LLM ROUTE %-12s configured=%s:%s [%s, catalog=%s] -> effective=%s:%s%s",
+            agent, r["configured_provider"], r["configured_model"] or "-",
+            r["configured_model_source"],
+            ("VERIFIED" if r["configured_model_in_catalog"]
+             else "MISSING" if r["configured_model_in_catalog"] is False
+             else "UNVERIFIED"),
+            r["provider"], r["model"] or "-",
+            (" [SWITCHED: " + r["switch_reason"] + "]"
+             if r["switched"] else ""))
+    for provider, p in providers.items():
+        if provider == "unorouter" and p.get("configured_chain"):
+            logger.info(
+                "LLM PROVIDER unorouter: configured_chain=%s "
+                "effective_chain=%s catalog_available=%s",
+                ",".join(p["configured_chain"]),
+                ",".join(p.get("effective_chain") or []) or "EMPTY",
+                p.get("catalog_available"))
+    return diag if log else diag
 
 
 def last_validation() -> dict:

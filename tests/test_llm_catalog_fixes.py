@@ -185,9 +185,14 @@ cap, _logger = _capture_llm_logs()
 uno = _install_uno()
 report = llm_service.validate_models()
 entry = report["providers"]["unorouter"]
-check("primary present in the live catalog -> matched, provider READY",
-      entry["status"] == "READY" and PRIMARY in entry["matched"]
-      and entry["ok"] is True and entry["models_found"] == len(LIVE_IDS))
+# Partial drift: the primary matched but candidate glm-5.3-flash:free is
+# absent from the live catalog -> the provider row is DEGRADED (usable, with
+# the obsolete id named) — the honest label, while the chain stays usable.
+check("primary present in the live catalog -> matched, provider DEGRADED "
+      "(one configured candidate is obsolete)",
+      entry["status"] == "DEGRADED" and PRIMARY in entry["matched"]
+      and entry["ok"] is True and entry["models_found"] == len(LIVE_IDS)
+      and entry["missing_models"] == ["glm-5.3-flash:free"])
 eff = llm_service.unorouter_effective_chain()
 check("effective chain keeps the primary first",
       eff["chain"][0] == PRIMARY and eff["catalog_available"] is True)
@@ -328,11 +333,12 @@ elapsed = time.monotonic() - t0
 gentry = report["providers"]["gemini"]
 check("hanging catalog fetch bounded by the short timeout (no startup block)",
       elapsed < 2.5 and _hanging_models.calls >= 1)
-check("timed-out provider marked DEGRADED with timed_out=true",
-      gentry["status"] == "DEGRADED" and gentry["timed_out"] is True
+check("timed-out provider marked CATALOG_UNAVAILABLE with timed_out=true",
+      gentry["status"] == "CATALOG_UNAVAILABLE" and gentry["timed_out"] is True
       and "timed out" in str(gentry["error"]))
 check("other providers still validated (chain continues)",
-      report["providers"]["unorouter"]["status"] == "READY")
+      report["providers"]["unorouter"]["status"] == "DEGRADED"
+      and report["providers"]["unorouter"]["ok"] is True)
 config.settings.LLM_NEWS_PROVIDER = "unorouter"
 config.settings.GEMINI_API_KEY = ""
 config.settings.LLM_CATALOG_TIMEOUT_SECONDS = 8

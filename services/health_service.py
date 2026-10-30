@@ -228,10 +228,16 @@ def _overall_from(account: dict, market: dict) -> dict:
             + (f" (reconnect attempt #{attempt})" if attempt else "")
         )
 
-    # --- required LLM providers: circuit state AND catalog usability -------
+    # --- required LLM providers = the EFFECTIVE active chain ----------------
+    # Health is computed from the providers the active task routes actually
+    # depend on (after any verified NO_USABLE_MODEL switch). A provider that
+    # was routed around — or that no route uses at all — is OPTIONAL: its
+    # failure is reported as a note, never as a system degradation.
     validation = (llm_service.last_validation() or {}).get("providers", {})
+    notes = []
     usable_providers = []
-    for provider in _routed_providers():
+    required = _routed_providers()
+    for provider in required:
         state = (llm_service.provider_states().get(provider) or {})
         circuit = state.get("state")
         if circuit not in ("READY",):
@@ -245,7 +251,10 @@ def _overall_from(account: dict, market: dict) -> dict:
         vstatus = ventry.get("status")
         if vstatus == "NO_USABLE_MODEL":
             # Endpoint reachable but ZERO configured models are in the live
-            # catalog — the provider cannot serve anything as configured.
+            # catalog AND no verified alternate could take the route — the
+            # task chain has nothing to run on. (When a verified alternate
+            # exists, effective routing already switched to it and this
+            # provider is not in the required set.)
             status = "DEGRADED"
             missing = ", ".join(ventry.get("missing_models") or []) or "none configured"
             reasons.append(
@@ -253,34 +262,58 @@ def _overall_from(account: dict, market: dict) -> dict:
                 f"(configured models missing from the live catalog: {missing})"
             )
             continue
-        if vstatus in ("DEGRADED", "ERROR"):
-            if (ventry.get("catalog_status") == "UNAVAILABLE"
-                    and ventry.get("inference_status") != "AUTH_ERROR"):
-                # Catalog DISCOVERY is temporarily unavailable — NOT proof
-                # the provider is down. The inference circuit is READY and
-                # configured models remain usable per validation policy
-                # (runtime 404/429 circuits protect requests). The system
-                # keeps trading; the discovery degradation stays visible on
-                # the provider row. Only credentials-class failures
-                # (catalog UNAVAILABLE_AUTH / circuit AUTH_ERROR) degrade
-                # the overall system.
-                usable_providers.append(provider)
-                continue
+        if vstatus == "ERROR":
             status = "DEGRADED"
             reasons.append(
                 f"LLM provider {provider} model validation {vstatus}"
                 + (f": {ventry.get('error')}" if ventry.get("error") else "")
             )
             continue
+        if vstatus in ("CATALOG_UNAVAILABLE",):
+            # Catalog DISCOVERY is temporarily unavailable — NOT proof the
+            # provider is down. The inference circuit is READY and
+            # configured models remain usable per validation policy (runtime
+            # 404/429 circuits protect requests). The system keeps trading;
+            # the discovery degradation stays visible on the provider row.
+            usable_providers.append(provider)
+            continue
+        if vstatus == "DEGRADED":
+            # Catalog VERIFIED with SOME usable models but obsolete ids
+            # configured (drift). The chain still has usable models, so this
+            # is a configuration warning, not a system degradation.
+            notes.append(
+                f"LLM provider {provider} DEGRADED (obsolete configured "
+                f"model ids: {', '.join(ventry.get('missing_models') or [])})")
+            usable_providers.append(provider)
+            continue
         usable_providers.append(provider)
 
     # No usable configured LLM model ANYWHERE on the active chain.
-    if _routed_providers() and not usable_providers:
+    if required and not usable_providers:
         status = "DEGRADED"
         reasons.append(
             "no usable configured LLM model on any active-chain provider "
-            f"({', '.join(_routed_providers())})"
+            f"({', '.join(required)})"
         )
+
+    # --- optional providers: reported, never load-bearing --------------------
+    try:
+        optional = [p for p in (llm_service.provider_states() or {})
+                    if p not in required
+                    and (llm_service.provider_states()[p] or {}).get("enabled")]
+    except Exception:  # noqa: BLE001
+        optional = []
+    for provider in optional:
+        ventry = validation.get(provider) or {}
+        vstatus = ventry.get("status")
+        if vstatus == "NO_USABLE_MODEL":
+            notes.append(
+                f"optional provider {provider} NO_USABLE_MODEL — not used by "
+                f"any active task route; active chain: {', '.join(required) or 'none'}")
+        elif vstatus == "CATALOG_UNAVAILABLE":
+            notes.append(
+                f"optional provider {provider} catalog unavailable — "
+                f"discovery only; not used by any active task route")
 
     fundamentals = fundamentals_service.health_check()
     provider_name = str(fundamentals.get("provider") or settings.FUNDAMENTALS_PROVIDER or "none").lower()
@@ -293,7 +326,8 @@ def _overall_from(account: dict, market: dict) -> dict:
                 f"fundamentals provider {provider_name} {fundamentals.get('status')}"
             )
 
-    return {"status": status, "reasons": reasons, "critical": []}
+    return {"status": status, "reasons": reasons, "notes": notes,
+            "critical": []}
 
 
 def run_startup_checks() -> dict:
@@ -381,36 +415,65 @@ def run_startup_checks() -> dict:
     # NO_USABLE_MODEL — never READY.
     validation = llm_service.validate_models()
     states = llm_service.provider_states()
+    active_required = _routed_providers()
     llm_providers = {}
     for provider in ("unorouter", "groq", "nvidia", "gemini", "openrouter"):
         state = states.get(provider, {})
         entry = validation.get("providers", {}).get(provider, {})
-        if state.get("state") == "NOT_CONFIGURED":
+        vstatus = entry.get("status")
+        inference = entry.get("inference_status")
+        role = ("required" if provider in active_required else "optional")
+        if not llm_service.provider_enabled(provider):
+            status, detail = "DISABLED", (
+                f"disabled via configuration ({role}) — catalog not fetched")
+        elif state.get("state") == "NOT_CONFIGURED":
             status, detail = "NOT_CONFIGURED", state.get("detail", "")
-        elif entry.get("status") == "NO_USABLE_MODEL":
+        elif vstatus == "NO_USABLE_MODEL":
             status = "NO_USABLE_MODEL"
             detail = (
                 f"endpoint OK ({entry.get('models_found', 0)} live models) but "
                 f"ZERO configured models match: "
                 f"{', '.join(entry.get('missing_models') or []) or 'none configured'}"
+                + (" — " + role + (" (active routes switched to a verified "
+                   "alternate)" if role == "optional" else ""))
             )
         elif entry.get("catalog_status") == "UNAVAILABLE_AUTH":
             status = "ERROR"
             detail = (f"model catalog credentials failure: "
                       f"{str(entry.get('error') or '')[:160]}")
-        elif entry.get("status") in ("DEGRADED", "ERROR"):
+        elif vstatus == "CATALOG_UNAVAILABLE":
             # Catalog DISCOVERY failed temporarily (timeout/network). This is
             # NOT proof that inference is unavailable: inference status is
             # reported separately and configured models remain usable per
             # validation policy (runtime 404/429 circuits protect requests).
-            status = "DEGRADED"
+            status = "CATALOG_UNAVAILABLE"
             detail = (
                 f"model catalog temporarily unavailable "
                 f"({str(entry.get('error') or '')[:120]}); "
-                f"inference: {entry.get('inference_status', 'UNKNOWN')} — "
+                f"inference: {inference or 'UNKNOWN'} — "
                 f"configured models remain usable"
             )
-        elif state.get("state") != "READY":
+        elif inference in ("AUTH_ERROR", "NETWORK_ERROR", "DEGRADED",
+                           "INFERENCE_FAILED"):
+            # Catalog fine, inference PROVEN failing — distinct from every
+            # catalog-side state, and more severe than model drift.
+            status = "INFERENCE_FAILED"
+            detail = (f"catalog OK but inference failed: "
+                      f"{state.get('detail', inference)}")
+        elif vstatus == "DEGRADED":
+            # Catalog verified, some models usable, obsolete ids configured.
+            sources = entry.get("model_sources") or {}
+            drift = [f"{m} [{sources.get(m, 'default')}]"
+                     for m in (entry.get("missing_models") or [])]
+            status = "DEGRADED"
+            detail = (
+                f"{len(entry.get('matched') or [])}/"
+                f"{len(entry.get('configured') or [])} configured model(s) "
+                f"usable — obsolete ids skipped: {', '.join(drift) or 'none'}"
+                + (f"; selected fallback: {entry['selected_fallback']}"
+                   if provider == "unorouter" and entry.get("selected_fallback") else "")
+            )
+        elif state.get("state") not in ("READY",):
             status, detail = state.get("state"), state.get("detail", "")
         else:
             matched = entry.get("matched") or []
@@ -420,6 +483,7 @@ def run_startup_checks() -> dict:
                 f"{len(matched)}/{len(entry.get('configured') or [])} configured "
                 f"model(s) matched in the live catalog "
                 f"({entry.get('models_found', 0)} live)"
+                + (f"; inference: {inference or 'UNKNOWN'}")
                 + (f"; missing: {', '.join(missing)}" if missing else "")
                 + (f"; selected fallback: {entry['selected_fallback']}"
                    if provider == "unorouter" and entry.get("selected_fallback") else "")

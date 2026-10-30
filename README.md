@@ -97,12 +97,17 @@ agent files. Defaults (verified against live catalogs, Sept 2026):
 
 | Task | Provider env | Default provider | Model env | Default model |
 |---|---|---|---|---|
-| Technical | `LLM_TECH_PROVIDER` | groq | `GROQ_TECH_MODEL` | `openai/gpt-oss-20b` |
-| Debate | `LLM_DEBATE_PROVIDER` | groq | `GROQ_DEBATE_MODEL` | `openai/gpt-oss-20b` |
-| Risk | `LLM_RISK_PROVIDER` | groq | `GROQ_RISK_MODEL` | `openai/gpt-oss-20b` |
-| CIO | `LLM_CIO_PROVIDER` | groq | `GROQ_CIO_MODEL` | `openai/gpt-oss-120b` |
-| News | `LLM_NEWS_PROVIDER` | gemini | `GEMINI_MODEL` | `gemini-3.6-flash` |
-| Fundamentals | `LLM_FUNDAMENTALS_PROVIDER` | gemini | `GEMINI_MODEL` | `gemini-3.6-flash` |
+| Technical | `LLM_TECH_PROVIDER` | unorouter | `GROQ_TECH_MODEL` (when on groq) | UnoRouter chain (primary + fallbacks) |
+| Debate | `LLM_DEBATE_PROVIDER` | unorouter | `GROQ_DEBATE_MODEL` (when on groq) | UnoRouter chain |
+| Risk | `LLM_RISK_PROVIDER` | unorouter | `GROQ_RISK_MODEL` (when on groq) | UnoRouter chain |
+| CIO | `LLM_CIO_PROVIDER` | unorouter | `GROQ_CIO_MODEL` (when on groq) | UnoRouter chain |
+| News | `LLM_NEWS_PROVIDER` | unorouter | `GEMINI_MODEL` (when on gemini) | UnoRouter chain |
+| Fundamentals | `LLM_FUNDAMENTALS_PROVIDER` | unorouter | `GEMINI_MODEL` (when on gemini) | UnoRouter chain |
+
+Every UnoRouter-routed task runs the application's own model chain
+(`UNOROUTER_PRIMARY_MODEL` + `UNOROUTER_FALLBACK_MODELS`, catalog-verified)
+with **Groq as the chain-final provider fallback**
+(`GROQ_*_MODEL` / `GROQ_FALLBACK_MODEL`).
 
 - **OpenRouter is optional**: it is only used when `OPENROUTER_MODEL` is
   explicitly set AND verified available for the account at startup. Its old
@@ -117,6 +122,36 @@ agent files. Defaults (verified against live catalogs, Sept 2026):
   the provider's live `/models` catalog; a missing model is reported on the
   dashboard and each request fails with `MODEL_NOT_FOUND` — never a fake
   result.
+- **Effective routing (recorded, never silent)**: when a routed provider's
+  live catalog is VERIFIED to contain none of its configured models
+  (`NO_USABLE_MODEL` — a permanent configuration problem), its tasks run on
+  the first VERIFIED alternate (Groq, then NVIDIA). The switch is recorded
+  in `/api/providers/health`, startup diagnostics and the health rows, and
+  it self-heals when the catalog verification changes. Transient failures
+  (catalog timeout, open breakers, quota) NEVER trigger a switch — the
+  provider stays routed and the failure is reported as a degradation.
+- **Health is computed from ACTIVE routes**: only providers the effective
+  task chains actually depend on are required. An optional provider that no
+  route uses (e.g. a switched-away or disabled UnoRouter, or an unused
+  Gemini) cannot degrade overall health — its failure is reported as a
+  note on `/api/health`. Provider statuses distinguish `READY`,
+  `READY_VERIFIED`, `DEGRADED` (obsolete configured ids — drift, named with
+  their source), `NO_USABLE_MODEL`, `CATALOG_UNAVAILABLE` (discovery only;
+  inference reported separately), `INFERENCE_FAILED`, `NOT_CONFIGURED`,
+  `DISABLED`, `ERROR` (credentials-class).
+- **Configuration-drift warnings**: when an ENV override
+  (e.g. `UNOROUTER_PRIMARY_MODEL`) holds a model id the live catalog no
+  longer serves, startup logs `LLM_CONFIG_DRIFT` naming the variable — the
+  id is never silently replaced with an arbitrary catalog entry.
+- **Bounded inference probe (opt-in)**: `LLM_INFERENCE_PROBE_ENABLED=true`
+  sends ONE tiny non-trading request per active-chain provider at startup,
+  separating "the catalog lists the model" (`UNKNOWN`) from "the model
+  actually answers" (`VERIFIED` / `INFERENCE_FAILED`). Default OFF — zero
+  extra provider requests.
+- **Startup diagnostics**: effective routes, configured ids with their
+  source (default vs env override), catalog matches, recorded switches,
+  fallbacks and inference state are logged at boot (secret-free) and
+  exposed via `/api/providers/health` (`diagnostics` field).
 - **Circuit breakers**: a 429 quota-exhaustion opens the provider circuit
   (no retries, no per-symbol storms; server `retry_after` honored); a 404
   opens a per-model circuit; an auth failure pauses the provider. States
@@ -269,6 +304,7 @@ results in the capability registry shown on the dashboard Health page.
 .venv/bin/python tests/test_full_pipeline.py      # full cycle, real agents, stubbed transports
 .venv/bin/python tests/test_debate_risk_pipeline.py  # debate/risk/monitoring/deferral/sizing contracts
 .venv/bin/python tests/test_conditional_pipeline.py  # conditional execution, zero-LLM no-setup path, gating
+.venv/bin/python tests/test_provider_reliability.py  # provider hierarchy, effective routing, health vocabulary
 .venv/bin/python tests/test_alphavantage_fundamentals.py   # AV provider (mocked HTTP)
 .venv/bin/python tests/test_fmp_fundamentals.py   # FMP provider + evidence merger (mocked HTTP)
 .venv/bin/python tests/test_external_request_hardening.py  # no request storms, rate-limit semantics

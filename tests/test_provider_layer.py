@@ -227,9 +227,13 @@ check("openrouter optional: no model routed by default", config.settings.OPENROU
 
 # provider overrides resolved at call time
 config.settings.LLM_RISK_PROVIDER = "nvidia"
-check("risk can be routed to NVIDIA via env", llm_service.route_info("risk") ==
-      {"provider": "nvidia", "model": "meta/llama-test",
-       "fallback_provider": "", "fallback_model": ""})
+_risk_route = llm_service.route_info("risk")
+check("risk can be routed to NVIDIA via env", all([
+    _risk_route["provider"] == "nvidia", _risk_route["model"] == "meta/llama-test",
+    _risk_route["fallback_provider"] == "", _risk_route["fallback_model"] == "",
+    # effective-routing metadata (recorded switch state; not switched here)
+    _risk_route["configured_provider"] == "nvidia",
+    _risk_route["switched"] is False]))
 config.settings.LLM_RISK_PROVIDER = "groq"
 
 config.settings.GROQ_TECH_MODEL = "custom/model-x"

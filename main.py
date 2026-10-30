@@ -1231,6 +1231,18 @@ async def lifespan(app: FastAPI):
     except Exception as exc:  # noqa: BLE001
         logger.error(f"Startup health check failed (non-fatal): {exc}")
 
+    # Effective-configuration diagnostics (secret-free): routes, model ids
+    # with their source (default vs env override), catalog matches, verified
+    # switches, fallbacks, inference state. Plus the OPT-IN bounded
+    # inference probe (LLM_INFERENCE_PROBE_ENABLED, default off — zero
+    # extra provider requests otherwise).
+    try:
+        if settings.LLM_INFERENCE_PROBE_ENABLED:
+            llm_service.probe_active_chain()
+        llm_service.startup_diagnostics()
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"LLM startup diagnostics failed (non-fatal): {exc}")
+
     # Real-time layer (Alpaca WebSockets). Each SDK stream runs in its own
     # dedicated thread — the SDK's run() owns its event loop, so it must
     # never be awaited inside the FastAPI loop. Ticks are bridged to this
@@ -1432,20 +1444,33 @@ async def api_providers_health():
     secrets."""
     validation = llm_service.validate_models(refresh_if_stale=True)
     states = llm_service.provider_states()
+    required = llm_service.active_chain_providers()
     providers = {}
     for provider, state in states.items():
         ventry = (validation.get("providers") or {}).get(provider, {})
         vstatus = ventry.get("status")
+        inference = ventry.get("inference_status")
         status = "HEALTHY"
-        if state["state"] == "NOT_CONFIGURED":
+        if not llm_service.provider_enabled(provider):
+            status = "DISABLED"
+        elif state["state"] == "NOT_CONFIGURED":
             status = "NOT_CONFIGURED"
         elif vstatus == "NO_USABLE_MODEL":
             status = "NO_USABLE_MODEL"
-        elif vstatus in ("DEGRADED", "ERROR"):
+        elif vstatus == "ERROR":
+            status = "CATALOG_AUTH_ERROR"
+        elif vstatus == "CATALOG_UNAVAILABLE":
+            status = "CATALOG_UNAVAILABLE"
+        elif vstatus == "DEGRADED":
             status = "DEGRADED"
+        elif inference in ("AUTH_ERROR", "NETWORK_ERROR", "DEGRADED",
+                           "INFERENCE_FAILED"):
+            status = "INFERENCE_FAILED"
         elif state["state"] in ("QUOTA_EXHAUSTED", "AUTH_ERROR", "MODEL_UNAVAILABLE",
                                 "NETWORK_ERROR", "DEGRADED"):
             status = "UNHEALTHY"
+        elif inference == "VERIFIED":
+            status = "READY_VERIFIED"
         providers[provider] = {
             "enabled": bool(state.get("enabled")),
             "status": status,
@@ -1475,8 +1500,12 @@ async def api_providers_health():
         }
     return JSONResponse({
         "providers": providers,
+        "active_chain_providers": required,
+        "routes": (validation.get("routes") or {}),
         "unorouter_model_chain": llm_service.unorouter_model_chain(),
         "unorouter_effective_chain": llm_service.unorouter_effective_chain(),
+        "inference_probes": llm_service.inference_probe_results(),
+        "diagnostics": llm_service.startup_diagnostics(log=False),
         "checked_at": datetime.now(timezone.utc).isoformat(),
     })
 
