@@ -493,11 +493,22 @@ def run_startup_checks() -> dict:
             "circuit": state.get("state"),
             "catalog_status": entry.get("catalog_status"),
             "inference_status": entry.get("inference_status"),
+            "inference_verified": entry.get("inference_verified", False),
+            "inference_tested": entry.get("inference_tested"),
+            "last_error": state.get("last_error"),
             "models_checked": entry.get("checked", {}),
             "catalog": {
                 "live_models": entry.get("models_found", 0),
+                # configured (what the deployment asks for) vs catalog_matched
+                # (what the live catalog lists) vs selected (what routing
+                # actually uses) vs inference_tested (what actually answered)
+                # — four distinct facts, never merged.
                 "configured": entry.get("configured", []),
                 "matched": entry.get("matched", []),
+                "catalog_matched": entry.get("catalog_matched", []),
+                "selected": entry.get("selected", []),
+                "routing_excluded": entry.get("routing_excluded", []),
+                "routing_basis": entry.get("routing_basis"),
                 "missing": entry.get("missing_models", []),
                 "selected_fallback": entry.get("selected_fallback"),
                 "age_s": entry.get("catalog_age_s"),

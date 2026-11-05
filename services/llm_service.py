@@ -470,6 +470,18 @@ _clients = {}  # provider -> cached SDK client (tests may inject)
 _verified_models = {}  # provider -> set of model ids seen in the live catalog
 _last_validation = None  # report dict returned by validate_models()
 
+# Inference evidence (independent of model DISCOVERY): the last successful
+# completion per provider, with the exact model that answered. A catalog
+# match is not proof of inference; a served completion is.
+_last_success_info = {}  # provider -> {"model", "at", "monotonic"}
+
+# Obsolete-model registry: a configured id observed ABSENT from a freshly
+# fetched live catalog. Discovery facts OUTLIVE a catalog outage — otherwise
+# an obsolete id returns to the routing chain the moment /v1/models times out
+# (which is exactly how an obsolete id keeps getting re-sent). An id is
+# removed again only when a fresh catalog actually lists it.
+_obsolete_models = {}   # provider -> {normalized model id -> {"since", "live_models"}}
+
 # Model-catalog layer: /v1/models is fetched AT MOST once per provider per
 # LLM_CATALOG_CACHE_TTL_MINUTES window (5-10 min) — one shared catalog for
 # health checks, validations and chain resolution. A hanging provider is
@@ -693,6 +705,7 @@ def get_model_catalog(provider: str, force: bool = False) -> dict:
                     ids = future.result(timeout=timeout_s)
                     fetched["ids"] = {_normalize_model_id(i) for i in (ids or set())}
                     _verified_models[provider] = set(fetched["ids"])
+                    _record_catalog_obsolescence(provider, fetched["ids"])
                 except _FutureTimeoutError:
                     fetched["timed_out"] = True
                     fetched["error"] = (f"model catalog fetch timed out after "
@@ -720,6 +733,46 @@ def get_model_catalog(provider: str, force: bool = False) -> dict:
     out["cached"] = False
     out["age_s"] = 0.0
     return out
+
+
+def _record_catalog_obsolescence(provider: str, live_ids) -> dict:
+    """Updates the obsolete-model registry from a FRESHLY fetched catalog.
+
+    A configured id that the live catalog does not list is remembered as
+    obsolete for this process; an id that appears again is restored at once.
+    This is what keeps an obsolete id out of routing while a later catalog
+    fetch is unavailable (ids=None would otherwise mean "unverified", and
+    the configured order — including the dead id — would be used again).
+    Returns the provider's registry entry (safe, no secrets)."""
+    live = {_normalize_model_id(m) for m in (live_ids or set())}
+    registry = _obsolete_models.setdefault(provider, {})
+    for model in _configured_models_for(provider):
+        norm = _normalize_model_id(model)
+        if not norm:
+            continue
+        if norm in live:
+            if registry.pop(norm, None):
+                logger.info(
+                    "LLM_MODEL_RESTORED: %s: '%s' is listed in the live "
+                    "catalog again — routing may use it.", provider, norm)
+        else:
+            entry = registry.get(norm) or {"since": _now_iso()}
+            entry["live_models"] = len(live)
+            registry[norm] = entry
+    return {m: dict(v) for m, v in registry.items()}
+
+
+def obsolete_models(provider: str = None) -> dict:
+    """Configured model ids known to be absent from a live catalog (per
+    provider, or all). Safe diagnostics only — ids and timestamps."""
+    if provider is not None:
+        return {m: dict(v) for m, v in (_obsolete_models.get(provider) or {}).items()}
+    return {p: {m: dict(v) for m, v in models.items()}
+            for p, models in _obsolete_models.items() if models}
+
+
+def _is_known_obsolete(provider: str, model: str) -> bool:
+    return _normalize_model_id(model) in (_obsolete_models.get(provider) or {})
 
 
 def _warn_model_unavailable(provider: str, model: str, detail: str) -> bool:
@@ -918,6 +971,8 @@ def reset_all_state() -> None:
             slot["event"].set()
         _catalog_inflight.clear()
     _model_warned.clear()
+    _last_success_info.clear()
+    _obsolete_models.clear()
     global _last_validation, _cycle_send_count
     _last_validation = None
     with _state_lock:
@@ -1048,6 +1103,16 @@ def cycle_usage() -> dict:
 # Classic circuit breaker (CLOSED / OPEN / HALF_OPEN)
 # ---------------------------------------------------------------------------
 
+# --- what a failure is allowed to open ---------------------------------------
+# MODEL-scoped: the model id is wrong/obsolete for this account. Such a
+# failure must NEVER open (or re-open, e.g. from a HALF_OPEN probe) the
+# PROVIDER circuit — other models on the same provider are still healthy, and
+# an obsolete candidate must not be able to poison them.
+_MODEL_SCOPED_FAILURES = frozenset({"MODEL_NOT_FOUND"})
+# LOCAL policy stops: not the provider's fault at all.
+_NON_PROVIDER_FAILURES = frozenset({"CYCLE_BUDGET_EXCEEDED", "RATE_LIMITED_LOCAL"})
+
+
 def _breaker_state(provider: str) -> str:
     entry = _breaker[provider]
     if entry["failures"] >= _breaker_threshold() and entry["open_until"] > time.monotonic():
@@ -1083,6 +1148,16 @@ def _breaker_success(provider: str) -> None:
     _breaker[provider]["failures"] = 0
     _breaker[provider]["open_until"] = 0.0
     _breaker[provider]["last_success"] = _now_iso()
+
+
+def _breaker_model_failure(provider: str, status: str) -> None:
+    """Records a MODEL-scoped failure (dead/obsolete id) without touching the
+    provider's consecutive-failure count, so it can neither open nor re-open
+    the provider circuit. The per-model 404 circuit already owns the window."""
+    _breaker[provider]["last_failure"] = _now_iso()
+    logger.debug(
+        "%s: model-scoped failure (%s) — provider circuit unchanged; the "
+        "model circuit owns the cooldown.", provider, status)
 
 
 def _breaker_failure(provider: str, status: str) -> None:
@@ -1174,6 +1249,13 @@ def provider_states() -> dict:
             ),
             "last_success": breaker["last_success"],
             "last_failure": breaker["last_failure"],
+            # Safe last-failure diagnostics: status + category (TIMEOUT /
+            # CONNECTION / TLS / HTTP_5XX / ...) + original exception type.
+            # Never a message, header, URL or key.
+            "last_error": dict(_last_failure[provider])
+            if _last_failure[provider] else None,
+            "last_success_model": (_last_success_info.get(provider) or {}).get("model"),
+            "obsolete_models": sorted(_obsolete_models.get(provider) or {}),
             "requests_last_24h": len(stamps),
             "daily_request_limit": limit,
             "quota_cooldown_remaining_s": round(max(0.0, _quota_backoff_until[provider] - now), 1),
@@ -1259,32 +1341,115 @@ def _is_network_error(exc: Exception) -> bool:
     return False
 
 
-def _classify_exception(exc: Exception):
-    """Maps a provider exception to (status, retry_after).
-
-    Uses the exception's HTTP status code when the SDK exposes one — never
-    message keyword matching on generic exceptions.
-    """
+def _http_status_code(exc: Exception):
+    """The HTTP status carried by an SDK exception, when one exists."""
     code = getattr(exc, "status_code", None)
     if not isinstance(code, int):
         code = getattr(exc, "code", None)
     if not isinstance(code, int):
         response = getattr(exc, "response", None)
         code = getattr(response, "status_code", None)
+    return code if isinstance(code, int) else None
+
+
+def _exception_type_names(exc: Exception) -> list:
+    """ORIGINAL exception class names, root cause first.
+
+    An SDK wrapper (e.g. openai.APIConnectionError) hides the real cause
+    (httpx.ConnectError, ssl.SSLCertVerificationError, ...); walking
+    __cause__/__context__ preserves that category. Type NAMES only — no
+    message, header, URL or key is ever extracted here."""
+    names, seen, node = [], set(), exc
+    while node is not None and id(node) not in seen and len(names) < 8:
+        seen.add(id(node))
+        name = node.__class__.__name__
+        if name not in names:
+            names.append(name)
+        node = node.__cause__ or node.__context__
+    return list(reversed(names))
+
+
+# Transport category hints (lower-case class-name fragments). TLS and timeout
+# are checked before the generic connection family so a ConnectTimeout stays a
+# TIMEOUT and a handshake failure stays a TLS failure.
+_TLS_NAME_HINTS = ("ssl", "tls", "certificate")
+_TIMEOUT_NAME_HINTS = ("timeout",)
+_CONNECTION_NAME_HINTS = ("connection", "connecterror", "protocolerror",
+                          "networkerror", "serverdisconnected", "remotedisconnected")
+
+
+def _exception_details(exc: Exception) -> dict:
+    """SAFE, type-based classification of a provider exception.
+
+    Distinguishes connection failures, timeouts, TLS failures, HTTP 4xx/5xx,
+    rate limits (429 transient) from quota exhaustion (429 hard), missing
+    models (404) and auth failures (401/403). Preserves the ORIGINAL
+    exception class name(s) so NVIDIA-style NETWORK_ERROR failures are not
+    collapsed into one opaque category. Contains no message, URL, header or
+    credential."""
+    code = _http_status_code(exc)
+    names = _exception_type_names(exc)
     message = str(exc)
     retry_after = _parse_retry_delay(message)
+    category = "PROVIDER_ERROR"
+    if code is not None:
+        if code == 404:
+            category = "MODEL_NOT_FOUND"
+        elif code in (401, 403):
+            category = "AUTH"
+        elif code == 429:
+            category = ("QUOTA_EXHAUSTED"
+                        if _looks_like_quota_exhaustion(message, retry_after)
+                        else "RATE_LIMIT")
+        elif 400 <= code < 500:
+            category = "HTTP_4XX"
+        elif 500 <= code < 600:
+            category = "HTTP_5XX"
+    if category == "PROVIDER_ERROR":
+        lowered = [n.lower() for n in names]
+        if any(h in n for h in _TLS_NAME_HINTS for n in lowered):
+            category = "TLS"
+        elif any(h in n for h in _TIMEOUT_NAME_HINTS for n in lowered):
+            category = "TIMEOUT"
+        elif any(h in n for h in _CONNECTION_NAME_HINTS for n in lowered):
+            category = "CONNECTION"
+        else:
+            try:
+                import httpx
+                if isinstance(exc, httpx.TransportError):
+                    category = "CONNECTION"
+            except ImportError:
+                pass
+    return {"category": category, "http_status": code,
+            "exception_type": names[0] if names else exc.__class__.__name__,
+            "exception_chain": names[:6], "retry_after": retry_after}
 
-    if isinstance(code, int) and code == 429:
-        if _looks_like_quota_exhaustion(message, retry_after):
-            return "PROVIDER_QUOTA_EXCEEDED", retry_after
-        return "RATE_LIMITED", retry_after
-    if isinstance(code, int) and code == 404:
+
+def _status_from_details(details: dict):
+    """Maps classified details to the router's (status, retry_after)."""
+    code = details.get("http_status")
+    category = details.get("category")
+    retry_after = details.get("retry_after")
+    if code == 429:
+        return (("PROVIDER_QUOTA_EXCEEDED" if category == "QUOTA_EXHAUSTED"
+                 else "RATE_LIMITED"), retry_after)
+    if code == 404:
         return "MODEL_NOT_FOUND", None
-    if isinstance(code, int) and code in (401, 403):
+    if code in (401, 403):
         return "AUTH_ERROR", None
-    if _is_network_error(exc):
+    if category in ("CONNECTION", "TIMEOUT", "TLS"):
         return "NETWORK_ERROR", None
     return "PROVIDER_ERROR", None
+
+
+def _classify_exception(exc: Exception):
+    """Maps a provider exception to (status, retry_after).
+
+    Uses the exception's HTTP status code when the SDK exposes one — never
+    message keyword matching on generic exceptions — and the original
+    exception type chain for transport failures.
+    """
+    return _status_from_details(_exception_details(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -1392,7 +1557,8 @@ class LLMResult:
     def __init__(self, agent, provider, model, status, text="", parsed=None,
                  latency_ms=None, error=None, error_type=None, attempts=0,
                  fallback_used=False, cached=False, cache_age_s=None,
-                 cache_replay=False):
+                 cache_replay=False, error_category=None, http_status=None,
+                 exception_type=None):
         self.agent = agent
         self.provider = provider
         self.model = model
@@ -1406,6 +1572,12 @@ class LLMResult:
         self.fallback_used = fallback_used
         self.cached = cached
         self.cache_age_s = cache_age_s
+        # Safe failure attribution: what KIND of failure it was and which
+        # HTTP status / original exception type carried it (never a message
+        # with credentials, headers or a signed URL).
+        self.error_category = error_category
+        self.http_status = http_status
+        self.exception_type = exception_type
         # cache_replay: served from cache AFTER a total chain failure
         # (the "cached result" stop before the deterministic fallback).
         self.cache_replay = cache_replay
@@ -1447,6 +1619,9 @@ class LLMResult:
             "latency_ms": self.latency_ms,
             "error": self.error,
             "error_type": self.error_type,
+            "error_category": self.error_category,
+            "http_status": self.http_status,
+            "exception_type": self.exception_type,
             "attempts": self.attempts,
             "fallback_used": self.fallback_used,
             "cached": self.cached,
@@ -1506,21 +1681,67 @@ def _reclassify(result: LLMResult, symbol=None) -> LLMResult:
 
 
 def _attempt(provider: str, model: str, system: str, user: str,
-             temperature: float, max_tokens: int):
+             temperature: float, max_tokens: int, details: dict = None,
+             count_cycle: bool = False):
+    """One logical attempt (up to LLM_RATE_LIMIT_MAX_RETRIES + 1 sends).
+
+    `details` (optional dict) is filled with SAFE outcome diagnostics: the
+    category (CONNECTION / TIMEOUT / TLS / HTTP_4XX / HTTP_5XX / RATE_LIMIT /
+    QUOTA_EXHAUSTED / MODEL_NOT_FOUND / AUTH / EMPTY_RESPONSE /
+    MALFORMED_RESPONSE / PROVIDER_ERROR / CYCLE_BUDGET_EXCEEDED), the HTTP
+    status when one exists, and the ORIGINAL exception class name.
+
+    `count_cycle=True` charges EVERY network send (including retries) to the
+    per-cycle budget, so bounded retries can never exceed
+    LLM_CYCLE_MAX_REQUESTS. `count_cycle=False` (probes) spends no cycle
+    budget.
+    """
+    global _cycle_send_count
     inst = _PROVIDER_INSTANCES[provider]
     last = ("PROVIDER_ERROR", "request failed", None, None)
     for attempt in range(_max_retries() + 1):
+        if count_cycle and _cycle_sends_remaining() <= 0:
+            if details is not None:
+                details.update({"category": "CYCLE_BUDGET_EXCEEDED",
+                                "http_status": None, "exception_type": None})
+            return ("CYCLE_BUDGET_EXCEEDED",
+                    (f"CYCLE_BUDGET_EXCEEDED: this cycle already sent "
+                     f"{_cycle_send_count} LLM requests (cap "
+                     f"{_cycle_send_budget()}); failing fast to protect the "
+                     f"quota."), None, None)
+        if count_cycle:
+            _cycle_send_count += 1
         _count_request(provider)
         try:
             text = inst.send(model, system, user, temperature, max_tokens)
             if not str(text).strip():
+                _last_failure[provider] = {
+                    "status": "INVALID_RESPONSE", "at": time.monotonic(),
+                    "model": model, "category": "EMPTY_RESPONSE"}
+                if details is not None:
+                    details.update({"category": "EMPTY_RESPONSE",
+                                    "http_status": None,
+                                    "exception_type": None})
                 return "INVALID_RESPONSE", "model returned an empty response", text, None
             _last_failure[provider] = None
+            _last_success_info[provider] = {
+                "model": model, "at": _now_iso(), "monotonic": time.monotonic()}
+            if details is not None:
+                details.update({"category": "OK", "http_status": None,
+                                "exception_type": None})
             return "OK", None, str(text), None
         except Exception as exc:  # noqa: BLE001 — classified below
-            status, retry_after = _classify_exception(exc)
+            classified = _exception_details(exc)
+            status, retry_after = _status_from_details(classified)
             last = (status, str(exc) or exc.__class__.__name__, None, retry_after)
-            _last_failure[provider] = {"status": status, "at": time.monotonic()}
+            _last_failure[provider] = {
+                "status": status, "at": time.monotonic(), "model": model,
+                "category": classified["category"],
+                "http_status": classified["http_status"],
+                "exception_type": classified["exception_type"],
+            }
+            if details is not None:
+                details.update(classified)
             if status == "PROVIDER_QUOTA_EXCEEDED":
                 _mark_quota_backoff(provider, retry_after)
                 return last  # never retry an exhausted quota
@@ -1536,6 +1757,7 @@ def _attempt(provider: str, model: str, system: str, user: str,
                 attempt < _max_retries()
                 and retry_after is not None
                 and 0 < retry_after <= _max_rate_limit_wait()
+                and (not count_cycle or _cycle_sends_remaining() > 0)
             )
             if not can_retry:
                 return last
@@ -1629,7 +1851,21 @@ def _candidate_chain(agent: str):
     )
     if fallback_usable:
         chain.append((fb_provider, fb_model))
-    return chain, route
+    # Chain-final VERIFIED alternate: ONE provider the live catalog confirms
+    # can serve this task (Groq). This is what lets a routed provider whose
+    # inference endpoint is unreachable (e.g. NVIDIA -> NETWORK_ERROR) still
+    # complete the task. At most one extra provider — never unlimited
+    # provider hopping, and never an unverified model id.
+    if (chain and provider not in ("unorouter", "groq")
+            and all(p != "groq" for p, _m in chain)):
+        groq_model = _groq_chain_model(agent)
+        groq_live = _catalog_verified_models("groq")
+        if (_provider_enabled("groq") and _provider_key("groq") and groq_model
+                and groq_live is not None
+                and _normalize_model_id(groq_model) in
+                {_normalize_model_id(m) for m in groq_live}):
+            chain.append(("groq", groq_model))
+    return chain[:_model_attempt_cap()], route
 
 
 def _candidate_precheck(provider: str, model: str):
@@ -1641,6 +1877,19 @@ def _candidate_precheck(provider: str, model: str):
     if not _provider_key(provider):
         key_name = _PROVIDER_INSTANCES[provider].key_attr
         return "NOT_CONFIGURED", f"{key_name} not configured."
+    # Recorded-obsolete id: excluded from routing even while the live catalog
+    # is unavailable. No request is sent, and the provider breaker is not
+    # touched (the model is the problem, not the provider).
+    if _is_known_obsolete(provider, model):
+        _warn_model_unavailable(
+            provider, model,
+            "was absent from a fetched live catalog and is recorded as "
+            "obsolete for this process; routing excludes it even while the "
+            "catalog is unavailable (no request sent).")
+        return "MODEL_NOT_FOUND", (
+            f"LLM_MODEL_UNAVAILABLE: model '{model}' is recorded as obsolete "
+            f"on {provider} (absent from a fetched live catalog); skipped "
+            f"without a request.")
     allowed, breaker_reason = _breaker_check(provider)
     if not allowed:
         return "CIRCUIT_OPEN", f"CIRCUIT_OPEN: {breaker_reason}."
@@ -1744,6 +1993,7 @@ def call(agent: str, system: str, user: str, temperature: float = 0.2,
     for idx, (cand_provider, cand_model) in enumerate(chain):
         if not cand_model:
             continue
+        attempt_details = {}
         # 2a. Global per-cycle network-send budget: beyond the cap the call
         #     fails fast (never a send); cached replay / deterministic
         #     fallback take over. Protects the quota by construction.
@@ -1784,11 +2034,13 @@ def call(agent: str, system: str, user: str, temperature: float = 0.2,
             # (always — the quota is shared) and the trading-cycle budget
             # (trading tasks only) BEFORE the request leaves the process.
             _mark_model_sent(cand_provider, cand_model)
-            if agent != "operator":
-                _cycle_send_count += 1
             attempt_t0 = time.monotonic()
+            # count_cycle: every send — including a bounded retry — is charged
+            # to the per-cycle budget inside _attempt (retries can never
+            # exceed LLM_CYCLE_MAX_REQUESTS).
             status, attempt_error, text, _ = _attempt(
-                cand_provider, cand_model, system, user, temperature, max_tokens
+                cand_provider, cand_model, system, user, temperature, max_tokens,
+                details=attempt_details, count_cycle=(agent != "operator")
             )
             parsed = None
             if status == "OK" and expect_json:
@@ -1800,6 +2052,9 @@ def call(agent: str, system: str, user: str, temperature: float = 0.2,
                 except Exception as exc:  # noqa: BLE001 — parse errors are data
                     status = "INVALID_RESPONSE"
                     attempt_error = f"unparseable JSON response: {exc}"
+                    attempt_details = {"category": "MALFORMED_RESPONSE",
+                                       "http_status": None,
+                                       "exception_type": exc.__class__.__name__}
             _log_request(
                 "send", provider=cand_provider, model=cand_model, agent=agent,
                 symbol=symbol, reason=reason, ok=(status == "OK"),
@@ -1823,13 +2078,22 @@ def call(agent: str, system: str, user: str, temperature: float = 0.2,
             # NOT counted as a new failure, so the breaker can close.
             status, error = pre_status, pre_error
 
-        # Only an ACTUAL failed attempt updates the failure breaker.
-        if pre_status is None:
-            _breaker_failure(cand_provider, status)
+        # Only an ACTUAL failed attempt updates the failure breaker — and a
+        # MODEL-scoped failure (dead/obsolete id) never opens or re-opens the
+        # PROVIDER circuit, so it cannot poison the models that still work.
+        if pre_status is None and status not in _NON_PROVIDER_FAILURES:
+            if status in _MODEL_SCOPED_FAILURES:
+                _breaker_model_failure(cand_provider, status)
+            else:
+                _breaker_failure(cand_provider, status)
         last_result = LLMResult(
             agent, cand_provider, cand_model, status,
             latency_ms=round((time.monotonic() - t0) * 1000, 1),
             error=error, attempts=idx + 1, fallback_used=idx > 0,
+            error_category=(attempt_details.get("category")
+                            if pre_status is None else status),
+            http_status=attempt_details.get("http_status"),
+            exception_type=attempt_details.get("exception_type"),
         )
         if idx == 0 and len(chain) > 1:
             log = logger.info if status == "NOT_CONFIGURED" else logger.warning
@@ -1973,31 +2237,52 @@ def unorouter_effective_chain(catalog_ids=None) -> dict:
     /v1/models catalog. Ids are never invented or substituted: a missing
     candidate is reported and skipped, and the next candidate that DOES
     exist is selected. When the catalog itself is unavailable (fetch
-    failed/timed out) the configured order is kept — verification is
-    impossible, and the runtime 404 circuits still protect every request —
-    with catalog_available=False reporting that honestly.
+    failed/timed out) the configured order is kept MINUS ids a previous
+    catalog proved obsolete — verifying the rest is impossible, and the
+    runtime 404 circuits still protect every request — with
+    catalog_available=False reporting that honestly.
+
+    A candidate recorded as OBSOLETE (absent from a catalog that WAS fetched)
+    stays out of the chain even when the current catalog is unavailable — an
+    obsolete id must not re-enter routing just because /v1/models timed out.
 
     Returns {"chain": [...], "configured": [...], "missing": [...],
-             "selected_fallback": str|None, "catalog_available": bool}."""
+             "excluded_obsolete": [...], "selected_fallback": str|None,
+             "catalog_available": bool, "routing_basis": str}."""
     configured = unorouter_model_chain()
+    obsolete = [m for m in configured if _is_known_obsolete("unorouter", m)]
+    routable = [m for m in configured if m not in obsolete]
     if catalog_ids is None:
         catalog_ids = get_model_catalog("unorouter").get("ids")
     if catalog_ids is None:
-        return {"chain": list(configured)[:_model_attempt_cap()],
+        # Verification impossible: keep the configured ORDER, minus ids that
+        # a previous fetch already proved absent. Runtime 404 circuits still
+        # protect every remaining request.
+        return {"chain": routable[:_model_attempt_cap()],
                 "configured": configured, "missing": [],
+                "excluded_obsolete": obsolete,
                 "selected_fallback": (
-                    configured[1] if len(configured) > 1 else None),
-                "catalog_available": False}
+                    routable[1] if len(routable) > 1 else None),
+                "catalog_available": False,
+                "routing_basis": "configured-minus-known-obsolete"}
     live = {_normalize_model_id(m) for m in catalog_ids}
+    # A fetched catalog is the source of truth: remember configured ids it
+    # does not list, and restore any id it lists again.
+    _record_catalog_obsolescence("unorouter", live)
+    obsolete = [m for m in configured if _is_known_obsolete("unorouter", m)]
     chain, missing = [], []
     for model in configured:
         (chain if model in live else missing).append(model)
+        if model not in live and model not in obsolete:
+            obsolete.append(model)
     # The attempt cap applies to LIVE models only (never unlimited guessing;
     # a dead candidate never consumes an attempt slot).
     chain = chain[:_model_attempt_cap()]
     return {"chain": chain, "configured": configured, "missing": missing,
+            "excluded_obsolete": obsolete,
             "selected_fallback": (chain[1] if len(chain) > 1 else None),
-            "catalog_available": True}
+            "catalog_available": True,
+            "routing_basis": "catalog-verified"}
 
 
 def _model_env_source(provider: str, model: str) -> str:
@@ -2174,6 +2459,9 @@ def validate_models(refresh_if_stale: bool = False) -> dict:
             "ok": False, "status": "NOT_CONFIGURED", "models_found": 0,
             "configured": configured, "matched": [], "missing": [],
             "missing_models": [], "checked": {}, "selected_fallback": None,
+            "catalog_matched": [], "selected": [], "routing_excluded": [],
+            "routing_basis": None, "inference_tested": None,
+            "inference_verified": False,
             "catalog_age_s": None, "catalog_cached": False,
             "timed_out": False, "error": None,
             "catalog_status": "NOT_CONFIGURED", "inference_status": "NOT_CONFIGURED",
@@ -2231,6 +2519,13 @@ def validate_models(refresh_if_stale: bool = False) -> dict:
                 # separately in inference_status).
                 entry["catalog_status"] = "UNAVAILABLE"
                 entry["status"] = "CATALOG_UNAVAILABLE"
+            # What routing would use RIGHT NOW, without a catalog: the
+            # configured chain minus ids a previous catalog proved obsolete.
+            entry["routing_excluded"] = sorted(_obsolete_models.get(provider) or {})
+            if provider == "unorouter":
+                eff = unorouter_effective_chain()
+                entry["selected"] = eff["chain"]
+                entry["routing_basis"] = eff["routing_basis"]
             continue
 
         entry["ok"] = True
@@ -2242,11 +2537,17 @@ def validate_models(refresh_if_stale: bool = False) -> dict:
         entry["matched"] = matched
         entry["missing_models"] = missing
 
+        entry["catalog_matched"] = list(matched)
+        entry["routing_excluded"] = sorted(_obsolete_models.get(provider) or {})
+
         if provider == "unorouter":
             effective = unorouter_effective_chain(live_ids)
             entry["selected_fallback"] = effective["selected_fallback"]
             entry["effective_chain"] = effective["chain"]
             entry["catalog_available"] = True
+            entry["selected"] = effective["chain"]
+            entry["routing_excluded"] = effective["excluded_obsolete"]
+            entry["routing_basis"] = effective["routing_basis"]
 
         if configured and not matched:
             # Endpoint works but NOTHING configured is usable — never READY.
@@ -2260,11 +2561,39 @@ def validate_models(refresh_if_stale: bool = False) -> dict:
         else:
             entry["status"] = "READY"
 
-    # --- recorded inference probes (when enabled) ----------------------------
+    # --- inference evidence + selected models (independent of catalogs) ----
     for provider in PROVIDERS:
         entry = report["providers"][provider]
         probe = _inference_probes.get(provider)
         entry["inference_probe"] = dict(probe) if probe else None
+        last_ok = _last_success_info.get(provider)
+        if probe:
+            entry["inference_tested"] = {
+                "source": "probe", "model": probe.get("model"),
+                "ok": bool(probe.get("ok")), "status": probe.get("status"),
+                "error_category": probe.get("error_category"),
+                "at": probe.get("at")}
+        elif last_ok:
+            entry["inference_tested"] = {
+                "source": "inference", "model": last_ok.get("model"),
+                "ok": True, "status": "OK", "error_category": None,
+                "at": last_ok.get("at")}
+        entry["inference_verified"] = bool(
+            entry["inference_tested"] and entry["inference_tested"]["ok"])
+        if not entry.get("selected"):
+            # Models this provider actually serves on the EFFECTIVE routes.
+            selected = []
+            for agent in _TASK_PROVIDERS:
+                if agent == "operator":
+                    continue
+                try:
+                    route = effective_route(agent)
+                except Exception:  # noqa: BLE001 - reporting must not crash
+                    continue
+                model = _normalize_model_id(_task_model(provider, agent))
+                if route["provider"] == provider and model and model not in selected:
+                    selected.append(model)
+            entry["selected"] = selected
 
     # --- per-task route checks (back-compat label mapping) ------------------
     def _mark(provider, model, label):
@@ -2389,11 +2718,16 @@ def inference_probe(provider: str, task: str = "cio") -> dict:
             return result
         result["model"] = model
         t0 = time.monotonic()
+        details = {}
         status, error, text, _retry = _attempt(
             provider, model,
             system="You are a health probe. Reply with exactly: OK",
-            user="health probe", temperature=0.0, max_tokens=8)
+            user="health probe", temperature=0.0, max_tokens=8,
+            details=details)
         result["status"] = status
+        result["error_category"] = details.get("category")
+        result["http_status"] = details.get("http_status")
+        result["exception_type"] = details.get("exception_type")
         result["latency_ms"] = round((time.monotonic() - t0) * 1000, 1)
         result["ok"] = status == "OK"
         result["error"] = error
